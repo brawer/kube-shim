@@ -36,11 +36,9 @@ pub struct ReconciliationConfig {
 
 impl Config {
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let config_str = std::fs::read_to_string(path)
-            .context("Failed to read config file")?;
+        let config_str = std::fs::read_to_string(path).context("Failed to read config file")?;
 
-        let config: Config = toml::from_str(&config_str)
-            .context("Failed to parse TOML config")?;
+        let config: Config = toml::from_str(&config_str).context("Failed to parse TOML config")?;
 
         Ok(config)
     }

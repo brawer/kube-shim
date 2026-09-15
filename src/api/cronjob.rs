@@ -1,14 +1,14 @@
+use super::secret::ObjectMeta;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
     Json,
 };
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use sqlx::{SqlitePool, Row};
+use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
-use chrono::Utc;
-use super::secret::ObjectMeta;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CronJob {
@@ -32,11 +32,15 @@ pub async fn create_cronjob(
     State(pool): State<SqlitePool>,
     Json(req): Json<CreateCronJobRequest>,
 ) -> Result<(StatusCode, Json<CronJob>), (StatusCode, String)> {
-    let namespace = req.metadata.namespace.clone().unwrap_or_else(|| "default".to_string());
+    let namespace = req
+        .metadata
+        .namespace
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().timestamp();
-    let spec_json = serde_json::to_string(&req.spec)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let spec_json =
+        serde_json::to_string(&req.spec).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     sqlx::query(
         r#"

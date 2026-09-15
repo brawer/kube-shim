@@ -29,14 +29,23 @@ pub async fn load_tls_config<P: AsRef<Path>>(cert_path: P, key_path: P) -> Resul
 
     let cert_count = rustls_pemfile::certs(&mut cert_bytes.as_slice())
         .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("{} does not contain valid PEM certificate data", cert_path.display()))?
+        .with_context(|| {
+            format!(
+                "{} does not contain valid PEM certificate data",
+                cert_path.display()
+            )
+        })?
         .len();
     if cert_count == 0 {
         bail!("{} contains no certificates", cert_path.display());
     }
 
-    let key_count = rustls_pemfile::private_key(&mut key_bytes.as_slice())
-        .with_context(|| format!("{} does not contain valid PEM private key data", key_path.display()))?;
+    let key_count = rustls_pemfile::private_key(&mut key_bytes.as_slice()).with_context(|| {
+        format!(
+            "{} does not contain valid PEM private key data",
+            key_path.display()
+        )
+    })?;
     if key_count.is_none() {
         bail!("{} contains no private key", key_path.display());
     }
@@ -83,7 +92,11 @@ mod tests {
         let (cert_path, key_path) = write_self_signed_cert(&dir);
 
         let result = load_tls_config(&cert_path, &key_path).await;
-        assert!(result.is_ok(), "expected valid cert/key to load: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "expected valid cert/key to load: {:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]
@@ -117,7 +130,10 @@ mod tests {
         std::fs::write(&garbage_cert_path, b"this is not a certificate").unwrap();
 
         let result = load_tls_config(&garbage_cert_path, &key_path).await;
-        assert!(result.is_err(), "expected garbage cert data to error, not panic");
+        assert!(
+            result.is_err(),
+            "expected garbage cert data to error, not panic"
+        );
     }
 
     #[tokio::test]
@@ -129,7 +145,10 @@ mod tests {
         std::fs::write(&garbage_key_path, b"this is not a private key").unwrap();
 
         let result = load_tls_config(&cert_path, &garbage_key_path).await;
-        assert!(result.is_err(), "expected garbage key data to error, not panic");
+        assert!(
+            result.is_err(),
+            "expected garbage key data to error, not panic"
+        );
     }
 
     #[tokio::test]

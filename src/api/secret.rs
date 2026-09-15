@@ -3,11 +3,11 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use sqlx::{SqlitePool, Row};
+use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
-use chrono::Utc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectMeta {
@@ -41,11 +41,15 @@ pub async fn create_secret(
     State(pool): State<SqlitePool>,
     Json(req): Json<CreateSecretRequest>,
 ) -> Result<(StatusCode, Json<Secret>), (StatusCode, String)> {
-    let namespace = req.metadata.namespace.clone().unwrap_or_else(|| "default".to_string());
+    let namespace = req
+        .metadata
+        .namespace
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().timestamp();
-    let data_json = serde_json::to_string(&req.data)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let data_json =
+        serde_json::to_string(&req.data).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     sqlx::query(
         r#"

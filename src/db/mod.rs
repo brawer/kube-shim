@@ -55,7 +55,7 @@ mod tests {
 
         // Verify tables exist
         let result: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='secrets'"
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='secrets'",
         )
         .fetch_one(&pool)
         .await

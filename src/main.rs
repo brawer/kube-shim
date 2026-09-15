@@ -1,10 +1,10 @@
-use kube_shim::{api, config, db, tls};
 use anyhow::{Context, Result};
 use axum::{
     routing::{get, post},
     Router,
 };
 use clap::Parser;
+use kube_shim::{api, config, db, tls};
 use std::net::SocketAddr;
 use tower_http::cors::CorsLayer;
 
@@ -61,34 +61,26 @@ fn build_router(pool: sqlx::SqlitePool) -> Router {
         // Discovery endpoints
         .route("/api/v1", get(api::discovery_v1))
         .route("/apis/batch/v1", get(api::discovery_batch_v1))
-
         // Health check
         .route("/health", get(api::health))
-
         // Secrets API
         .route(
             "/api/v1/namespaces/:namespace/secrets",
-            post(api::secret::create_secret)
-                .get(api::secret::list_secrets),
+            post(api::secret::create_secret).get(api::secret::list_secrets),
         )
         .route(
             "/api/v1/namespaces/:namespace/secrets/:name",
-            get(api::secret::get_secret)
-                .delete(api::secret::delete_secret),
+            get(api::secret::get_secret).delete(api::secret::delete_secret),
         )
-
         // CronJobs API
         .route(
             "/apis/batch/v1/namespaces/:namespace/cronjobs",
-            post(api::cronjob::create_cronjob)
-                .get(api::cronjob::list_cronjobs),
+            post(api::cronjob::create_cronjob).get(api::cronjob::list_cronjobs),
         )
         .route(
             "/apis/batch/v1/namespaces/:namespace/cronjobs/:name",
-            get(api::cronjob::get_cronjob)
-                .delete(api::cronjob::delete_cronjob),
+            get(api::cronjob::get_cronjob).delete(api::cronjob::delete_cronjob),
         )
-
         .layer(CorsLayer::permissive())
         .with_state(pool)
 }
