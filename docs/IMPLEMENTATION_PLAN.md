@@ -134,10 +134,14 @@ sqlite3 db.sqlite "SELECT * FROM jobs"
 - Per-job VM sizing: read `resources.requests.cpu` / `.memory` from the CronJob's pod template and map to a Hetzner server type (small lookup table), instead of the fixed cx51 assumption — needed now that the shim runs more than one workload shape.
 - Config: `max_concurrent_jobs`, plus the rolling-budget parameters `budget_daily_rate_eur` and `budget_rollover_cap_days` — this just reserves the config shape; the accrual/enforcement logic itself is built in Phase 10, once cost calculation exists.
 - Internal `WorkloadKind` enum (`CronJob` for now) threaded through the reconciliation types, so the Phase 6+ VM-provisioning and PVC-binding code isn't written in a way that assumes "CronJob" is the only possible workload kind. This is purely an internal abstraction — no new API surface — done now so the future Deployment support (see "Future Work") doesn't require rewriting this layer.
+- **Admission check on CronJob create/update: `spec.jobTemplate.spec.activeDeadlineSeconds` must be set.** `activeDeadlineSeconds` is optional in the real Kubernetes API, but the shim needs a hard worst-case runtime bound for every job to make the budget guard (Phase 10) and deadline enforcement (Phase 8) meaningful, so it requires it via policy the same way a real cluster's `ValidatingAdmissionPolicy`/webhook would. A CronJob submitted without it is rejected with the same response shape a real admission webhook denial produces: HTTP 403, a `Status` object (`kind: Status`, `reason: Forbidden`), message `admission webhook "kube-shim.io/require-active-deadline" denied the request: spec.jobTemplate.spec.activeDeadlineSeconds must be set (bounds the job's worst-case cost against the budget guard)`. `kubectl`/Terraform surface this exactly like any real admission denial — resolves Open Question 9.
 
 **Files to create/modify:**
 - `src/api/pvc.rs` (new) - PersistentVolumeClaim CRUD
 - `src/api/mod.rs` - register PVC routes, discovery entry
+- `src/api/cronjob.rs` - add the `activeDeadlineSeconds` admission check on create/update
+- `src/k8s_status.rs` (new) - builds Kubernetes-shaped `Status` error responses (reusable for any future admission/validation rejection, not just this one)
+- `src/admission.rs` (new) - the `activeDeadlineSeconds` policy check itself
 - `src/db/schema.sql` - add `persistent_volume_claims` table
 - `src/config.rs` - add `max_concurrent_jobs`, `budget_daily_rate_eur`, `budget_rollover_cap_days`
 - `src/workload.rs` (new) - `WorkloadKind` enum + shared resource-sizing helpers
@@ -149,6 +153,13 @@ kubectl get pvc osmdiffs-scratch
 sqlite3 db.sqlite "SELECT name, size_gb, reclaim_policy, status FROM persistent_volume_claims"
 # Apply a second, differently-sized cronjob + PVC (e.g. a smaller weekly job)
 # and confirm both are stored independently with no naming collisions.
+
+# Admission check:
+# Apply a CronJob with no activeDeadlineSeconds set
+kubectl apply -f cronjob-no-deadline.yaml
+# Error from server (Forbidden): error when creating "cronjob-no-deadline.yaml":
+# admission webhook "kube-shim.io/require-active-deadline" denied the request: ...
+terraform apply   # same manifest via Terraform: apply fails with the same message, cleanly
 ```
 
 ---
@@ -329,14 +340,15 @@ kubectl logs -f osmdiffs-weekly-test
 **Deliverables:**
 - Comprehensive error handling for all Hetzner API calls
 - Idempotent state transitions (can retry without side effects) — before creating a volume or VM, check for an existing Hetzner resource carrying this job's name label, so a crash between "API call succeeded" and "DB write committed" can't create a duplicate on restart
-- Timeouts: volume creation (5 min), VM boot (5 min), container runtime (6 hours + job timeout)
-- Cleanup on failure: unmount, detach, delete (even if one step fails)
-- Startup recovery: detect crashed containers, orphaned volumes, incomplete jobs
+- Timeouts: volume creation (5 min), VM boot (5 min)
+- **`activeDeadlineSeconds` enforcement (hard, not advisory):** since Phase 2's admission check guarantees every job has one set, the reconciliation loop tracks each running job's deadline and force-kills its VM (delete, not just stop the container) the moment it's exceeded — mirroring real Kubernetes Job behavior, where a Job that outlives `activeDeadlineSeconds` is terminated and marked `Failed` with reason `DeadlineExceeded`. This is what makes Phase 10's cost estimate an actual worst-case bound rather than a hopeful guess: nothing can silently run (and bill) past the deadline it declared at submission time.
+- Cleanup on failure: unmount, detach, delete (even if one step fails) — including the deadline-exceeded case above
+- Startup recovery: detect crashed containers, orphaned volumes, incomplete jobs, and jobs whose deadline passed while the shim itself was down
 - Chaos testing scenario: kill shim mid-job, restart, verify cleanup proceeds
 
 **Files to modify:**
-- `src/reconcile/job.rs` - add timeouts, error recovery, label-based idempotency checks
-- `src/reconcile/startup.rs` - comprehensive orphan detection
+- `src/reconcile/job.rs` - add timeouts, error recovery, label-based idempotency checks, `activeDeadlineSeconds` tracking + force-kill
+- `src/reconcile/startup.rs` - comprehensive orphan detection, including deadline-exceeded jobs missed while down
 - `src/db/schema.sql` - add last_transition_time timestamp
 
 **Testing:**
@@ -354,6 +366,15 @@ terraform apply & sleep 30 && pkill kube-shim
 # Should detect container status, proceed to cleanup
 
 # Repeat 10+ times, verify zero orphans remain
+
+# Scenario 3: deadline enforcement
+# Apply a job with activeDeadlineSeconds=60 running a container that never exits
+terraform apply
+sleep 90
+kubectl get pod osmdiffs-weekly-test
+# Should show Failed, reason DeadlineExceeded; VM should be gone in Hetzner console
+# Repeat once while killing the shim at t=30s, to confirm startup recovery also
+# catches an expired deadline it missed while down
 ```
 
 ---
@@ -391,7 +412,7 @@ kubectl top pods
 **Deliverables:**
 - Daily sync of Hetzner pricing API → SQLite cache table (via the `CloudProvider::get_pricing()` method from Phase 4)
 - Cost calculation: (VM hourly price × duration) + (volume price per GB-hour × GB × duration)
-- Estimated cost before a job starts — now required, not optional, since the budget guard depends on it: hourly VM price × the job's `activeDeadlineSeconds` (its worst-case runtime) + estimated volume cost for that same duration
+- Estimated cost before a job starts — now required, not optional, since the budget guard depends on it: hourly VM price × the job's `activeDeadlineSeconds` (its worst-case runtime) + estimated volume cost for that same duration. This is a true worst-case bound, not a hopeful guess: Phase 2's admission check guarantees every job has `activeDeadlineSeconds` set, and Phase 8 actually force-kills the VM if it's exceeded, so nothing can run past the duration this estimate assumes.
 - Actual cost calculated when job completes
 - Cost aggregated per job type and across the whole family (daily/weekly/monthly totals)
 - **Rolling budget guard**, replacing a flat daily cap:
@@ -527,8 +548,10 @@ curl -k https://localhost:6443/debug/status | jq '.total_cost_eur, .budget_balan
 | `src/api/*.rs` | Kubernetes API handlers | Phases 1-2, 9 |
 | `src/api/pvc.rs` | PersistentVolumeClaim CRUD | Create (Phase 2) |
 | `src/workload.rs` | `WorkloadKind` abstraction (CronJob now, Deployment later) | Create (Phase 2) |
+| `src/k8s_status.rs` | Kubernetes-shaped `Status` error responses (reused by any admission/validation rejection) | Create (Phase 2) |
+| `src/admission.rs` | `activeDeadlineSeconds`-required policy check | Create (Phase 2) |
 | `src/db/schema.sql` | SQLite schema | Phases 1-3, 5-6, 8-10 |
-| `src/reconcile/*.rs` | State machine loop | Create (Phases 3, 5-6, 8, 10, 12) |
+| `src/reconcile/*.rs` | State machine loop, incl. `activeDeadlineSeconds` enforcement (Phase 8) | Create (Phases 3, 5-6, 8, 10, 12) |
 | `src/providers/*.rs` | `CloudProvider` trait + Hetzner implementation | Create (Phases 4-6, 10) |
 | `src/pricing/*.rs` | Cost tracking + rolling budget guard | Create (Phase 10) |
 | `src/status_page.rs` | Public read-only status page (port 80) | Create (Phase 11) |
@@ -579,6 +602,11 @@ Each state has:
 
 A job also passes through `BudgetWait` before `VolumePending` if its estimated cost exceeds the current rolling budget balance (Phase 10); it's retried each tick, not failed, once enough balance has accrued.
 
+A running job that exceeds its `activeDeadlineSeconds` (Phase 8) is force-killed and transitions to `Failed` with reason `DeadlineExceeded` — the same terminology real Kubernetes Jobs use for this exact situation.
+
+### Admission Validation
+`activeDeadlineSeconds` is optional in the real Kubernetes API, but the shim requires it on every CronJob (Phase 2) so the budget guard and deadline enforcement above have something to work with. Rather than silently defaulting it or inventing a bespoke error, a missing deadline is rejected the same way a real cluster's admission webhook/policy would reject a policy violation: HTTP 403, a standard `Status` object (`reason: Forbidden`), and a message in the same shape a tool like Gatekeeper or Kyverno would produce. `src/k8s_status.rs` builds this response generically, so any future admission/validation rule (not just this one) can reuse it.
+
 ### Workload Abstraction (for future Deployment support)
 The reconciliation and VM-provisioning code is written against a `WorkloadKind` enum (Phase 2) rather than assuming "CronJob" directly. Today it has one variant. This costs nothing now but means that when `Deployment` support is added later (see "Future Work"), the shared plumbing — cloud provider client, PVC binding, cloud-init templating, log streaming, events, pricing — doesn't need to be reworked; only the state machine for "how a run starts/ends" differs per kind.
 
@@ -603,13 +631,13 @@ A token bucket, not a fixed daily reset: `balance_eur` increases by `budget_dail
 
 ### Per-Phase Checklist
 - Phase 1: terraform apply/destroy works, resources stored in SQLite
-- Phase 2: PVC CRUD works, CronJob resolves a referenced PVC, a second differently-sized cronjob coexists without naming collisions
+- Phase 2: PVC CRUD works, CronJob resolves a referenced PVC, a second differently-sized cronjob coexists without naming collisions; a CronJob without `activeDeadlineSeconds` is rejected with a standard Kubernetes 403 `Status` response, surfaced cleanly by both `kubectl` and Terraform
 - Phase 3: reconciliation loop advances job states automatically
 - Phase 4: `CloudProvider` trait exists and `HetznerProvider` is the only caller of it (no direct hcloud calls elsewhere); logs show "DRY-RUN" messages, no actual resources created
 - Phase 5: small volumes created/deleted cleanly, orphan scan finds/deletes strays without touching Retain-policy PVCs
 - Phase 6: VMs launch sized per-job, receive cloud-init, containers run
 - Phase 7: kubectl logs -f works while container running
-- Phase 8: 10+ chaos scenarios (kill shim, container crashes, etc.) with zero orphans and zero duplicate resources
+- Phase 8: 10+ chaos scenarios (kill shim, container crashes, etc.) with zero orphans and zero duplicate resources; a job that overruns `activeDeadlineSeconds` is force-killed and marked `Failed`/`DeadlineExceeded`, including when the shim was down at the moment the deadline passed
 - Phase 9: kubectl describe shows events, kubectl top shows metrics across all running jobs
 - Phase 10: costs calculated per job and per family; a job whose estimate exceeds the budget balance waits in `BudgetWait` and launches once enough has accrued; a job that finishes early returns its unused margin to the balance
 - Phase 11: status page reachable with no auth on port 80, shows events/jobs/cost, never leaks secrets, and rejects all non-GET requests
@@ -652,7 +680,7 @@ A token bucket, not a fixed daily reset: `balance_eur` increases by `budget_dail
 
 8. **Deployment networking (future)**: long-running Deployments will likely need a stable public IP/DNS name, unlike ephemeral CronJob VMs that are torn down after each run. Not needed for the initial scope, but worth deciding before "Future Work" below begins.
 
-9. **Estimated cost accuracy**: Phase 10's budget guard uses `activeDeadlineSeconds` as the worst-case runtime for a cost estimate. If a job has no `activeDeadlineSeconds` set, what should the shim assume? A conservative default (e.g. 24h) risks blocking small jobs unnecessarily against the budget; no default risks an unbounded job draining the whole balance. Worth deciding before Phase 10.
+9. **Estimated cost accuracy**: resolved. Rather than guessing a default when `activeDeadlineSeconds` is absent, Phase 2 requires it via an admission check (HTTP 403, standard Kubernetes `Status` object, same shape a real admission-policy denial would produce) — so every job always has an explicit, user-chosen worst-case runtime, and Phase 8 force-kills the VM if it's exceeded. No default to get wrong, and the cost estimate is a real bound rather than a hopeful guess.
 
 ---
 
