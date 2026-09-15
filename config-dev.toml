@@ -1,0 +1,15 @@
+[server]
+host = "127.0.0.1"
+port = 6443
+tls_cert_path = "certs/cert.pem"
+tls_key_path = "certs/key.pem"
+
+[database]
+path = "db.sqlite"
+
+[hetzner]
+token = "YOUR_HETZNER_TOKEN_HERE"
+dry_run = true
+
+[reconciliation]
+interval_secs = 10
