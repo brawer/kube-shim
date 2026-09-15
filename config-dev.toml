@@ -4,6 +4,11 @@ port = 6443
 tls_cert_path = "certs/cert.pem"
 tls_key_path = "certs/key.pem"
 
+# Dev-only placeholder token. Generate a real one for anything beyond local
+# testing, e.g.: openssl rand -base64 32
+[[server.api_tokens]]
+token = "dev-only-insecure-token"
+
 [database]
 path = "db.sqlite"
 
