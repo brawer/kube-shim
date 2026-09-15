@@ -143,8 +143,8 @@ All Phase 1 acceptance criteria have been verified:
 
 ## Known Limitations (Deferred to Future Phases)
 
-- ⚠️ **TLS/HTTPS**: Using HTTP in Phase 1 for development. TLS support will be added in Phase 2 using axum-server crate.
-- ⚠️ **Authentication/Authorization**: No RBAC or auth implemented. Single-user trusted setup assumed.
+- ✅ **TLS/HTTPS** — resolved (PR #6): serves via `axum-server`/rustls, plain HTTP no longer accepted.
+- ✅ **Authentication/Authorization** — resolved for the initial scope (Phase 2): bearer-token auth (a rotatable token list) required on every request; full RBAC remains out of scope (single-user trusted setup).
 - ⚠️ **Reconciliation Loop**: No state machine or job orchestration yet. Pure CRUD only.
 - ⚠️ **Hetzner Integration**: No actual cloud API calls. Deferred to Phase 3 (dry-run) and Phase 4 (real operations).
 - ⚠️ **Patch Operations**: PATCH endpoint not implemented yet (only CRUD subset). Can be added later if needed.
