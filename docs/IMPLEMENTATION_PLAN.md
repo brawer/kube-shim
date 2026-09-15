@@ -2,21 +2,24 @@
 
 ## Context
 
-**Problem:** Run expensive, short-lived containerized workloads (osmdiffs: 6 CPU, 8GB RAM, 250GB ephemeral disk, ~6hr runtime weekly) on a budget VPS without paying for always-on infrastructure or managed Kubernetes node pools.
+**Problem:** Run a family of expensive, short-lived containerized batch workloads (starting with osmdiffs: 6 CPU, 8GB RAM, 250GB ephemeral disk, ~6hr runtime weekly, plus several similar scheduled cronjobs) on a budget VPS without paying for always-on infrastructure or managed Kubernetes node pools.
 
 **Solution:** Build a lightweight Kubernetes API server that runs on a cheap VPS ($10-20/month) and:
-- Accepts Kubernetes Job/CronJob manifests via Terraform
-- Creates ephemeral Hetzner Cloud VMs per job (6 CPU, 8GB RAM, cx51 ~€4/job)
-- Manages 250GB ephemeral block volumes (provisioned on-demand, deleted after)
+- Accepts Kubernetes `Secret`, `PersistentVolumeClaim`, and `CronJob` manifests via Terraform
+- Creates ephemeral Hetzner Cloud VMs per job run, sized per-job from the CronJob pod template's resource requests (not a single hardcoded size)
+- Manages Hetzner Cloud block volumes provisioned via PersistentVolumeClaims — ephemeral (deleted after each run) by default, or retained across runs when a job wants to reuse cached data (e.g. a downloaded OSM planet file)
 - Runs containers via cloud-init + Docker inside VMs
 - Exposes Kubernetes-compatible APIs so Terraform `kubernetes_provider` works natively
 - Streams logs, metrics, and cost tracking via custom Kubernetes APIs
+- **Long-term, not initial scope:** also manage long-running `Deployment` workloads, reusing the same underlying VM-provisioning and volume-binding infrastructure built for CronJobs (see "Future Work" below)
 
 **Key constraints:**
-- Absolute requirement: 250GB ephemeral scratch storage per job
-- Cheap indie developer infrastructure (total ~€50-60/month for weekly jobs)
+- Absolute requirement: large ephemeral scratch storage per job (up to 250GB for osmdiffs; other jobs in the family may need less)
+- Multiple distinct cronjobs, potentially running concurrently — resource sizing, naming, and cost tracking must be per-job, not hardcoded to one workload
+- Cheap indie developer infrastructure (total ~€50-60/month across the whole cronjob family)
 - Must survive control plane restarts (crash recovery via reconciliation loop)
 - Must prevent resource leaks (volumes, VMs) if any component fails
+- Must prevent runaway cost if multiple jobs misfire concurrently (concurrency cap / budget guard)
 
 ---
 
@@ -30,40 +33,50 @@
    - Reconciliation loop (10-second ticks) for state management
    - Hetzner Cloud API client + pricing sync
 
-**2. Worker VMs:** Short-lived Hetzner Cloud VMs (created per job)
+**2. Worker VMs:** Short-lived Hetzner Cloud VMs (created per job run)
    - Receive volume attachment + container spec via cloud-init
    - Run Docker container with mounted volume
    - Communicate status/logs back to shim via SSH + status files
 
 **3. Kubernetes API Surface:** Minimal implementation
-   - Resources: `Secret` (v1), `CronJob` (batch/v1), Pod status
+   - Resources: `Secret` (v1), `PersistentVolumeClaim` (v1), `CronJob` (batch/v1), Pod status
    - Operations: CRUD on resources, watch/streaming, list
    - Extensions: Events, Metrics, Cost tracking (custom APIs)
+   - **Future:** `Deployment` (apps/v1) for long-running workloads — deliberately deferred, but the internal `WorkloadKind` abstraction introduced in Phase 2 is designed so adding it later doesn't require reworking the CronJob path.
 
 ### Data Flow
 
 ```
 Terraform (terraform apply)
   → HTTPS POST to Shim:6443 (kubernetes_provider)
-    → Shim stores Secret/CronJob in SQLite
+    → Shim stores Secret / PersistentVolumeClaim / CronJob in SQLite
     → Reconciliation loop detects new jobs
-      → Creates 250GB Hetzner volume
-      → Launches Hetzner VM with cloud-init
+      → Resolves the PersistentVolumeClaim referenced by the CronJob's pod
+        template
+        → New Hetzner volume if the PVC is Pending (or reuse the existing
+          Hetzner volume if the PVC is Bound and its reclaim policy is
+          Retain)
+      → Launches Hetzner VM with cloud-init, sized from the pod template's
+        resource requests
       → Cloud-init mounts volume, pulls image, docker run
       → Container writes to /scratch, streams logs
-      → On exit: Shim detects completion, fetches logs, deletes VM+volume
+      → On exit: Shim detects completion, fetches logs, deletes VM
+        (and the volume too, unless the PVC's reclaim policy is Retain)
     → Shim updates job status in SQLite
     → Terraform reads back status via GET requests
   → kubectl logs -f osmdiffs-weekly-...  (streams from VM via SSH)
   → kubectl get pod, kubectl describe, etc. (reads from Shim database)
+  → kubectl get cronjobs  (lists the whole job family, not just osmdiffs)
 ```
 
 ---
 
 ## Implementation Phases
 
-### Phase 1: Scaffold + HTTP API (Days 1-2)
+### Phase 1: Scaffold + HTTP API (Days 1-2) — ✅ Complete
 **Goal:** Prove Terraform can CRUD resources via the shim.
+
+No changes from the original plan — this phase already shipped exactly as designed. See `docs/PHASE_1_COMPLETION.md` for the completion report.
 
 **Deliverables:**
 - New Rust project with `Cargo.toml` (axum, tokio, sqlx, serde, tracing)
@@ -96,7 +109,38 @@ sqlite3 db.sqlite "SELECT * FROM jobs"
 
 ---
 
-### Phase 2: Reconciliation Loop Skeleton (Days 2-3)
+### Phase 2: PersistentVolumeClaim API + Multi-Job Resource Model (Days 2-3)
+**Goal:** Let Terraform manage volumes the same way it already manages Secrets and CronJobs, and remove the hardcoded single-workload assumptions from Phase 1 before the reconciliation loop is built on top of them.
+
+**Deliverables:**
+- `PersistentVolumeClaim` (v1) CRUD handlers: create/read/list/delete
+  - `spec.resources.requests.storage`, `spec.accessModes`
+  - Shim-specific annotation `kube-shim.io/reclaim-policy: Delete|Retain` (default `Delete`, matching the original ephemeral-per-run behavior). `Retain` keeps the underlying Hetzner volume around between job runs — useful for a job that wants to cache a large downloaded dataset instead of re-fetching it weekly.
+- CronJob pod template can reference a PVC by name (`volumes: - persistentVolumeClaim: claimName: ...`); the reconciliation loop resolves it instead of always creating an ad-hoc volume per run.
+- Database: `persistent_volume_claims` table (name, namespace, size_gb, access_mode, reclaim_policy, bound_hetzner_volume_id, status: `Pending` / `Bound` / `Released`)
+- Per-job VM sizing: read `resources.requests.cpu` / `.memory` from the CronJob's pod template and map to a Hetzner server type (small lookup table), instead of the fixed cx51 assumption — needed now that the shim runs more than one workload shape.
+- Config: `max_concurrent_jobs` and an optional `daily_budget_eur` circuit breaker in `config.toml`, so a misconfigured or duplicated cronjob can't silently rack up cost across the whole family.
+- Internal `WorkloadKind` enum (`CronJob` for now) threaded through the reconciliation types, so the Phase 6+ VM-provisioning and PVC-binding code isn't written in a way that assumes "CronJob" is the only possible workload kind. This is purely an internal abstraction — no new API surface — done now so the future Deployment support (see "Future Work") doesn't require rewriting this layer.
+
+**Files to create/modify:**
+- `src/api/pvc.rs` (new) - PersistentVolumeClaim CRUD
+- `src/api/mod.rs` - register PVC routes, discovery entry
+- `src/db/schema.sql` - add `persistent_volume_claims` table; add `max_concurrent_jobs`/budget config
+- `src/config.rs` - add `max_concurrent_jobs`, `daily_budget_eur`
+- `src/workload.rs` (new) - `WorkloadKind` enum + shared resource-sizing helpers
+
+**Testing:**
+```bash
+terraform apply   # now includes a PersistentVolumeClaim alongside Secret/CronJob
+kubectl get pvc osmdiffs-scratch
+sqlite3 db.sqlite "SELECT name, size_gb, reclaim_policy, status FROM persistent_volume_claims"
+# Apply a second, differently-sized cronjob + PVC (e.g. a smaller weekly job)
+# and confirm both are stored independently with no naming collisions.
+```
+
+---
+
+### Phase 3: Reconciliation Loop Skeleton (Days 3-4)
 **Goal:** Build the state machine that will drive all orchestration.
 
 **Deliverables:**
@@ -129,7 +173,7 @@ sqlite3 db.sqlite "SELECT name, status, retry_count FROM jobs"
 
 ---
 
-### Phase 3: Hetzner Integration (Dry-Run Mode) (Days 3-4)
+### Phase 4: Hetzner Integration (Dry-Run Mode) (Days 4-5)
 **Goal:** Call real Hetzner API but don't actually create resources yet.
 
 **Deliverables:**
@@ -159,20 +203,20 @@ terraform apply
 
 ---
 
-### Phase 4: Real Hetzner Operations (Small Volumes) (Days 4-5)
+### Phase 5: Real Hetzner Operations (Small Volumes) (Days 5-6)
 **Goal:** Actually provision volumes, but small (1-10GB) for safety.
 
 **Deliverables:**
 - Set `dry_run = false` in config
-- Real volume creation in reconciliation loop
+- Real volume creation in reconciliation loop, resolved through the PVC binding added in Phase 2 (create a new Hetzner volume for a Pending PVC; reuse the existing one for a Bound PVC with reclaim policy Retain)
 - Volume attachment to VPS
 - Error handling + retry logic with timeouts (5 min for volume creation)
-- Orphan detection: scan Hetzner for volumes with our prefix, delete if not tracked in DB
+- Orphan detection: scan Hetzner for volumes with our prefix, delete if not tracked in DB — cross-check both `jobs.volume_id` and `persistent_volume_claims.bound_hetzner_volume_id` so a retained PVC's volume is never mistaken for an orphan
 - Database: track volume_id, volume_device, mount_point
 
 **Files to modify:**
 - `src/hetzner/volumes.rs` - implement real create/attach/detach/delete
-- `src/reconcile/job.rs` - implement volume state steps (VolumeCreating, VolumeAttaching, VolumeAttached)
+- `src/reconcile/job.rs` - implement volume state steps (VolumeCreating, VolumeAttaching, VolumeAttached), including the PVC-resolution step from Phase 2
 - `src/reconcile/orphan_scan.rs` (new) - periodic orphan detection + cleanup
 - `src/db/schema.sql` - add volume_device, mount_point columns
 
@@ -185,6 +229,8 @@ terraform apply
 # terraform destroy
 # Verify volume deleted (takes ~2 min)
 # Repeat 5 times without orphans
+# Repeat once with a Retain-policy PVC and confirm the volume survives
+# terraform destroy of the CronJob (but not the PVC)
 ```
 
 **Exit criteria:**
@@ -193,12 +239,12 @@ terraform apply
 
 ---
 
-### Phase 5: VM Provisioning + Cloud-Init (Days 5-6)
+### Phase 6: VM Provisioning + Cloud-Init (Days 6-7)
 **Goal:** Launch actual Hetzner Cloud VMs with containers inside.
 
 **Deliverables:**
-- Cloud-init script generation (bash, templated with env vars)
-- Real VM creation (cx51 or size based on job resources)
+- Cloud-init script generation (bash, templated with proper escaping — job-supplied values such as image name/args/env must never be interpolated into shell unescaped; pass them as a base64-encoded blob decoded inside the VM instead)
+- Real VM creation, sized per-job using the resource-request lookup table from Phase 2 (not a fixed cx51)
 - VM waits for volume attachment, mounts it
 - VM pulls container image, runs docker
 - Container write to /scratch
@@ -231,7 +277,7 @@ terraform apply
 
 ---
 
-### Phase 6: Log Streaming (Days 6-7)
+### Phase 7: Log Streaming (Days 7-8)
 **Goal:** Support `kubectl logs -f` for live monitoring.
 
 **Deliverables:**
@@ -262,19 +308,19 @@ kubectl logs -f osmdiffs-weekly-test
 
 ---
 
-### Phase 7: Reconciliation Hardening (Days 7-8)
+### Phase 8: Reconciliation Hardening (Days 8-9)
 **Goal:** Make the reconciliation loop bulletproof for production.
 
 **Deliverables:**
 - Comprehensive error handling for all Hetzner API calls
-- Idempotent state transitions (can retry without side effects)
+- Idempotent state transitions (can retry without side effects) — before creating a volume or VM, check for an existing Hetzner resource carrying this job's name label, so a crash between "API call succeeded" and "DB write committed" can't create a duplicate on restart
 - Timeouts: volume creation (5 min), VM boot (5 min), container runtime (6 hours + job timeout)
 - Cleanup on failure: unmount, detach, delete (even if one step fails)
 - Startup recovery: detect crashed containers, orphaned volumes, incomplete jobs
 - Chaos testing scenario: kill shim mid-job, restart, verify cleanup proceeds
 
 **Files to modify:**
-- `src/reconcile/job.rs` - add timeouts, error recovery
+- `src/reconcile/job.rs` - add timeouts, error recovery, label-based idempotency checks
 - `src/reconcile/startup.rs` - comprehensive orphan detection
 - `src/db/schema.sql` - add last_transition_time timestamp
 
@@ -297,14 +343,14 @@ terraform apply & sleep 30 && pkill kube-shim
 
 ---
 
-### Phase 8: Events + Metrics APIs (Days 8-9)
-**Goal:** Add observability for `kubectl describe` and monitoring.
+### Phase 9: Events + Metrics APIs (Days 9-10)
+**Goal:** Add observability for `kubectl describe` and monitoring across the whole cronjob family, not just one workload.
 
 **Deliverables:**
 - Events table in SQLite: reason, message, timestamp
 - Emit events during reconciliation: "VolumeCreated", "VMStarting", "ContainerRunning", etc.
 - Metrics API: `GET /apis/metrics.k8s.io/v1beta1/nodes` and `/pods`
-- Estimate CPU/memory from running jobs (CPU cores * job count, etc.)
+- Estimate CPU/memory from running jobs (CPU cores * job count, etc.), aggregated across every cronjob, not just osmdiffs
 
 **Files to create/modify:**
 - `src/api/events.rs` (new) - list events
@@ -319,19 +365,21 @@ kubectl describe pod osmdiffs-weekly-...
 
 kubectl top nodes
 kubectl top pods
-# Should show estimated CPU/memory usage
+# Should show estimated CPU/memory usage across all concurrently running jobs
 ```
 
 ---
 
-### Phase 9: Pricing + Cost Tracking (Days 9-10)
-**Goal:** Track Hetzner pricing, calculate job costs, expose via API.
+### Phase 10: Pricing + Cost Tracking (Days 10-11)
+**Goal:** Track Hetzner pricing, calculate job costs, expose via API, and enforce the budget guard from Phase 2.
 
 **Deliverables:**
 - Daily sync of Hetzner pricing API → SQLite cache table
 - Cost calculation: (VM hourly price * duration) + (volume price per GB-hour * GB * duration)
 - Estimated cost before job starts (optional)
 - Actual cost calculated when job completes
+- Cost aggregated per job type and across the whole family (daily/monthly totals)
+- Enforce `daily_budget_eur` from Phase 2: once exceeded, pause launching new job runs and emit an event/log line, rather than silently continuing
 - Expose via metrics API and events
 - Hardcoded fallback pricing if API sync fails
 
@@ -339,7 +387,7 @@ kubectl top pods
 - `src/pricing/mod.rs` (new) - pricing sync and calculation
 - `src/pricing/hetzner.rs` (new) - fetch Hetzner pricing API
 - `src/api/pricing.rs` (new) - cost endpoint
-- `src/reconcile/pricing.rs` (new) - background sync loop
+- `src/reconcile/pricing.rs` (new) - background sync loop + budget guard check
 - `src/db/schema.sql` - add hetzner_pricing table, estimated_cost_eur column
 
 **Testing:**
@@ -354,11 +402,14 @@ sqlite3 db.sqlite "SELECT name, estimated_cost_eur FROM jobs"
 
 # Via API
 curl -k https://localhost:6443/debug/status | jq '.total_cost_eur'
+
+# Set daily_budget_eur artificially low, confirm new job launches are paused
+# and an event is emitted once the budget is exceeded
 ```
 
 ---
 
-### Phase 10: Resource Naming + Cleanup (Days 10-11)
+### Phase 11: Resource Naming + Cleanup (Days 11-12)
 **Goal:** Identify resources created by shim, enable manual cleanup.
 
 **Deliverables:**
@@ -385,27 +436,29 @@ curl -H "Authorization: Bearer $TOKEN" https://api.hetzner.cloud/v1/volumes | jq
 
 ---
 
-### Phase 11: Testing + Hardening (Days 11-12)
-**Goal:** Run actual osmdiffs job, verify end-to-end, monitor for 1 week.
+### Phase 12: Testing + Hardening (Days 12-13)
+**Goal:** Run real workloads from the cronjob family end-to-end, verify end-to-end, monitor for 1 week.
 
 **Deliverables:**
-- Swap 1GB test volume for 250GB
-- Swap busybox for real osmdiffs image
-- One full job run (6+ hours)
+- Swap 1GB test volume for the real per-job sizes (up to 250GB for osmdiffs)
+- Swap busybox for real container images, across at least osmdiffs and one other cronjob from the family
+- Run osmdiffs and at least one other cronjob concurrently at least once, to exercise the multi-job concurrency cap and budget guard under real conditions
+- One full osmdiffs job run (6+ hours)
 - Monitor Hetzner console, logs, costs
-- Run 2-3 scheduled runs (wait for Sundays or trigger manually)
+- Run 2-3 scheduled runs across the family (wait for real schedule triggers or trigger manually)
 
 **Testing:**
 ```bash
-# Deploy real osmdiffs CronJob
+# Deploy the real CronJobs (osmdiffs + at least one more from the family)
 terraform apply
 
 # Monitor:
 journalctl -u kube-shim -f
 curl -k https://localhost:6443/debug/status (every hour)
-# Hetzner console (watch volume count)
+# Hetzner console (watch volume + VM count across all jobs)
 
-# After job completes
+# After jobs complete
+kubectl get cronjobs
 kubectl logs osmdiffs-weekly-XXXXX
 kubectl describe pod osmdiffs-weekly-XXXXX
 curl -k https://localhost:6443/debug/status | jq '.total_cost_eur'
@@ -417,18 +470,20 @@ curl -k https://localhost:6443/debug/status | jq '.total_cost_eur'
 
 | File | Purpose | Status |
 |------|---------|--------|
-| `Cargo.toml` | Rust dependencies | Create (Phase 1) |
-| `src/main.rs` | Server entry point | Create (Phase 1) |
-| `src/api/*.rs` | Kubernetes API handlers | Create (Phases 1-8) |
-| `src/db/schema.sql` | SQLite schema | Create (Phase 1) |
-| `src/reconcile/*.rs` | State machine loop | Create (Phases 2-10) |
-| `src/hetzner/*.rs` | Cloud API client | Create (Phases 3-5) |
-| `src/pricing/*.rs` | Cost tracking | Create (Phase 9) |
-| `src/config.rs` | Configuration parsing | Create (Phase 1) |
+| `Cargo.toml` | Rust dependencies | Done (Phase 1) |
+| `src/main.rs` | Server entry point | Done (Phase 1) |
+| `src/api/*.rs` | Kubernetes API handlers | Phases 1-2, 9 |
+| `src/api/pvc.rs` | PersistentVolumeClaim CRUD | Create (Phase 2) |
+| `src/workload.rs` | `WorkloadKind` abstraction (CronJob now, Deployment later) | Create (Phase 2) |
+| `src/db/schema.sql` | SQLite schema | Phases 1-3, 5-6, 8-10 |
+| `src/reconcile/*.rs` | State machine loop | Create (Phases 3, 5-6, 8, 10-11) |
+| `src/hetzner/*.rs` | Cloud API client | Create (Phases 4-6) |
+| `src/pricing/*.rs` | Cost tracking + budget guard | Create (Phase 10) |
+| `src/config.rs` | Configuration parsing | Phases 1-2 |
 | `config.toml` | Runtime config template | Create (Phase 1) |
 | `bootstrap/provision.sh` | One-time VPS setup | Create (Phase 1) |
-| `bootstrap/cloud-init-template.sh` | VM startup script | Create (Phase 5) |
-| `bootstrap/cleanup-orphans.sh` | Manual cleanup script | Create (Phase 10) |
+| `bootstrap/cloud-init-template.sh` | VM startup script | Create (Phase 6) |
+| `bootstrap/cleanup-orphans.sh` | Manual cleanup script | Create (Phase 11) |
 
 ---
 
@@ -467,6 +522,11 @@ Each state has:
 - Timeout (how long before failing?)
 - Retry logic (backoff on failure)
 
+`VolumePending → VolumeCreating` additionally requires the job's referenced PersistentVolumeClaim to be resolvable: either it's `Pending` (create a fresh Hetzner volume, then mark the PVC `Bound`) or it's already `Bound` with reclaim policy `Retain` (reuse the existing Hetzner volume). A job whose PVC doesn't exist yet stays in `Created` rather than erroring, since Terraform may apply the PVC and the CronJob in the same run in either order.
+
+### Workload Abstraction (for future Deployment support)
+The reconciliation and VM-provisioning code is written against a `WorkloadKind` enum (Phase 2) rather than assuming "CronJob" directly. Today it has one variant. This costs nothing now but means that when `Deployment` support is added later (see "Future Work"), the shared plumbing — Hetzner client, PVC binding, cloud-init templating, log streaming, events, pricing — doesn't need to be reworked; only the state machine for "how a run starts/ends" differs per kind.
+
 ### Database Strategy
 - SQLite: single file, ACID, no external dependency
 - Versioning: update rows by incrementing `version` column
@@ -485,30 +545,31 @@ Each state has:
 
 ### Per-Phase Checklist
 - Phase 1: terraform apply/destroy works, resources stored in SQLite
-- Phase 2: reconciliation loop advances job states automatically
-- Phase 3: logs show "DRY-RUN" messages, no actual resources created
-- Phase 4: small volumes created/deleted cleanly, orphan scan finds/deletes strays
-- Phase 5: VMs launch, receive cloud-init, containers run
-- Phase 6: kubectl logs -f works while container running
-- Phase 7: 10+ chaos scenarios (kill shim, container crashes, etc.) with zero orphans
-- Phase 8: kubectl describe shows events, kubectl top shows metrics
-- Phase 9: costs calculated per job, total cost tracked
-- Phase 10: all resources named consistently, cleanup script works
-- Phase 11: real osmdiffs job completes successfully, cost accurate
+- Phase 2: PVC CRUD works, CronJob resolves a referenced PVC, a second differently-sized cronjob coexists without naming collisions
+- Phase 3: reconciliation loop advances job states automatically
+- Phase 4: logs show "DRY-RUN" messages, no actual resources created
+- Phase 5: small volumes created/deleted cleanly, orphan scan finds/deletes strays without touching Retain-policy PVCs
+- Phase 6: VMs launch sized per-job, receive cloud-init, containers run
+- Phase 7: kubectl logs -f works while container running
+- Phase 8: 10+ chaos scenarios (kill shim, container crashes, etc.) with zero orphans and zero duplicate resources
+- Phase 9: kubectl describe shows events, kubectl top shows metrics across all running jobs
+- Phase 10: costs calculated per job and per family, total cost tracked, budget guard pauses new launches when exceeded
+- Phase 11: all resources named consistently, cleanup script works
+- Phase 12: real osmdiffs job and at least one other cronjob complete successfully, concurrently at least once, cost accurate
 
 ### End-to-End Test
 ```bash
 # 1. Provision VPS with provision.sh
 # 2. Deploy shim (cargo build --release, copy to VPS, systemd service)
-# 3. Apply Terraform config with real osmdiffs CronJob
-# 4. Monitor until job completes (6+ hours)
+# 3. Apply Terraform config with the real cronjob family (osmdiffs + others)
+# 4. Monitor until jobs complete (6+ hours for osmdiffs)
 # 5. Verify:
-#    - kubectl logs shows full osmdiffs output
+#    - kubectl logs shows full output for each job
 #    - kubectl get pod shows Succeeded status
-#    - Hetzner console: volume created, then deleted
-#    - Cost calculated: €0.50-1.50 per job
+#    - Hetzner console: volumes created, then deleted (except Retain-policy ones)
+#    - Cost calculated per job and aggregated across the family
 #    - Shim logs: no errors, all state transitions clean
-# 6. Run 2-3 more jobs (over 1-2 weeks) with zero manual intervention
+# 6. Run 2-3 more scheduled cycles (over 1-2 weeks) with zero manual intervention
 ```
 
 ---
@@ -521,20 +582,39 @@ Each state has:
 
 3. **Terraform state**: Where does user store it? Assumed locally or in git (not critical to shim implementation).
 
-4. **Monitoring**: Plan includes logging to journalctl. Optional: export to syslog/Loki later.
+4. **Monitoring**: Plan includes logging to journalctl. Optional: export to syslog/Loki later. Still no notification path for a failed unattended run — worth deciding whether that's a log-only concern or needs an actual alert (email/webhook) before Phase 12.
 
-5. **RBAC/AuthN**: Assumed single-user trusted setup. Skip RBAC entirely.
+5. **RBAC/AuthN**: Assumed single-user trusted setup. Skip RBAC entirely, but Phase 1 currently ships with no auth token at all over plain HTTP — this must stay bound to localhost/VPN until at least a bearer token exists, since anyone reaching port 6443 could create jobs that spend the Hetzner budget.
+
+6. **PVC default reclaim policy**: Phase 2 defaults to `Delete` (matches the original ephemeral-per-job-run design). Confirm this is the right default for every job in the family, or whether some jobs should default to `Retain` for caching.
+
+7. **Concurrency/budget guard scope**: Is `max_concurrent_jobs` a global cap across the whole family, or per-job-type? Is `daily_budget_eur` a hard stop (refuse new job launches) or just an alert that still lets jobs run?
+
+8. **Deployment networking (future)**: long-running Deployments will likely need a stable public IP/DNS name, unlike ephemeral CronJob VMs that are torn down after each run. Not needed for the initial scope, but worth deciding before "Future Work" below begins.
+
+---
+
+## Future Work: Deployments (`apps/v1`)
+
+Not in the initial scope, but the design above is meant to make this additive rather than a rewrite:
+
+- Add `Deployment` (apps/v1) as a second `WorkloadKind` (see Phase 2), alongside `CronJob`.
+- Reuses as-is: the Hetzner client, PVC binding logic, cloud-init templating, log streaming, events/metrics, and pricing — all built for CronJobs.
+- New pieces needed: a long-running VM state (create → run → restart-on-crash indefinitely, instead of create → run → delete once), a health-check/restart policy, and — per Open Question 8 — a stable network identity if the deployment needs to be reachable.
+- Sequencing: start this only after the CronJob path (Phases 1-12) has run in production for a while and the reconciliation loop has proven itself reliable across restarts. A long-running workload has a much bigger blast radius for a reconciliation-loop bug than a 6-hour job does — a stuck CronJob run wastes at most one job's worth of money; a stuck Deployment could run (and bill) indefinitely.
 
 ---
 
 ## Timeline Estimate
 
-- **Phase 1-2** (HTTP + reconciliation skeleton): 2 days
-- **Phase 3-4** (Hetzner volumes): 2 days
-- **Phase 5-6** (VMs + container + logs): 2 days
-- **Phase 7-8** (hardening + events/metrics): 2 days
-- **Phase 9-10** (pricing + naming): 2 days
-- **Phase 11** (real workload testing): 2 days
-- **Total**: ~2 weeks of development, 1+ week of running/monitoring
+- **Phase 1** (HTTP + CRUD scaffold): 2 days — done
+- **Phase 2** (PVC API + multi-job resource model): 1 day
+- **Phase 3-4** (reconciliation skeleton + dry-run Hetzner): 2 days
+- **Phase 5-6** (Hetzner volumes + VMs/containers): 2 days
+- **Phase 7-8** (log streaming + hardening): 2 days
+- **Phase 9-10** (events/metrics + pricing/budget guard): 2 days
+- **Phase 11** (naming + cleanup): 1 day
+- **Phase 12** (multi-job real-workload testing): 2 days
+- **Total**: ~2.5 weeks of development (the extra half-day over the original estimate is Phase 2's PVC/multi-job work), 1+ week of running/monitoring across the whole cronjob family. `Deployment` support (Future Work) is intentionally excluded from this estimate.
 
 ---
