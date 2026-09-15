@@ -23,10 +23,27 @@ fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BINARY="$REPO_ROOT/target/release/kube-shim"
 WORK_DIR="$(mktemp -d)"
-PORT=16443
-BASE_URL="https://127.0.0.1:${PORT}"
 SERVER_PID=""
 FAILURES=0
+
+find_free_port() {
+    # Ask the OS for a currently-free ephemeral port rather than hardcoding
+    # one: nothing guarantees any specific port is unused on a CI runner
+    # (not even a high, non-standard one -- see PR discussion). This still
+    # leaves a small window between "the OS said this port was free" and
+    # "our server actually binds it", since a shell script can't hand the
+    # already-open socket to the server the way the Rust integration test
+    # does with std::net::TcpListener -- but that race is negligible in
+    # practice, and far safer than a fixed number.
+    python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
+}
+
+PORT="$(find_free_port)"
+if [[ -z "$PORT" ]]; then
+    echo "FAIL - could not determine a free port"
+    exit 1
+fi
+BASE_URL="https://127.0.0.1:${PORT}"
 
 cleanup() {
     if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
