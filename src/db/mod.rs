@@ -1,16 +1,21 @@
 use anyhow::{Context, Result};
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::path::Path;
+use std::str::FromStr;
 
 pub async fn init_pool<P: AsRef<Path>>(db_path: P) -> Result<SqlitePool> {
-    let db_url = format!(
-        "sqlite://{}",
-        db_path.as_ref().display()
-    );
+    let db_url = format!("sqlite://{}", db_path.as_ref().display());
+
+    // create_if_missing is required: sqlx does not create the database file
+    // by default, so a fresh deployment with no pre-existing db.sqlite would
+    // otherwise fail to start.
+    let options = SqliteConnectOptions::from_str(&db_url)
+        .with_context(|| format!("Invalid database path: {}", db_url))?
+        .create_if_missing(true);
 
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
-        .connect(&db_url)
+        .connect_with(options)
         .await
         .context("Failed to connect to SQLite database")?;
 

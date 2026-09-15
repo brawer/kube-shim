@@ -1,13 +1,12 @@
-use kube_shim::{api, config, db};
+use kube_shim::{api, config, db, tls};
 use anyhow::{Context, Result};
 use axum::{
     routing::{get, post},
     Router,
 };
 use clap::Parser;
-use tokio::net::TcpListener;
+use std::net::SocketAddr;
 use tower_http::cors::CorsLayer;
-use tracing_subscriber;
 
 #[derive(Parser, Debug)]
 #[command(name = "kube-shim")]
@@ -38,18 +37,19 @@ async fn main() -> Result<()> {
     // Build router
     let app = build_router(pool);
 
-    // Bind and listen
-    let listener = TcpListener::bind(format!("{}:{}", cfg.server.host, cfg.server.port))
+    // Load TLS configuration
+    let tls_config = tls::load_tls_config(&cfg.server.tls_cert_path, &cfg.server.tls_key_path)
         .await
-        .context("Failed to bind to address")?;
+        .context("Failed to load TLS configuration")?;
 
-    tracing::info!(
-        "Server listening on http://{}:{} (Note: Phase 2 will add TLS support)",
-        cfg.server.host,
-        cfg.server.port
-    );
+    let addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port)
+        .parse()
+        .context("Invalid server host/port")?;
 
-    axum::serve(listener, app)
+    tracing::info!("Server listening on https://{}", addr);
+
+    axum_server::bind_rustls(addr, tls_config)
+        .serve(app.into_make_service())
         .await
         .context("Server error")?;
 

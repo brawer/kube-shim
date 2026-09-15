@@ -71,6 +71,6 @@ interval_secs = 10
 "#;
         let config: Config = toml::from_str(toml_str).expect("Failed to parse config");
         assert_eq!(config.server.port, 6443);
-        assert_eq!(config.hetzner.dry_run, true);
+        assert!(config.hetzner.dry_run);
     }
 }
