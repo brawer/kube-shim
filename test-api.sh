@@ -1,8 +1,8 @@
 #!/bin/bash
 set -e
 
-BASE_URL="http://127.0.0.1:6443"
-INSECURE=""  # No TLS in Phase 1
+BASE_URL="https://127.0.0.1:6443"
+INSECURE="-k"  # self-signed cert, not in any trust store
 
 echo "=== Kube-Shim API Testing ==="
 echo ""

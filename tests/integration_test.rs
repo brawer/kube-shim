@@ -1,7 +1,7 @@
-use serde_json::json;
-use sqlx::{SqlitePool, Row};
-use uuid::Uuid;
 use chrono::Utc;
+use serde_json::json;
+use sqlx::{Row, SqlitePool};
+use uuid::Uuid;
 
 // Test helpers
 async fn setup_test_db() -> SqlitePool {
@@ -26,8 +26,7 @@ async fn test_create_and_get_secret() {
     // Insert into database
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().timestamp();
-    let data_json = serde_json::to_string(&secret_data["data"])
-        .expect("Failed to serialize data");
+    let data_json = serde_json::to_string(&secret_data["data"]).expect("Failed to serialize data");
 
     sqlx::query(
         r#"

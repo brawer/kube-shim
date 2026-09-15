@@ -25,12 +25,16 @@ anyhow = "1.0"
 thiserror = "1.0"
 config = "0.14"
 toml = "0.8"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 http = "1.0"
 hyper = "1.0"
-rustls = "0.23"
+rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2.0"
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 clap = { version = "4.0", features = ["derive"] }
-# Note: TLS dependencies (rustls, tokio-rustls, etc.) will be added in Phase 2
+
+[dev-dependencies]
+rcgen = "0.13"
+tempfile = "3"

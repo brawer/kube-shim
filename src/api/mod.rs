@@ -1,13 +1,10 @@
-pub mod secret;
 pub mod cronjob;
+pub mod secret;
 
 #[cfg(test)]
 mod tests;
 
-use axum::{
-    response::IntoResponse,
-    Json,
-};
+use axum::{response::IntoResponse, Json};
 use serde_json::json;
 
 pub async fn discovery_v1() -> impl IntoResponse {
