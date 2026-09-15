@@ -7,8 +7,8 @@
 **Solution:** Build a lightweight Kubernetes API server that runs on a cheap VPS ($10-20/month) and:
 - Accepts Kubernetes `Secret`, `PersistentVolumeClaim`, and `CronJob` manifests via Terraform, authenticated by a bearer token — no VPN or special networking required
 - Creates ephemeral Hetzner Cloud VMs per job run, sized per-job from the CronJob pod template's resource requests (not a single hardcoded size)
-- Manages Hetzner Cloud block volumes provisioned via PersistentVolumeClaims — ephemeral (deleted after each run) by default, or retained across runs when a job wants to reuse cached data (e.g. a downloaded OSM planet file)
-- Runs containers via cloud-init + Docker inside VMs
+- Manages Hetzner Cloud block volumes provisioned via PersistentVolumeClaims, using the standard `spec.storageClassName` field — ephemeral (deleted after each run) by default, or retained across runs when a job wants to reuse cached data (e.g. a downloaded OSM planet file)
+- Runs containers via cloud-init + Docker inside VMs, on worker VMs that are unreachable from the internet (inbound) while still able to reach it (outbound) — via a Hetzner Cloud Firewall, not private networking
 - Talks to the cloud through a small provider-agnostic interface — Hetzner Cloud is the only implementation initially, with Infomaniak (OpenStack) plannable as a second provider later without reworking the reconciliation loop (see "Future Work")
 - Exposes Kubernetes-compatible APIs so Terraform `kubernetes_provider` works natively
 - Streams logs, metrics, and cost tracking via custom Kubernetes APIs
@@ -22,8 +22,9 @@
 - Cheap indie developer infrastructure (total ~€50-60/month across the whole cronjob family)
 - Must survive control plane restarts (crash recovery via reconciliation loop) — including a restart caused by updating the shim's own container image
 - Must prevent resource leaks (volumes, VMs) if any component fails
-- Must prevent runaway cost if multiple jobs misfire concurrently or a single job runs long — enforced via a concurrency cap and a rolling (not daily-reset) budget guard, so the daily rate can be low while still allowing an occasional bigger job funded by unspent prior days
-- The authenticated `:6443` API must not be usable by anyone who doesn't hold the bearer token, since it can create jobs that spend the Hetzner budget — and this has to work without a VPN or other special networking
+- Must prevent runaway cost if a single job runs long or several run at once — enforced by a rolling (not daily-reset) budget guard alone, so the daily rate can be low while still allowing an occasional bigger job funded by unspent prior days; no separate job-count cap, since at the budget levels this project runs at, the budget itself already prevents meaningful concurrency in practice
+- The authenticated `:6443` API must not be usable by anyone who doesn't hold a valid bearer token, since it can create jobs that spend the Hetzner budget — and this has to work without a VPN or other special networking
+- Worker VMs must be unreachable from the internet (no inbound connections from anyone but the shim itself), while still able to reach the internet outbound (downloading input data, uploading results)
 - The public status page has no authentication, so it must never render secrets, credentials, or anything else that isn't meant to be public
 
 ---
@@ -43,6 +44,7 @@
    - Receive volume attachment + container spec via cloud-init
    - Run Docker container with mounted volume
    - Communicate status/logs back to shim via SSH (a native Rust client, not a subprocess) + status files
+   - Protected by a Hetzner Cloud Firewall: no inbound from anywhere except the shim's own VPS IP, all outbound allowed — unreachable from the internet without needing private networking or a NAT gateway
 
 **3. Kubernetes API Surface:** Minimal implementation
    - Resources: `Secret` (v1), `PersistentVolumeClaim` (v1), `CronJob` (batch/v1), Pod status
@@ -136,19 +138,20 @@ sqlite3 db.sqlite "SELECT * FROM jobs"
 **Goal:** Close the gap this plan flagged in Open Question 5 — Phase 1 shipped with zero authentication on `:6443`. Since there's no VPN and no other special networking planned, this has to be solved with an in-band credential before the shim can safely face the internet.
 
 **Deliverables:**
-- A single shared-secret bearer token: `api_token` in `config.toml`, generated (e.g. via `openssl rand -base64 32`) rather than a human-chosen password — with that much entropy, brute-forcing it is computationally infeasible, so no separate rate-limiting layer is needed at launch. This mirrors Kubernetes' own built-in "static token file" authenticator (`--token-auth-file`) — a standard, supported pattern, not a bespoke one.
-- Middleware wrapping the *entire* `:6443` router — every route, reads included, since Secret contents must never be visible without auth — that checks `Authorization: Bearer <token>` using a **constant-time comparison**, not `==`, so response timing can't leak how many leading bytes of a guess matched.
+- A **list** of shared-secret bearer tokens rather than a single one — `api_tokens` in `config.toml`, each entry a generated token (e.g. via `openssl rand -base64 32`, never a human-chosen password) plus an optional `expires_at` (RFC 3339). This is what makes rotation possible: add the new token, update Terraform/kubectl to use it, then remove (or let expire) the old one — an overlap window rather than a single atomic cutover. It mirrors Kubernetes' own built-in "static token file" authenticator (`--token-auth-file`), which is itself a *list* of valid tokens for exactly this reason — not a bespoke design.
+- Middleware wrapping the *entire* `:6443` router — every route, reads included, since Secret contents must never be visible without auth — that checks `Authorization: Bearer <token>` against every non-expired entry in the list, using a **constant-time comparison** for each (iterating the whole list unconditionally rather than short-circuiting on the first match, so total response time doesn't leak which entry — or whether any entry — matched).
+- If the configured list is empty, or every entry has expired, **the shim refuses to start** rather than either locking the operator out confusingly at request time or — far worse — failing open and accepting all requests. This is checked once at startup and again whenever the config is reloaded.
 - Missing or wrong token → HTTP 401 Unauthorized, using the standard Kubernetes `Status` object (`reason: Unauthorized`) — distinct from the 403 `Forbidden` used for admission denials (Phase 4): 401 means "I don't know who you are," 403 means "I know who you are and the answer is no," matching real API server semantics.
 - The public status page (`:8080`, Phase 13) is deliberately *not* wrapped by this middleware — it stays unauthenticated by design.
-- No custom client tooling needed: `kubectl config set-credentials ... --token=...` and Terraform's `kubernetes_provider` `token` argument both send exactly this header natively.
+- No custom client tooling needed: `kubectl config set-credentials ... --token=...` and Terraform's `kubernetes_provider` `token` argument both send exactly this header natively, regardless of how many tokens the shim currently considers valid.
 - **From this phase onward, every `curl` example against `:6443` elsewhere in this document assumes `-H "Authorization: Bearer $TOKEN"` is included — omitted from later snippets for brevity, not because it's optional.**
 
 **Files to create/modify:**
-- `src/auth.rs` (new) - bearer-token middleware, constant-time comparison
+- `src/auth.rs` (new) - bearer-token middleware: list iteration, constant-time comparison per entry, expiration check
 - `src/k8s_status.rs` (new) - builds Kubernetes-shaped `Status` error responses (401 here; reused by Phase 4's 403 admission check and any future validation rejection)
 - `src/main.rs` - wrap the `:6443` router in the auth middleware; the `:8080` router (Phase 13) never gets it
-- `src/config.rs` - add `api_token` (required to start; refuse to boot with it unset)
-- `bootstrap/provision.sh` - generate the token during first-time provisioning, print/save it once for the operator to copy into their kubeconfig/Terraform vars
+- `src/config.rs` - add `api_tokens: Vec<{token, expires_at: Option<DateTime>}>`; refuse to boot if none currently valid
+- `bootstrap/provision.sh` - generate the first token during first-time provisioning, print/save it once for the operator to copy into their kubeconfig/Terraform vars
 
 **Testing:**
 ```bash
@@ -163,6 +166,14 @@ curl -k -H "Authorization: Bearer $(cat api-token.txt)" https://localhost:6443/a
 
 # The public status page (once Phase 13 exists) must keep working with no auth at all:
 curl http://localhost:8080/
+
+# Rotation:
+# Add a second token to api_tokens, restart, confirm BOTH the old and new
+# token work simultaneously
+# Set the old token's expires_at to the past, restart, confirm only the
+# new token works and the old one now gets 401
+# Empty the list entirely (or expire every entry) and confirm the shim
+# refuses to start, rather than booting with no effective auth
 ```
 
 Note: the token only protects the connection if TLS is actually used (already shipped in Phase 1) — a bearer token sent over plaintext HTTP is trivially sniffable, so this closes the loop only together with the existing TLS listener, never instead of it.
@@ -215,11 +226,11 @@ systemctl --user restart kube-shim
 **Deliverables:**
 - `PersistentVolumeClaim` (v1) CRUD handlers: create/read/list/delete
   - `spec.resources.requests.storage`, `spec.accessModes`
-  - Shim-specific annotation `kube-shim.io/reclaim-policy: Delete|Retain` (default `Delete`, matching the original ephemeral-per-run behavior). `Retain` keeps the underlying Hetzner volume around between job runs — useful for a job that wants to cache a large downloaded dataset instead of re-fetching it weekly.
+  - Reclaim policy via the **standard** `spec.storageClassName` field, not a custom annotation: two built-in class names, `kube-shim-delete` (the default when `storageClassName` is omitted, matching the original ephemeral-per-run behavior) and `kube-shim-retain` (keeps the underlying Hetzner volume around between job runs — useful for a job that wants to cache a large downloaded dataset instead of re-fetching it weekly). No separate `StorageClass`/`PersistentVolume` CRUD is implemented — real dynamic provisioning's three-resource dance (StorageClass → PV → PVC) would be meaningfully more work for no practical benefit here, so the two class names are just a fixed, internally known lookup. An unknown `storageClassName` is rejected the standard way: HTTP 422, `Status` object, `reason: Invalid`, `causes: [{reason: FieldValueNotSupported, field: "spec.storageClassName"}]` — built via `src/k8s_status.rs` (Phase 2), same as every other structured error in this API.
 - CronJob pod template can reference a PVC by name (`volumes: - persistentVolumeClaim: claimName: ...`); the reconciliation loop resolves it instead of always creating an ad-hoc volume per run.
-- Database: `persistent_volume_claims` table (name, namespace, size_gb, access_mode, reclaim_policy, bound_hetzner_volume_id, status: `Pending` / `Bound` / `Released`)
+- Database: `persistent_volume_claims` table (name, namespace, size_gb, access_mode, storage_class_name, bound_hetzner_volume_id, status: `Pending` / `Bound` / `Released`)
 - Per-job VM sizing: read `resources.requests.cpu` / `.memory` from the CronJob's pod template and map to a Hetzner server type (small lookup table), instead of the fixed cx51 assumption — needed now that the shim runs more than one workload shape.
-- Config: `max_concurrent_jobs`, plus the rolling-budget parameters `budget_daily_rate_eur` and `budget_rollover_cap_days` — this just reserves the config shape; the accrual/enforcement logic itself is built in Phase 12, once cost calculation exists.
+- Config: the rolling-budget parameters `budget_daily_rate_eur` and `budget_rollover_cap_days` — this just reserves the config shape; the accrual/enforcement logic itself is built in Phase 12, once cost calculation exists. No `max_concurrent_jobs` or other job-count cap: the budget guard is the only concurrency limiter (see Key Constraints) — at this project's spending levels it already rules out meaningful concurrent spend, so a second, separate cap would just be redundant bookkeeping.
 - Internal `WorkloadKind` enum (`CronJob` for now) threaded through the reconciliation types, so the Phase 8+ VM-provisioning and PVC-binding code isn't written in a way that assumes "CronJob" is the only possible workload kind. This is purely an internal abstraction — no new API surface — done now so the future Deployment support (see "Future Work") doesn't require rewriting this layer.
 - **Admission check on CronJob create/update: `spec.jobTemplate.spec.activeDeadlineSeconds` must be set.** `activeDeadlineSeconds` is optional in the real Kubernetes API, but the shim needs a hard worst-case runtime bound for every job to make the budget guard (Phase 12) and deadline enforcement (Phase 10) meaningful, so it requires it via policy the same way a real cluster's `ValidatingAdmissionPolicy`/webhook would. A CronJob submitted without it is rejected with the same response shape a real admission webhook denial produces: HTTP 403, a `Status` object (`kind: Status`, `reason: Forbidden`, built via Phase 2's `src/k8s_status.rs`), message `admission webhook "kube-shim.io/require-active-deadline" denied the request: spec.jobTemplate.spec.activeDeadlineSeconds must be set (bounds the job's worst-case cost against the budget guard)`. `kubectl`/Terraform surface this exactly like any real admission denial — resolves Open Question 9.
 
@@ -229,16 +240,20 @@ systemctl --user restart kube-shim
 - `src/api/cronjob.rs` - add the `activeDeadlineSeconds` admission check on create/update
 - `src/admission.rs` (new) - the `activeDeadlineSeconds` policy check itself, reusing Phase 2's `src/k8s_status.rs` for the response
 - `src/db/schema.sql` - add `persistent_volume_claims` table
-- `src/config.rs` - add `max_concurrent_jobs`, `budget_daily_rate_eur`, `budget_rollover_cap_days`
+- `src/config.rs` - add `budget_daily_rate_eur`, `budget_rollover_cap_days`
 - `src/workload.rs` (new) - `WorkloadKind` enum + shared resource-sizing helpers
 
 **Testing:**
 ```bash
 terraform apply   # now includes a PersistentVolumeClaim alongside Secret/CronJob
 kubectl get pvc osmdiffs-scratch
-sqlite3 db.sqlite "SELECT name, size_gb, reclaim_policy, status FROM persistent_volume_claims"
+sqlite3 db.sqlite "SELECT name, size_gb, storage_class_name, status FROM persistent_volume_claims"
 # Apply a second, differently-sized cronjob + PVC (e.g. a smaller weekly job)
 # and confirm both are stored independently with no naming collisions.
+
+# Reclaim policy:
+kubectl apply -f pvc-with-unknown-storage-class.yaml
+# Error from server (Invalid): ...spec.storageClassName: Unsupported value...
 
 # Admission check:
 # Apply a CronJob with no activeDeadlineSeconds set
@@ -287,7 +302,7 @@ sqlite3 db.sqlite "SELECT name, status, retry_count FROM jobs"
 **Goal:** Call the real Hetzner API but don't actually create resources yet — and define the provider interface so Hetzner isn't hardcoded throughout the codebase.
 
 **Deliverables:**
-- A `CloudProvider` trait (`create_volume`, `delete_volume`, `attach_volume`, `create_server`, `delete_server`, `get_pricing`, ...) defined *before* writing any Hetzner-specific code. `HetznerProvider` is the only implementation for now. This is what lets Infomaniak (OpenStack) be added later as a second implementation instead of a rewrite (see "Future Work") — but it's a lightweight seam, not a finished multi-cloud abstraction; expect its exact method signatures to need adjustment once a second provider is actually implemented against it.
+- A `CloudProvider` trait (`create_volume`, `delete_volume`, `attach_volume`, `create_server`, `delete_server`, `create_firewall`, `get_pricing`, ...) defined *before* writing any Hetzner-specific code. `create_firewall` is what Phase 8 uses to lock worker VMs down to no inbound traffic except from the shim itself. `HetznerProvider` is the only implementation for now. This is what lets Infomaniak (OpenStack) be added later as a second implementation instead of a rewrite (see "Future Work") — but it's a lightweight seam, not a finished multi-cloud abstraction; expect its exact method signatures to need adjustment once a second provider is actually implemented against it.
 - Hetzner client setup (hcloud crate) implementing `CloudProvider`
 - `DRY_RUN=true` config flag
 - Reconciliation step: `VolumePending` → attempt volume creation (logged, not executed)
@@ -357,6 +372,7 @@ terraform apply
 **Deliverables:**
 - Cloud-init script generation (bash, templated with proper escaping — job-supplied values such as image name/args/env must never be interpolated into shell unescaped; pass them as a base64-encoded blob decoded inside the VM instead)
 - Real VM creation, sized per-job using the resource-request lookup table from Phase 4 (not a fixed cx51)
+- **Every worker VM gets a Hetzner Cloud Firewall attached at creation time**: all inbound denied except SSH (22) from the shim's own VPS IP; all outbound allowed. This is what makes "unreachable from the internet, but can still reach it" true (Key Constraints) — no Hetzner private network, no NAT gateway, no extra routing needed; the VM keeps a normal public IP for outbound connectivity, it's just unreachable inbound from anyone but the shim.
 - VM waits for volume attachment, mounts it
 - VM pulls container image, runs docker
 - Container write to /scratch
@@ -366,6 +382,7 @@ terraform apply
 
 **Files to create/modify:**
 - `src/providers/hetzner/servers.rs` - implement real server create/delete
+- `src/providers/hetzner/firewall.rs` (new) - creates/attaches the restrictive Cloud Firewall for every worker VM
 - `src/cloud_init.rs` (new) - generate cloud-init script with proper escaping
 - `src/reconcile/job.rs` - add VM state steps (VMCreating, VMRunning, etc.)
 - `bootstrap/cloud-init-template.sh` (new) - bash template for VM startup
@@ -385,6 +402,12 @@ terraform apply
 # Verify logs fetchable: ssh root@{ip} docker logs {container-id}
 # terraform destroy
 # Verify VM + volume deleted
+
+# Firewall:
+# From a machine that is NOT the shim's VPS, confirm every port on the
+# worker VM's public IP is unreachable (e.g. `nc -zv {worker-ip} 22` times out)
+# From inside the worker VM (via the shim's own SSH access), confirm outbound
+# still works, e.g. `curl -sI https://example.com` succeeds
 ```
 
 ---
@@ -600,7 +623,7 @@ curl -H "Authorization: Bearer $TOKEN" https://api.hetzner.cloud/v1/volumes | jq
 **Deliverables:**
 - Swap 1GB test volume for the real per-job sizes (up to 250GB for osmdiffs)
 - Swap busybox for real container images, across at least osmdiffs and one other cronjob from the family
-- Run osmdiffs and at least one other cronjob concurrently at least once, to exercise the multi-job concurrency cap and budget guard under real conditions
+- Run osmdiffs and at least one other cronjob concurrently at least once, to exercise the budget guard under real concurrent-job conditions
 - One full osmdiffs job run (6+ hours)
 - Monitor Hetzner console, logs, costs, and the public status page
 - Run 2-3 scheduled runs across the family (wait for real schedule triggers or trigger manually)
@@ -643,6 +666,7 @@ curl -k https://localhost:6443/debug/status | jq '.total_cost_eur, .budget_balan
 | `src/db/schema.sql` | SQLite schema | Phases 1, 4-5, 7-8, 10-12 |
 | `src/reconcile/*.rs` | State machine loop, incl. `activeDeadlineSeconds` enforcement (Phase 10) | Create (Phases 5, 7-8, 10, 12) |
 | `src/providers/*.rs` | `CloudProvider` trait + Hetzner implementation | Create (Phases 6-8, 12) |
+| `src/providers/hetzner/firewall.rs` | Restrictive Cloud Firewall for worker VMs (inbound denied except from the shim) | Create (Phase 8) |
 | `src/pricing/*.rs` | Cost tracking + rolling budget guard | Create (Phase 12) |
 | `src/ssh.rs` | SSH client built on `russh` | Create (Phase 9) |
 | `src/status_page.rs` | Public read-only status page (port 8080) | Create (Phase 13) |
@@ -698,10 +722,16 @@ A job also passes through `BudgetWait` before `VolumePending` if its estimated c
 A running job that exceeds its `activeDeadlineSeconds` (Phase 10) is force-killed and transitions to `Failed` with reason `DeadlineExceeded` — the same terminology real Kubernetes Jobs use for this exact situation.
 
 ### Authentication
-`:6443` requires `Authorization: Bearer <api_token>` on every request (Phase 2), checked with a constant-time comparison. A missing or wrong token gets a standard Kubernetes `Status` object with `reason: Unauthorized` (HTTP 401) — separate from the `reason: Forbidden` (HTTP 403) used for admission denials below, matching real API server conventions. `:8080` (Phase 13) is deliberately excluded from this middleware; it's meant to be public.
+`:6443` requires `Authorization: Bearer <token>` on every request (Phase 2), checked against every non-expired entry in `api_tokens` with a constant-time comparison. A missing or wrong token gets a standard Kubernetes `Status` object with `reason: Unauthorized` (HTTP 401) — separate from the `reason: Forbidden` (HTTP 403) used for admission denials below, matching real API server conventions. `:8080` (Phase 13) is deliberately excluded from this middleware; it's meant to be public. Supporting a *list* of tokens (each with an optional expiry) rather than a single one is what makes rotation possible: add a new token, migrate clients, then remove the old one — never a single atomic cutover with no overlap window.
 
 ### Admission Validation
 `activeDeadlineSeconds` is optional in the real Kubernetes API, but the shim requires it on every CronJob (Phase 4) so the budget guard and deadline enforcement above have something to work with. Rather than silently defaulting it or inventing a bespoke error, a missing deadline is rejected the same way a real cluster's admission webhook/policy would reject a policy violation: HTTP 403, a standard `Status` object (`reason: Forbidden`), and a message in the same shape a tool like Gatekeeper or Kyverno would produce. `src/k8s_status.rs` (Phase 2) builds this response generically, so any future admission/validation rule (not just this one) can reuse it.
+
+### Storage Classes / Reclaim Policy
+Rather than a custom annotation, reclaim policy is exposed through the PVC's standard `spec.storageClassName` field (Phase 4) — one of two built-in, hardcoded class names (`kube-shim-delete`, the default, and `kube-shim-retain`). No real `StorageClass` or `PersistentVolume` resource type is implemented; that would mean modeling actual Kubernetes dynamic provisioning's three-resource dance for no practical benefit at this project's scale, so the two names are just an internally known lookup table, not a CRUD'd API resource. An unknown class name is rejected via `src/k8s_status.rs`, HTTP 422 `reason: Invalid` — the same idiomatic shape a real cluster uses for "this enum value isn't one of the supported ones," distinct from the 403 `Forbidden` used for the `activeDeadlineSeconds` policy check above (that's a cluster policy denying an otherwise-valid request; this is a plain field-value validation failure).
+
+### Worker VM Network Isolation
+Every worker VM (Phase 8) gets a Hetzner Cloud Firewall at creation time: all inbound denied except SSH from the shim's own VPS IP, all outbound allowed. This achieves "unreachable from the internet, but can still reach it" (Key Constraints) without Hetzner private networking or a NAT gateway — the VM keeps its normal public IP (needed for outbound egress), it's just unreachable inbound from anyone but the shim. Chosen over private networking specifically for simplicity: a NAT-gateway-via-the-control-plane setup would need extra routing/IP-forwarding configuration on both ends for a security benefit (never touching the public internet even for shim↔worker traffic) that's largely redundant once the firewall already blocks every other inbound source.
 
 ### Workload Abstraction (for future Deployment support)
 The reconciliation and VM-provisioning code is written against a `WorkloadKind` enum (Phase 4) rather than assuming "CronJob" directly. Today it has one variant. This costs nothing now but means that when `Deployment` support is added later (see "Future Work"), the shared plumbing — cloud provider client, PVC binding, cloud-init templating, log streaming, events, pricing — doesn't need to be reworked; only the state machine for "how a run starts/ends" differs per kind.
@@ -730,13 +760,13 @@ The shim ships as a `FROM scratch` OCI image (Phase 3): a statically-linked musl
 
 ### Per-Phase Checklist
 - Phase 1: terraform apply/destroy works, resources stored in SQLite
-- Phase 2: `:6443` rejects requests with no/wrong bearer token (401, standard `Status` object, constant-time comparison); the public status page (once it exists in Phase 13) stays unauthenticated
+- Phase 2: `:6443` rejects requests with no/wrong bearer token (401, standard `Status` object, constant-time comparison); multiple tokens can be valid simultaneously (rotation), expired tokens are rejected, and the shim refuses to start with zero valid tokens configured; the public status page (once it exists in Phase 13) stays unauthenticated
 - Phase 3: `FROM scratch` image builds and starts (static musl binary, no libc); `podman pull` + `systemctl --user restart` picks up a new version with `db.sqlite` and in-flight jobs unaffected; ghcr.io package requires no pull credentials
-- Phase 4: PVC CRUD works, CronJob resolves a referenced PVC, a second differently-sized cronjob coexists without naming collisions; a CronJob without `activeDeadlineSeconds` is rejected with a standard Kubernetes 403 `Status` response, surfaced cleanly by both `kubectl` and Terraform
+- Phase 4: PVC CRUD works, CronJob resolves a referenced PVC, a second differently-sized cronjob coexists without naming collisions; an unknown `storageClassName` is rejected with a 422 `Status` response; a CronJob without `activeDeadlineSeconds` is rejected with a standard Kubernetes 403 `Status` response, surfaced cleanly by both `kubectl` and Terraform
 - Phase 5: reconciliation loop advances job states automatically
 - Phase 6: `CloudProvider` trait exists and `HetznerProvider` is the only caller of it (no direct hcloud calls elsewhere); logs show "DRY-RUN" messages, no actual resources created
 - Phase 7: small volumes created/deleted cleanly, orphan scan finds/deletes strays without touching Retain-policy PVCs
-- Phase 8: VMs launch sized per-job, receive cloud-init, containers run
+- Phase 8: VMs launch sized per-job, receive cloud-init, containers run; every worker VM is unreachable inbound from outside the shim's own IP but can still reach the internet outbound
 - Phase 9: kubectl logs -f works while container running, via `russh` (no `ssh` subprocess spawned by the shim)
 - Phase 10: 10+ chaos scenarios (kill shim, container crashes, etc.) with zero orphans and zero duplicate resources; a job that overruns `activeDeadlineSeconds` is force-killed and marked `Failed`/`DeadlineExceeded`, including when the shim was down at the moment the deadline passed
 - Phase 11: kubectl describe shows events, kubectl top shows metrics across all running jobs
@@ -768,25 +798,27 @@ The shim ships as a `FROM scratch` OCI image (Phase 3): a statically-linked musl
 
 ## Open Questions / Decisions
 
+All ten questions below are now resolved or deliberately deferred — none block starting Phase 1's already-shipped work or any subsequent phase.
+
 1. **Infomaniak vs. Hetzner**: resolved for the initial scope — build against the `CloudProvider` trait (Phase 6) with `HetznerProvider` as the only implementation, and defer Infomaniak (OpenStack) to "Future Work" below rather than guessing its shape now.
 
-2. **Container registry auth for *workload* images**: Assume public image (ghcr.io/brawer/osmdiffs public). If private, need to handle registry credentials in cloud-init. (Distinct from the shim's *own* image, which is also public — see Phase 3 — but that's a separate registry package with separate implications: workload images are pulled by worker VMs via cloud-init, the shim's own image is pulled by podman on the control-plane VPS.)
+2. **Container registry auth for *workload* images**: resolved by inference — all of this project's ghcr.io packages are public (open-source work only), so `ghcr.io/brawer/osmdiffs` and the rest of the cronjob family's images are assumed public too, same as the shim's own image (Phase 3). If any workload image later turns out to be private, cloud-init will need registry credentials added — flag that specifically if it comes up, since it wasn't confirmed job-by-job.
 
-3. **Terraform state**: Where does user store it? Assumed locally or in git (not critical to shim implementation).
+3. **Terraform state**: resolved — out of scope for the shim regardless of how Terraform itself is run (locally, or as a GitHub Action). The shim is just an HTTPS server authenticated by a bearer token; where Terraform's own state file lives has no bearing on it.
 
-4. **Monitoring**: Plan includes logging to journalctl, plus the public status page. Still no notification path for a failed unattended run — worth deciding whether that's a log-only/status-page concern or needs an actual alert (email/webhook) before Phase 15.
+4. **Monitoring / alerting**: deliberately deferred, not implemented in the initial scope. There's no single established generic webhook standard for arbitrary Kubernetes events — the closest ecosystem convention is Prometheus Alertmanager's webhook receiver (built on metrics + alerting rules) or ad hoc event-forwarders like `eventrouter`, both of which are downstream tooling the cluster operator adds, not something the API server defines. OpenTelemetry itself is a telemetry *data pipeline* (traces/metrics/logs), not an alerting system — alerting is a separate concern layered on top of an OTel-fed backend (Grafana, Prometheus, or a vendor). None of that infrastructure is warranted for a single-VPS personal project. If this gets built later, the lightest-weight fit is a simple outbound webhook POST (a JSON payload) on specific events — job `Failed`/`DeadlineExceeded`, budget balance running low — to a user-configured URL (a Slack incoming webhook, `ntfy.sh`, `healthchecks.io`, etc.), no Prometheus/OTel Collector required. For now: journalctl + the status page only.
 
 5. **RBAC/AuthN**: resolved for the initial scope. Full RBAC is still out of scope (single-user trusted setup), but Phase 2 requires a bearer token — mirroring Kubernetes' own built-in static-token-file authenticator — on every request to `:6443`, closing the "must stay bound to VPN" gap without needing a VPN or any special networking. The public `:8080` status page remains deliberately unauthenticated by design (read-only, structurally unable to mutate state) — see Phase 13.
 
-6. **PVC default reclaim policy**: Phase 4 defaults to `Delete` (matches the original ephemeral-per-job-run design). Confirm this is the right default for every job in the family, or whether some jobs should default to `Retain` for caching.
+6. **PVC default reclaim policy**: resolved. Since implementing full standard Kubernetes dynamic provisioning (a real `StorageClass` + `PersistentVolume` resource pair) would be meaningfully more than a day's work for no practical benefit at this scale, the shim instead exposes reclaim policy through the PVC's *standard* `spec.storageClassName` field (a real, already-optional PVC field) mapped to two hardcoded, internally known class names — `kube-shim-delete` (default) and `kube-shim-retain` — rather than either a custom annotation or dropping the feature. See Phase 4 and the "Storage Classes / Reclaim Policy" section under Key Implementation Details.
 
-7. **Concurrency guard scope**: Is `max_concurrent_jobs` a global cap across the whole family, or per-job-type? (The budget side of this question is now resolved — see the rolling budget guard in Phase 12: a hard stop via `BudgetWait`, not a soft alert.)
+7. **Concurrency guard scope**: resolved — dropped entirely, no separate `max_concurrent_jobs`. The rolling budget guard (Phase 12) is the only limiter: at the budget levels this project runs at, it already prevents more than one job's worth of concurrent spend in practice, so a second, separate job-count cap would just be redundant bookkeeping.
 
-8. **Deployment networking (future)**: long-running Deployments will likely need a stable public IP/DNS name, unlike ephemeral CronJob VMs that are torn down after each run. Not needed for the initial scope, but worth deciding before "Future Work" below begins.
+8. **Worker VM networking**: resolved for the initial scope. Every worker VM is unreachable from the internet inbound (a Hetzner Cloud Firewall permits nothing but SSH from the shim's own VPS IP) while remaining free to reach the internet outbound for downloading input data and uploading results — see Phase 8 and "Worker VM Network Isolation" under Key Implementation Details. Exposing any of this *inbound*, e.g. running the shim itself as a configurable reverse proxy driven by a Kubernetes `Ingress` resource, is explicitly out of scope for a long time — see "Future Work: Ingress Proxy" below.
 
 9. **Estimated cost accuracy**: resolved. Rather than guessing a default when `activeDeadlineSeconds` is absent, Phase 4 requires it via an admission check (HTTP 403, standard Kubernetes `Status` object, same shape a real admission-policy denial would produce) — so every job always has an explicit, user-chosen worst-case runtime, and Phase 10 force-kills the VM if it's exceeded. No default to get wrong, and the cost estimate is a real bound rather than a hopeful guess.
 
-10. **Bearer token rotation**: Phase 2 has no rotation story — changing `api_token` in config requires a restart, and there's no way to have two valid tokens during a rotation window (e.g. while updating Terraform's stored credential). Worth deciding whether that's acceptable for a single-operator setup (probably yes) or needs a short grace-period mechanism.
+10. **Bearer token rotation**: resolved. `api_tokens` (Phase 2) is a list, each entry with an optional expiration, checked against all of them — so a new token can be added and adopted by Terraform/kubectl before the old one is removed or allowed to expire, instead of a single atomic cutover with no overlap window. See "Authentication" under Key Implementation Details.
 
 ---
 
@@ -809,6 +841,16 @@ Not in the initial scope. Hetzner covers the stated budget and constraints on it
 - Materially different shape from Hetzner: Keystone token-based auth (tokens expire and need refreshing, unlike Hetzner's static API key), Cinder for volumes, Nova for servers ("flavors" instead of server types, plus availability zones and per-project quotas to account for).
 - Config would need a `provider: hetzner | infomaniak` selector and a per-provider credentials section, rather than the current single implicit Hetzner config block.
 - Sequencing and caveat: don't start this until there's an actual need (e.g. Hetzner capacity/pricing/region no longer fits). Because the `CloudProvider` trait currently has exactly one implementation, its method signatures are a guess, not a validated abstraction — expect to revise the trait itself, not just add a new file, when this work actually begins.
+
+---
+
+## Future Work: kube-shim as an Ingress Proxy
+
+Way out of scope — not sketched in any detail here, just a placeholder so the direction is recorded:
+
+- The idea: let kube-shim itself act as a reverse proxy in front of select worker VMs (or, more likely, future Deployments — see "Future Work: Deployments" above), configured through a standard Kubernetes `Ingress` resource, so specific services could deliberately be made reachable from the internet.
+- This directly reverses the network isolation model established in Phase 8 (worker VMs unreachable inbound by design) for whatever is explicitly exposed through it, so whenever this is actually pursued it needs its own security design pass, not an incremental bolt-on: TLS termination, which `Ingress` fields are even honored, and how it interacts with the existing Hetzner Cloud Firewall per worker VM.
+- No `Ingress` (networking.k8s.io/v1) support exists anywhere in the current API surface (Architecture Overview) — this would be new API surface, not a variation on something already planned.
 
 ---
 
