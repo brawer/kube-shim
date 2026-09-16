@@ -1,0 +1,12 @@
+# Keeps the build context small and, more importantly, keeps local-only
+# artifacts from ever being copied into the build stage by `COPY . .` --
+# none of these should be able to leak into a published image just because
+# they happened to exist on whoever's machine (or CI runner) ran the build.
+.git/
+target/
+*.sqlite
+*.sqlite3
+certs/
+*.pem
+*.key
+config.toml
