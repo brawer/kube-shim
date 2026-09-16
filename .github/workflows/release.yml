@@ -2,88 +2,31 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
+
+# Serialize releases: the manifest job (in release-build.yml) overwrites the
+# shared, mutable ":latest" tag, so two tags pushed close together must not
+# build concurrently -- whichever run's manifest push happened to land last
+# would silently "win" :latest, regardless of which tag is actually newer.
+# cancel-in-progress stays false (the default) on purpose: an in-progress
+# release may be mid-push or mid-attestation, and queuing a second run is
+# safe where killing the first one mid-flight would not be.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions: {}
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  # The actual build/manifest/attest work lives in release-build.yml, called
+  # here as a reusable workflow rather than inlined as jobs in this file.
+  # That split is what gets us SLSA Build Level 3 rather than Level 2 --
+  # see release-build.yml's own header comment for why.
+  release:
+    name: Build, package, and attest
     permissions:
+      attestations: write
       contents: read
-      # Needed to push the image to ghcr.io.
+      id-token: write
       packages: write
-    outputs:
-      image: ${{ steps.image.outputs.image }}
-      digest: ${{ steps.build.outputs.digest }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        # Pinned to a commit SHA rather than a floating tag (SLSA/OSSF supply-chain hygiene):
-        # a tag can be moved or a compromised release republished under the same tag, silently
-        # changing what runs in CI. To bump, resolve the new tag to its commit SHA and update
-        # both the SHA and the version comment together. Same convention as ci.yml.
-
-      - uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
-
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - id: build
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          # linux/amd64 only: the target is a standard Hetzner Cloud VPS.
-          # Add more platforms here if that ever changes.
-          platforms: linux/amd64
-          push: true
-          # Immutable version tag from the pushed git tag (e.g. v0.1.0),
-          # never :latest -- see docs/IMPLEMENTATION_PLAN.md Phase 3 for why
-          # (deliberate, manual updates only).
-          tags: ghcr.io/${{ github.repository_owner }}/kube-shim:${{ github.ref_name }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - id: image
-        run: |
-          # The SLSA provenance job below needs the image name as a job
-          # output (the `env` context isn't available to a reusable
-          # workflow's `with:` inputs).
-          echo "image=ghcr.io/${{ github.repository_owner }}/kube-shim" >> "$GITHUB_OUTPUT"
-
-      - name: Summary
-        run: |
-          echo "Published ghcr.io/${{ github.repository_owner }}/kube-shim:${{ github.ref_name }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "First release only: the ghcr.io package defaults to **private** even though this repo is public. Go to the package's settings on GitHub and set visibility to Public, so the VPS can pull it without credentials." >> "$GITHUB_STEP_SUMMARY"
-
-  # Generates SLSA Build Level 3 provenance for the image built above, using
-  # the SLSA project's own reusable workflow rather than hand-rolling
-  # anything -- self-generated provenance from inside the same job that
-  # built the artifact wouldn't meet the Level 3 bar (a compromised build
-  # step could just forge it). This reusable workflow runs as a genuinely
-  # separate, isolated job that only receives the image digest, signs the
-  # provenance via Sigstore keyless signing (OIDC-bound to this exact repo
-  # and workflow), and publishes both the attestation and a public Rekor
-  # transparency-log entry. See docs/IMPLEMENTATION_PLAN.md and
-  # https://github.com/slsa-framework/slsa-github-generator/blob/main/internal/builders/container/README.md
-  provenance:
-    needs: [build]
-    permissions:
-      actions: read # for detecting the GitHub Actions environment
-      id-token: write # for Sigstore keyless signing via OIDC
-      packages: write # for uploading the attestation to ghcr.io
-    # Must be pinned to a full vX.Y.Z tag, not a commit SHA -- unlike every
-    # other action in this repo's workflows, the SLSA generator itself
-    # refuses to run (by design) if referenced any other way, precisely so
-    # its own provenance chain stays verifiable back to a known release.
-    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v2.1.0
-    with:
-      image: ${{ needs.build.outputs.image }}
-      digest: ${{ needs.build.outputs.digest }}
-      registry-username: ${{ github.actor }}
-    secrets:
-      registry-password: ${{ secrets.GITHUB_TOKEN }}
+    uses: ./.github/workflows/release-build.yml

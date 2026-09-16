@@ -1,0 +1,224 @@
+name: Build and attest a release
+
+# Reusable workflow, called only by release.yml. Kept as a separate workflow
+# file (rather than a job in release.yml) specifically so this process has
+# its own, distinct identity for provenance purposes: the attestations this
+# workflow signs record *this* file's path and pinned ref as the builder,
+# not release.yml's. That's what SLSA Build Level 3 requires -- see
+# https://slsa.dev/spec/v1.2/build-track-basics#build-l3 -- and why the
+# jobs below shouldn't get folded back into release.yml.
+on:
+  workflow_call:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions: {}
+
+jobs:
+  verify-version:
+    name: Verify release tag matches Cargo.toml version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Compare tag to Cargo.toml version
+        run: |
+          TAG="${{ github.ref_name }}"
+          CARGO_VERSION=$(awk '
+            /^\[package\]/ { in_package=1; next }
+            /^\[/           { in_package=0 }
+            in_package && /^version[[:space:]]*=/ {
+              match($0, /"[^"]*"/)
+              print substr($0, RSTART+1, RLENGTH-2)
+              exit
+            }
+          ' Cargo.toml)
+          EXPECTED_TAG="v${CARGO_VERSION}"
+          if [ "$TAG" != "$EXPECTED_TAG" ]; then
+            echo "::error::Git tag '${TAG}' does not match Cargo.toml's package version '${CARGO_VERSION}' (expected tag '${EXPECTED_TAG}'). release-please should keep these in sync automatically -- if they've diverged, something's wrong upstream of this workflow." >&2
+            exit 1
+          fi
+          echo "OK: tag ${TAG} matches Cargo.toml version ${CARGO_VERSION}"
+
+  build:
+    name: Build architecture-specific images
+    runs-on: ${{ matrix.runner }}
+    needs: [verify-version]
+    timeout-minutes: 30
+
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
+
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Podman
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install podman
+
+      - name: Log in to Container Registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+
+      - name: Get commit timestamp
+        id: commit-info
+        run: |
+          TIMESTAMP=$(git log -1 --format=%cI ${{ github.sha }})
+          echo "timestamp=$TIMESTAMP" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        id: build
+        run: |
+          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ matrix.arch }}
+          TIMESTAMP=${{ steps.commit-info.outputs.timestamp }}
+          mkdir artifacts
+          podman build \
+            --build-arg BUILD_TIMESTAMP="${TIMESTAMP}" \
+            --build-arg VCS_REF="${{ github.sha }}" \
+            --build-arg VCS_URL="${{ github.server_url }}/${{ github.repository }}" \
+            --file ./Containerfile \
+            --platform ${{ matrix.platform }} \
+            --squash \
+            --tag ${IMAGE} \
+            --timestamp "$(date -d "${TIMESTAMP}" +%s)" \
+            .
+          podman inspect --format '{{.Digest}}' ${IMAGE} >artifacts/digest.txt
+          echo Built container "${IMAGE}@$(cat artifacts/digest.txt)"
+
+      - name: Push image
+        run: |
+          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DIGEST=$(cat artifacts/digest.txt)
+          podman push "${IMAGE}@${DIGEST}"
+
+      - name: Upload image digest to artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: artifacts-${{ matrix.arch }}
+          path: artifacts
+          retention-days: 30
+
+  manifest:
+    name: Build multi-architecture manifest
+    runs-on: ubuntu-24.04
+    needs: [build]
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      packages: write
+
+    steps:
+      - name: Install Podman
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install podman
+
+      - name: Log in to Container Registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+
+      - name: Download artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+
+      - name: Pull architecture-specific images
+        run: |
+          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          podman pull "${IMAGE}@$(cat artifacts-amd64/digest.txt)"
+          podman pull "${IMAGE}@$(cat artifacts-arm64/digest.txt)"
+
+      - name: Create and push multi-architecture manifest
+        run: |
+          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          IMAGE_TAG=${IMAGE}:${{ github.ref_name }}
+          IMAGE_AMD64=${IMAGE}@$(cat artifacts-amd64/digest.txt)
+          IMAGE_ARM64=${IMAGE}@$(cat artifacts-arm64/digest.txt)
+
+          mkdir artifacts
+          podman manifest create ${IMAGE_TAG}
+          podman manifest add ${IMAGE_TAG} "${IMAGE_AMD64}"
+          podman manifest add ${IMAGE_TAG} "${IMAGE_ARM64}"
+          podman tag ${IMAGE_TAG} ${IMAGE}:latest
+          podman manifest push ${IMAGE}:${{ github.ref_name }} \
+              --digestfile artifacts/digest.txt
+          podman manifest push ${IMAGE}:latest \
+              --digestfile artifacts/digest.txt
+
+      - name: Upload manifest digest to artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: artifacts-manifest
+          path: artifacts
+          retention-days: 30
+
+  attest:
+    name: Attest build provenance
+    runs-on: ubuntu-24.04
+    needs: [manifest]
+    timeout-minutes: 10
+
+    permissions:
+      attestations: write
+      id-token: write
+      packages: write
+
+    steps:
+      - name: Login to Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+
+      - name: Retrieve digests
+        id: retrieve-digests
+        run: |
+          {
+            echo "amd64_digest=$(cat artifacts-amd64/digest.txt)"
+            echo "arm64_digest=$(cat artifacts-arm64/digest.txt)"
+            echo "manifest_digest=$(cat artifacts-manifest/digest.txt)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Attest amd64 container
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.retrieve-digests.outputs.amd64_digest }}
+          push-to-registry: true
+
+      - name: Attest arm64 container
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.retrieve-digests.outputs.arm64_digest }}
+          push-to-registry: true
+
+      - name: Attest multi-architecture manifest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.retrieve-digests.outputs.manifest_digest }}
+          push-to-registry: true
