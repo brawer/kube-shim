@@ -180,30 +180,39 @@ Note: the token only protects the connection if TLS is actually used (already sh
 
 ---
 
-### Phase 3: Deploy & Update Mechanism (Container Image + Podman Quadlet) (Days 3-4)
+### Phase 3: Deploy & Update Mechanism (Container Image + Podman Quadlet) (Days 3-4) — ✅ Complete
 **Goal:** A repeatable way to build, ship, and update the shim binary on the VPS: a `FROM scratch` OCI image built in CI, run rootless under podman, updated by pulling a specific pinned version — no VPN, no auto-updater, no privileged ports.
 
 **Deliverables:**
-- Rust binary built statically for `x86_64-unknown-linux-musl` — no libc dependency at all, required for `FROM scratch` to even start the binary. `sqlx`'s SQLite `bundled` feature and `rustls` (already the plan's TLS choice over OpenSSL) are both static-friendly, so this doesn't force a dependency change.
+- Rust binary built statically for `x86_64-unknown-linux-musl` (and `aarch64-unknown-linux-musl` — see multi-arch below) — no libc dependency at all, required for `FROM scratch` to even start the binary. `sqlx`'s SQLite `bundled` feature and `rustls` (already the plan's TLS choice over OpenSSL) are both static-friendly, so this doesn't force a dependency change.
 - TLS root certificates embedded in the binary via `webpki-roots`, not `rustls-native-certs` — a scratch image has no `/etc/ssl/certs`, so outbound HTTPS to the Hetzner API needs its trust store compiled in.
 - No shelling out to external binaries anywhere in the shim process: scratch has no shell and no `/usr/bin/anything` to exec. Phase 9's log streaming uses a pure-Rust SSH client library (`russh`) instead of invoking a system `ssh` binary. The same principle applies to any future subprocess-shaped need — reach for a Rust crate, not a bundled Linux distro.
-- GitHub Actions workflow: on a version tag push, cross-compile the musl binary and publish `ghcr.io/brawer/kube-shim:vX.Y.Z` — an immutable version tag, never `:latest`. The package is public (matching how the rest of this project's ghcr.io packages are set up), so the VPS needs no pull credentials at all.
+- Runs as a non-root UID (1000) inside the container itself, on top of (not instead of) rootless podman on the host — defense in depth, and free, since the binary needs no special capabilities.
+- **Multi-arch**: built for both `linux/amd64` and `linux/arm64` (via a GitHub Actions matrix, native builds on each architecture's own runner — no cross-compilation, `rust:1-alpine`'s default target already matches whichever arch it's running on), joined into a single multi-arch manifest. Revisits the original "amd64 only" plan: kept open for a possible future ARM VPS (e.g. Hetzner's CAX line) and consistency with this project's other repos, even though nothing currently requires it.
+- GitHub Actions workflow: on a version tag push (now driven by `release-please`, not a manual `git tag` — see the release-please addendum below), builds and publishes `ghcr.io/brawer/kube-shim:vX.Y.Z` **and** `ghcr.io/brawer/kube-shim:latest`. The package is public, so the VPS needs no pull credentials at all.
+  - **Revised from the original "never `:latest`" decision**: matching the convention used across this project's other repos (`:latest` alongside the immutable version tag, for convenience — e.g. quick manual testing) outweighed keeping kube-shim as a one-off exception. This doesn't change how the VPS itself is updated: `deploy/kube-shim.container` still pins an explicit `vX.Y.Z` tag, and updates there are still the deliberate manual action described below — `:latest` existing doesn't mean anything *uses* it for the real deployment.
+  - **SLSA Build Level 3 provenance** is generated for every architecture-specific image and the joined manifest, via `actions/attest` (GitHub's native attestation action) run from a separate reusable workflow (`release-build.yml`) — not `slsa-framework/slsa-github-generator`, which an earlier version of this plan used; switched to match the same pattern already proven out in this project's sibling repos. The separate-workflow isolation (not a step folded into the same job that built the image) is what actually earns Level 3 rather than Level 1/2 either way — see `release-build.yml`'s own header comment.
+  - A `verify-version` job cross-checks the pushed tag against `Cargo.toml`'s version before building anything, as a cheap sanity net (normally redundant, since `release-please` keeps them in sync itself, but cheap insurance against a stray manual tag).
 - `bootstrap/provision.sh` rewritten around this: installs rootless podman; drops the earlier `scp` binary + hand-written systemd unit flow.
 - A podman quadlet unit (`deploy/kube-shim.container`) defining: the image reference (pinned version), bind mounts for persistent state (`/var/lib/kube-shim` on the host → `/data` in the container — holds `db.sqlite`, the TLS certs, and `config.toml`), and port publishing for `:6443` and `:8080`. Both ports are >1024, so rootless podman binds them with no special capability or sysctl tweak — deliberately avoided by putting the status page on 8080 instead of 80.
 - Updating is a **deliberate, manual action**, not an auto-updater: SSH in, bump the image tag in the quadlet unit, `podman pull` + `systemctl --user restart kube-shim`, watch `journalctl --user -u kube-shim -f`. Given the shim is trusted to spend real money orchestrating cloud resources, an unattended background update rolling out an untested release is a worse failure mode than a slightly stale binary.
 - Because job/volume/VM/budget state lives entirely in SQLite (not in-process memory) and worker VMs run independently of the shim process, restarting the container for an update is safe even with jobs in flight — the reconciliation loop just resumes on its next tick, using the schema migrations that already run automatically on startup (Phase 1).
 
-**Files to create/modify:**
-- `.github/workflows/release.yml` (new) - build the musl binary, build and push the `FROM scratch` image to ghcr.io on tag push
-- `Dockerfile` (new) - multi-stage: build stage compiles for the musl target, final stage is `FROM scratch` + the binary
+**Addendum: `release-please`.** Version tags are no longer pushed by hand — `release-please` (see `docs/RELEASING.md`) maintains a running release PR from Conventional-Commits PR titles and, once merged, tags the release itself, which is what actually triggers `release.yml`/`release-build.yml`. `Cargo.lock` is committed (it was gitignored at first, which broke the very first real release — see `docs/RELEASING.md` and PR history — a binary project needs a committed lock file for reproducible builds regardless, independent of that bug).
+
+**Files created/modified:**
+- `.github/workflows/release.yml` - thin entry point: tag-triggered, calls `release-build.yml` as a reusable workflow
+- `.github/workflows/release-build.yml` (new) - the actual multi-arch build/manifest/attest pipeline (`verify-version` → `build` [matrix: amd64, arm64] → `manifest` → `attest`)
+- `Containerfile` (was `Dockerfile` — renamed to match podman-first convention) - multi-stage: build stage compiles natively per-arch, final stage is `FROM scratch` + the binary, running as UID 1000
+- `.dockerignore` - added, then removed again once the Containerfile switched to an explicit `COPY` allowlist (safer than a denylist that can fall out of sync)
 - `bootstrap/provision.sh` - install podman; drop the old scp/systemd-unit deployment flow
 - `deploy/kube-shim.container` (new) - podman quadlet unit: image ref, bind mounts, port publishing
-- `Cargo.toml` - use `webpki-roots` (not `rustls-native-certs`); add `russh`
+- `Cargo.toml` / `Cargo.lock` - use `webpki-roots` (not `rustls-native-certs`); `Cargo.lock` committed, not gitignored
 
 **Testing:**
 ```bash
-git tag v0.1.0 && git push --tags
-# Watch GitHub Actions build + publish ghcr.io/brawer/kube-shim:v0.1.0
+# Cutting a release is now via release-please's PR, not a manual tag push --
+# see docs/RELEASING.md. Once that PR is merged and the tag exists:
 
 # On the VPS:
 podman pull ghcr.io/brawer/kube-shim:v0.1.0
@@ -211,8 +220,8 @@ systemctl --user start kube-shim
 journalctl --user -u kube-shim -f
 
 # Update:
-# bump the tag in deploy/kube-shim.container to v0.1.1
-podman pull ghcr.io/brawer/kube-shim:v0.1.1
+# bump the tag in deploy/kube-shim.container to the new version
+podman pull ghcr.io/brawer/kube-shim:vX.Y.Z
 systemctl --user restart kube-shim
 # Confirm db.sqlite state (jobs, PVCs, budget balance) survived the restart
 # Confirm an in-flight job's worker VM was untouched by the shim restart

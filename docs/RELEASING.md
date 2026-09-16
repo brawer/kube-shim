@@ -16,13 +16,17 @@ To cut a release:
 2. Once merged, `release-please` tags that commit and publishes the GitHub
    Release (with the same notes) on its own.
 3. That tag push triggers
-   [`release.yml`](https://github.com/brawer/kube-shim/blob/main/.github/workflows/release.yml),
-   which builds and publishes the container image to
-   `ghcr.io/brawer/kube-shim:vX.Y.Z`, together with SLSA Build Level 3
-   provenance. Optionally verify the release actually came out right:
+   [`release.yml`](https://github.com/brawer/kube-shim/blob/main/.github/workflows/release.yml)
+   /
+   [`release-build.yml`](https://github.com/brawer/kube-shim/blob/main/.github/workflows/release-build.yml),
+   which builds `linux/amd64` and `linux/arm64` images, joins them into a
+   multi-arch manifest published as both `ghcr.io/brawer/kube-shim:vX.Y.Z`
+   and `ghcr.io/brawer/kube-shim:latest`, and generates SLSA Build Level 3
+   provenance for every architecture-specific image and the manifest.
+   Optionally verify the release actually came out right:
    ```sh
-   slsa-verifier verify-image ghcr.io/brawer/kube-shim:vX.Y.Z \
-     --source-uri github.com/brawer/kube-shim
+   gh attestation verify oci://ghcr.io/brawer/kube-shim:vX.Y.Z \
+     --repo brawer/kube-shim
    ```
 
 See "What happens automatically" below for the full sequence — but read
@@ -97,11 +101,12 @@ Net effect while we're at `0.y.z`: a `!` commit → minor, everything else
    PR titles merged since the last release.
 2. Merging that release PR makes `release-please` tag the commit
    (`vX.Y.Z`) and publish the GitHub Release.
-3. The tag push triggers
-   [`release.yml`](https://github.com/brawer/kube-shim/blob/main/.github/workflows/release.yml):
-   builds the `FROM scratch` image, pushes
-   `ghcr.io/brawer/kube-shim:vX.Y.Z`, and generates SLSA Build Level 3
-   provenance for it.
+3. The tag push triggers `release.yml`, which calls `release-build.yml`:
+   builds the `FROM scratch` image for `linux/amd64` and `linux/arm64`,
+   pushes `ghcr.io/brawer/kube-shim:vX.Y.Z` and `:latest` as a multi-arch
+   manifest, and generates SLSA Build Level 3 provenance (via
+   `actions/attest`) for every architecture-specific image and the
+   manifest.
 4. Nothing deploys automatically from here. Per
    [`docs/IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) (Phase 3),
    updating a running VPS is always a deliberate, manual `podman pull` +
