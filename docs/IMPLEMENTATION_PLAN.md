@@ -134,7 +134,7 @@ sqlite3 db.sqlite "SELECT * FROM jobs"
 
 ---
 
-### Phase 2: Bearer Token Authentication (Days 2-3)
+### Phase 2: Bearer Token Authentication (Days 2-3) — ✅ Complete
 **Goal:** Close the gap this plan flagged in Open Question 5 — Phase 1 shipped with zero authentication on `:6443`. Since there's no VPN and no other special networking planned, this has to be solved with an in-band credential before the shim can safely face the internet.
 
 **Deliverables:**
