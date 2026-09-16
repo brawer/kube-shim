@@ -1,7 +1,10 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock is intentionally tracked, not ignored: kube-shim is a binary,
+# not a library, so a committed lock file is what makes the release build
+# reproducible (and, since PR #9, matches what SLSA provenance actually
+# claims about the build). See docs/RELEASING.md.
 
 # Database
 *.sqlite
