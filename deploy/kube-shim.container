@@ -1,0 +1,23 @@
+[Unit]
+Description=Kubernetes API Shim
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=ghcr.io/brawer/kube-shim:v0.1.0
+# Bump this tag manually to update. Deliberately no AutoUpdate=registry
+# label here -- see docs/IMPLEMENTATION_PLAN.md Phase 3: updates are always
+# a deliberate `podman pull` + restart, never an unattended auto-update,
+# given the shim spends real money orchestrating cloud resources.
+Volume=%h/kube-shim-data:/data:Z
+PublishPort=6443:6443
+PublishPort=8080:8080
+
+[Service]
+# Restart-on-crash is process supervision, not an auto-updater: it always
+# restarts the *same* pinned image tag above, never pulls a new one.
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
