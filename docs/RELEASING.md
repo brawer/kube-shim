@@ -107,8 +107,14 @@ Net effect while we're at `0.y.z`: a `!` commit → minor, everything else
    manifest, and generates SLSA Build Level 3 provenance (via
    `actions/attest`) for every architecture-specific image and the
    manifest.
-4. Nothing deploys automatically from here. Per
-   [`docs/IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) (Phase 3),
-   updating a running VPS is always a deliberate, manual `podman pull` +
-   `systemctl --user restart` — never an unattended auto-update, since the
-   shim spends real money orchestrating cloud resources.
+4. The `kube-shim.brawer.ch` instance updates itself from here: its
+   `deploy/kube-shim.container` quadlet unit tracks `:latest` with
+   `AutoUpdate=registry`, and `podman-auto-update.timer` picks up the new
+   image and restarts the service on its own, no SSH session needed. Per
+   [`docs/IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) (Phase 3), this
+   is a deliberate trade of update-safety for development-loop speed,
+   judged acceptable specifically because UpCloud's prepaid, no-auto-recharge
+   billing bounds the downside of an untested release running unattended. A
+   deployment without that backstop should instead pin an explicit
+   `vX.Y.Z` tag in the quadlet unit and update by hand with `podman pull` +
+   `systemctl --user restart`.

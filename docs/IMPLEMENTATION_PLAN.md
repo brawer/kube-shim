@@ -8,7 +8,7 @@
 - Accepts Kubernetes `Secret`, `PersistentVolumeClaim`, and `CronJob` manifests via Terraform, authenticated by a bearer token — no VPN or special networking required
 - Creates ephemeral Hetzner Cloud VMs per job run, sized per-job from the CronJob pod template's resource requests (not a single hardcoded size)
 - Manages Hetzner Cloud block volumes provisioned via PersistentVolumeClaims, using the standard `spec.storageClassName` field — ephemeral (deleted after each run) by default, or retained across runs when a job wants to reuse cached data (e.g. a downloaded OSM planet file)
-- Runs containers via cloud-init + Docker inside VMs, on worker VMs that are unreachable from the internet (inbound) while still able to reach it (outbound) — via a Hetzner Cloud Firewall, not private networking
+- Runs containers via cloud-init + rootless Podman inside VMs, on worker VMs that are unreachable from the internet (inbound) while still able to reach it (outbound) — via a Hetzner Cloud Firewall, not private networking
 - Talks to the cloud through a small provider-agnostic interface — Hetzner Cloud is the only implementation initially, with Infomaniak (OpenStack) plannable as a second provider later without reworking the reconciliation loop (see "Future Work")
 - Exposes Kubernetes-compatible APIs so Terraform `kubernetes_provider` works natively
 - Streams logs, metrics, and cost tracking via custom Kubernetes APIs
@@ -42,7 +42,7 @@
 
 **2. Worker VMs:** Short-lived Hetzner Cloud VMs (created per job run)
    - Receive volume attachment + container spec via cloud-init
-   - Run Docker container with mounted volume
+   - Run Podman container with mounted volume
    - Communicate status/logs back to shim via SSH (a native Rust client, not a subprocess) + status files
    - Protected by a Hetzner Cloud Firewall: no inbound from anywhere except the shim's own VPS IP, all outbound allowed — unreachable from the internet without needing private networking or a NAT gateway
 
@@ -73,7 +73,7 @@ Terraform (terraform apply, with a bearer token configured)
           Retain)
       → Launches a VM via the cloud provider interface, with cloud-init,
         sized from the pod template's resource requests
-      → Cloud-init mounts volume, pulls image, docker run
+      → Cloud-init mounts volume, pulls image, podman run
       → Container writes to /scratch, streams logs
       → On exit: Shim detects completion, fetches logs, deletes VM
         (and the volume too, unless the PVC's reclaim policy is Retain),
@@ -181,7 +181,7 @@ Note: the token only protects the connection if TLS is actually used (already sh
 ---
 
 ### Phase 3: Deploy & Update Mechanism (Container Image + Podman Quadlet) (Days 3-4) — ✅ Complete
-**Goal:** A repeatable way to build, ship, and update the shim binary on the VPS: a `FROM scratch` OCI image built in CI, run rootless under podman, updated by pulling a specific pinned version — no VPN, no auto-updater, no privileged ports.
+**Goal:** A repeatable way to build, ship, and update the shim binary on the VPS: a `FROM scratch` OCI image built in CI, run rootless under podman — no VPN, no privileged ports.
 
 **Deliverables:**
 - Rust binary built statically for `x86_64-unknown-linux-musl` (and `aarch64-unknown-linux-musl` — see multi-arch below) — no libc dependency at all, required for `FROM scratch` to even start the binary. `sqlx`'s SQLite `bundled` feature and `rustls` (already the plan's TLS choice over OpenSSL) are both static-friendly, so this doesn't force a dependency change.
@@ -190,13 +190,13 @@ Note: the token only protects the connection if TLS is actually used (already sh
 - Runs as a non-root UID (1000) inside the container itself, on top of (not instead of) rootless podman on the host — defense in depth, and free, since the binary needs no special capabilities.
 - **Multi-arch**: built for both `linux/amd64` and `linux/arm64` (via a GitHub Actions matrix, native builds on each architecture's own runner — no cross-compilation, `rust:1-alpine`'s default target already matches whichever arch it's running on), joined into a single multi-arch manifest. Revisits the original "amd64 only" plan: kept open for a possible future ARM VPS (e.g. Hetzner's CAX line) and consistency with this project's other repos, even though nothing currently requires it.
 - GitHub Actions workflow: on a version tag push (now driven by `release-please`, not a manual `git tag` — see the release-please addendum below), builds and publishes `ghcr.io/brawer/kube-shim:vX.Y.Z` **and** `ghcr.io/brawer/kube-shim:latest`. The package is public, so the VPS needs no pull credentials at all.
-  - **Revised from the original "never `:latest`" decision**: matching the convention used across this project's other repos (`:latest` alongside the immutable version tag, for convenience — e.g. quick manual testing) outweighed keeping kube-shim as a one-off exception. This doesn't change how the VPS itself is updated: `deploy/kube-shim.container` still pins an explicit `vX.Y.Z` tag, and updates there are still the deliberate manual action described below — `:latest` existing doesn't mean anything *uses* it for the real deployment.
+  - **Revised from the original "never `:latest`" decision**: matching the convention used across this project's other repos (`:latest` alongside the immutable version tag, for convenience — e.g. quick manual testing) outweighed keeping kube-shim as a one-off exception. `:latest` turned out to be more than just a convenience tag: `deploy/kube-shim.container` tracks it directly via `AutoUpdate=registry`, so the real VPS deployment rolls forward on every release — see the auto-update note below.
   - **SLSA Build Level 3 provenance** is generated for every architecture-specific image and the joined manifest, via `actions/attest` (GitHub's native attestation action) run from a separate reusable workflow (`release-build.yml`) — not `slsa-framework/slsa-github-generator`, which an earlier version of this plan used; switched to match the same pattern already proven out in this project's sibling repos. The separate-workflow isolation (not a step folded into the same job that built the image) is what actually earns Level 3 rather than Level 1/2 either way — see `release-build.yml`'s own header comment.
   - A `verify-version` job cross-checks the pushed tag against `Cargo.toml`'s version before building anything, as a cheap sanity net (normally redundant, since `release-please` keeps them in sync itself, but cheap insurance against a stray manual tag).
 - `bootstrap/provision.sh` rewritten around this: installs rootless podman; drops the earlier `scp` binary + hand-written systemd unit flow.
-- A podman quadlet unit (`deploy/kube-shim.container`) defining: the image reference (pinned version), bind mounts for persistent state (`/var/lib/kube-shim` on the host → `/data` in the container — holds `db.sqlite`, the TLS certs, and `config.toml`), and port publishing for `:6443` and `:8080`. Both ports are >1024, so rootless podman binds them with no special capability or sysctl tweak — deliberately avoided by putting the status page on 8080 instead of 80.
-- Updating is a **deliberate, manual action**, not an auto-updater: SSH in, bump the image tag in the quadlet unit, `podman pull` + `systemctl --user restart kube-shim`, watch `journalctl --user -u kube-shim -f`. Given the shim is trusted to spend real money orchestrating cloud resources, an unattended background update rolling out an untested release is a worse failure mode than a slightly stale binary.
+- A podman quadlet unit (`deploy/kube-shim.container`) defining: the image reference, bind mounts for persistent state (`/var/lib/kube-shim` on the host → `/data` in the container — holds `db.sqlite`, the TLS certs, and `config.toml`), and port publishing for `:6443` and `:8080`. Both ports are >1024, so rootless podman binds them with no special capability or sysctl tweak — deliberately avoided by putting the status page on 8080 instead of 80.
 - Because job/volume/VM/budget state lives entirely in SQLite (not in-process memory) and worker VMs run independently of the shim process, restarting the container for an update is safe even with jobs in flight — the reconciliation loop just resumes on its next tick, using the schema migrations that already run automatically on startup (Phase 1).
+- **Updating: two supported modes, not one.** The quadlet unit as checked in tracks `:latest` with `AutoUpdate=registry`, and `podman-auto-update.timer` (a systemd `--user` timer, enabled once during provisioning) polls the registry and restarts the container whenever a new image lands — so the actual `kube-shim.brawer.ch` instance rolls forward automatically on every release, with no SSH session required. This is a deliberate trade for development-loop speed while the project is young, not a general recommendation: an unattended rollout of an untested release is a real risk given the shim spends real money orchestrating cloud resources. It's judged acceptable here specifically because UpCloud's billing is prepaid with no auto-recharge — a bad release that misbehaves can burn at most the current prepaid balance, not an unbounded card charge, which bounds the downside of "wrong code ran unattended" to something already priced in. A deployment that doesn't have that backstop (a different provider with postpaid/card-on-file billing, or once this moves past personal-project status) should instead pin an explicit `vX.Y.Z` tag, drop the `AutoUpdate=registry` label, and go back to the deliberate `podman pull` + `systemctl --user restart kube-shim` flow — both modes are just a one-line edit to the same quadlet unit, not different infrastructure.
 
 **Addendum: `release-please`.** Version tags are no longer pushed by hand — `release-please` (see `docs/RELEASING.md`) maintains a running release PR from Conventional-Commits PR titles and, once merged, tags the release itself, which is what actually triggers `release.yml`/`release-build.yml`. `Cargo.lock` is committed (it was gitignored at first, which broke the very first real release — see `docs/RELEASING.md` and PR history — a binary project needs a committed lock file for reproducible builds regardless, independent of that bug).
 
@@ -383,7 +383,7 @@ terraform apply
 - Real VM creation, sized per-job using the resource-request lookup table from Phase 4 (not a fixed cx51)
 - **Every worker VM gets a Hetzner Cloud Firewall attached at creation time**: all inbound denied except SSH (22) from the shim's own VPS IP; all outbound allowed. This is what makes "unreachable from the internet, but can still reach it" true (Key Constraints) — no Hetzner private network, no NAT gateway, no extra routing needed; the VM keeps a normal public IP for outbound connectivity, it's just unreachable inbound from anyone but the shim.
 - VM waits for volume attachment, mounts it
-- VM pulls container image, runs docker
+- VM pulls container image, runs podman
 - Container write to /scratch
 - Status file: `/tmp/job-status.txt` (written by cloud-init on completion)
 - Container ID saved: `/tmp/container-id.txt`
@@ -408,7 +408,7 @@ terraform apply
 #   4. Container starts
 #   5. Writes to /scratch
 #   6. Container exits
-# Verify logs fetchable: ssh root@{ip} docker logs {container-id}
+# Verify logs fetchable: ssh root@{ip} podman logs {container-id}
 # terraform destroy
 # Verify VM + volume deleted
 
@@ -426,7 +426,7 @@ terraform apply
 
 **Deliverables:**
 - HTTP endpoint: `GET /api/v1/namespaces/default/pods/{name}/log?follow=true`
-- SSH to the worker VM using the `russh` client library (Phase 3) — never a subprocess — run `docker logs -f {container-id}` there, stream output back to the HTTP client
+- SSH to the worker VM using the `russh` client library (Phase 3) — never a subprocess — run `podman logs -f {container-id}` there, stream output back to the HTTP client
 - Fallback: return cached logs if job is not running
 - Handle SSH disconnects gracefully
 
@@ -666,7 +666,7 @@ curl -k https://localhost:6443/debug/status | jq '.total_cost_eur, .budget_balan
 | `src/auth.rs` | Bearer-token authentication middleware for `:6443` | Create (Phase 2) |
 | `src/k8s_status.rs` | Kubernetes-shaped `Status` error responses (401 here, reused for 403 admission denials) | Create (Phase 2) |
 | `.github/workflows/release.yml` | CI: build musl binary, publish OCI image to ghcr.io | Create (Phase 3) |
-| `Dockerfile` | Multi-stage build → `FROM scratch` image | Create (Phase 3) |
+| `Containerfile` | Multi-stage build → `FROM scratch` image | Create (Phase 3) |
 | `deploy/kube-shim.container` | Podman quadlet unit (image ref, bind mounts, ports) | Phases 3, 13 |
 | `src/api/*.rs` | Kubernetes API handlers | Phases 1, 4, 11 |
 | `src/api/pvc.rs` | PersistentVolumeClaim CRUD | Create (Phase 4) |
@@ -755,7 +755,7 @@ All cloud calls go through a `CloudProvider` trait (Phase 6) — `create_volume`
 A token bucket, not a fixed daily reset: `balance_eur` increases by `budget_daily_rate_eur` for every day (fractionally, per reconciliation tick) that passes, capped at `budget_daily_rate_eur × budget_rollover_cap_days`. Spending decrements the balance; a job that would exceed it waits in `BudgetWait` instead of being launched. Example: at €2/day with a 7-day cap, 3 idle days accrue €6 of balance — enough for one job estimated at €5, even though no single day's rate alone would cover it.
 
 ### Deployment Model
-The shim ships as a `FROM scratch` OCI image (Phase 3): a statically-linked musl binary with embedded TLS roots and no external process dependencies (SSH goes through `russh`, not a subprocess), run rootless via a podman quadlet unit. Persistent state (`db.sqlite`, TLS certs, `config.toml`) lives on a host bind mount, so a container restart — whether from a crash or a deliberate `podman pull` + `systemctl --user restart` for an update — never loses job/volume/VM/budget state, and any in-flight job's worker VM is unaffected since it runs independently on Hetzner. Updates are always a manual, deliberate action, never an unattended auto-updater, given the shim spends real money.
+The shim ships as a `FROM scratch` OCI image (Phase 3): a statically-linked musl binary with embedded TLS roots and no external process dependencies (SSH goes through `russh`, not a subprocess), run rootless via a podman quadlet unit. Persistent state (`db.sqlite`, TLS certs, `config.toml`) lives on a host bind mount, so a container restart — whether from a crash or an update — never loses job/volume/VM/budget state, and any in-flight job's worker VM is unaffected since it runs independently on Hetzner. The `kube-shim.brawer.ch` instance updates itself unattended via `podman-auto-update.timer` tracking `:latest` (see Phase 3), a deliberate trade of update-safety for development-loop speed, bounded by UpCloud's prepaid no-auto-recharge billing; a deployment without that backstop should pin a `vX.Y.Z` tag instead and update manually.
 
 ### Database Strategy
 - SQLite: single file, ACID, no external dependency
