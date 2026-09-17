@@ -14,7 +14,7 @@
 - Exposes Kubernetes-compatible APIs so Terraform `kubernetes_provider` works natively
 - Streams logs, metrics, and cost tracking via custom Kubernetes APIs, including a CSV cost report grouped by job labels
 - Tracks and enforces a rolling budget in the operator's own currency of choice (`main_currency`), converting the cloud provider's EUR-denominated actual spend via the ECB's daily reference rates
-- Serves a simple, publicly-reachable, read-only status page (port 8080) with recent events, currently running jobs, and accumulated cost — no VPN or `kubectl` needed just to check in
+- Serves a simple, publicly-reachable, read-only status page plus standard Kubernetes-style health endpoints (`/`, `/healthz`, `/livez`, `/readyz`) on the same `:443` listener as the authenticated API — reusing its ACME certificate rather than a separate plaintext port — with recent events, currently running jobs, and accumulated cost — no VPN or `kubectl` needed just to check in
 - Ships as a `FROM scratch` OCI container image, built in CI and run rootless under podman, so deploying and updating the shim itself is a `podman pull` + restart (or, for the maintainer's own instance, fully automatic via `podman-auto-update.timer`)
 - **Long-term, not initial scope:** also manage long-running `Deployment` workloads, and standalone durable `PersistentVolumeClaim`s for a job that wants to cache data across runs — both reuse the same underlying VM-provisioning and volume-binding infrastructure built for CronJobs/ephemeral volumes (see "Future Work" below)
 
@@ -38,9 +38,8 @@
 ### Components
 
 **1. Control Plane (Shim):** Rust binary running on a cheap VPS, as a rootless podman container
-   - Axum HTTP server (port 443, TLS via ACME) for the authenticated Kubernetes API, wrapped in bearer-token auth middleware
+   - Axum HTTP server (port 443, TLS via ACME): the authenticated Kubernetes API, wrapped in bearer-token auth middleware, plus a small, separately-scoped public sub-router (status page + `/healthz`/`/livez`/`/readyz`) deliberately kept outside that middleware's scope — same listener, same certificate, two different route groups, not two different ports
    - A minimal, unauthenticated Axum router (port 80, plain HTTP) that serves *only* `/.well-known/acme-challenge/*` for Let's Encrypt HTTP-01 validation — nothing else is ever registered on this listener
-   - A third, unauthenticated Axum router (port 8080, plain HTTP) serving only the read-only public status page — no mutating routes are ever registered on this listener
    - SQLite for persistent state (jobs, volumes, VMs, events, pricing, budget balance), stored on a bind-mounted host directory so it outlives container restarts/updates
    - Reconciliation loop (10-second fallback tick, plus immediate wake-ups on specific events) for state management
    - Cloud provider client (UpCloud first) behind a common interface, + pricing sync
@@ -57,9 +56,11 @@
    - Extensions: Events, Metrics, Cost tracking + CSV cost report (custom APIs)
    - **Future:** `Deployment` (apps/v1) for long-running workloads, and standalone `PersistentVolumeClaim`/`PersistentVolume` for data that must survive across job runs — both deliberately deferred, but the internal `WorkloadKind` abstraction introduced in Phase 5 is designed so adding `Deployment` later doesn't require reworking the CronJob path.
 
-**4. Public Status Page:** static-ish HTML, served from port 8080
-   - Read-only, no auth, no `kubectl`/VPN required
-   - Recent events, currently running jobs ("nodes"/pods), accumulated cost and budget balance in `main_currency`
+**4. Public Status Page + Health Endpoints:** static-ish HTML plus a few standard diagnostic paths, served from `:443` alongside the authenticated API (same listener/certificate, a structurally separate GET-only sub-router kept outside the auth middleware)
+   - `/` and a `/statusz` alias (the alias name nods to the informal "zPages" debug-page tradition from gRPC/OpenCensus, not a literal Kubernetes API-server convention the way the health endpoints below are): recent events, currently running jobs ("nodes"/pods), accumulated cost and budget balance in `main_currency`
+   - `/healthz`, `/livez`, `/readyz`: genuinely standard, Kubernetes-API-server-defined health endpoints, unauthenticated by the same convention real clusters use for infra health checks
+   - `/metrics` (Prometheus self-instrumentation) is a placeholder for later, not built in this round — see "Future Work" — distinct from the already-planned, authenticated `metrics.k8s.io` API (Phase 12), which reports job resource usage, not the shim process's own metrics
+   - Read-only, no auth, no `kubectl`/VPN required for any of the above
 
 ### Data Flow
 
@@ -88,8 +89,11 @@ Terraform (terraform apply, with a bearer token configured)
   → kubectl logs -f osmdiffs-weekly-...  (streams from VM via SSH)
   → kubectl get pod, kubectl describe, etc. (reads from Shim database)
   → kubectl get cronjobs  (lists the whole job family, not just osmdiffs)
-  → Browser: GET http://<vps-ip>:8080/  (public status page — events,
-    running jobs, accumulated cost; read-only, no auth)
+  → Browser: GET https://kube-shim.brawer.ch/  (public status page —
+    events, running jobs, accumulated cost; read-only, no auth, same
+    listener/cert as the authenticated API, just a different route group)
+  → GET https://kube-shim.brawer.ch/healthz  (unauthenticated health
+    check, standard Kubernetes convention)
   → GET https://kube-shim.brawer.ch/apis/cost.kube-shim.io/v1/report
     (authenticated CSV cost report, grouped by job labels)
 
@@ -150,14 +154,14 @@ sqlite3 db.sqlite "SELECT * FROM jobs"
 - Middleware wrapping the *entire* `:6443` router — every route, reads included, since Secret contents must never be visible without auth — that checks `Authorization: Bearer <token>` against every non-expired entry in the list, using a **constant-time comparison** for each (iterating the whole list unconditionally rather than short-circuiting on the first match, so total response time doesn't leak which entry — or whether any entry — matched).
 - If the configured list is empty, or every entry has expired, **the shim refuses to start** rather than either locking the operator out confusingly at request time or — far worse — failing open and accepting all requests. This is checked once at startup and again whenever the config is reloaded.
 - Missing or wrong token → HTTP 401 Unauthorized, using the standard Kubernetes `Status` object (`reason: Unauthorized`) — distinct from the 403 `Forbidden` used for admission denials (Phase 5): 401 means "I don't know who you are," 403 means "I know who you are and the answer is no," matching real API server semantics.
-- The public status page (`:8080`, Phase 14) is deliberately *not* wrapped by this middleware — it stays unauthenticated by design.
+- The public status page and health endpoints (Phase 14) are deliberately *not* wrapped by this middleware — even once they end up sharing the same `:443` listener as this API (Phase 4/14), the middleware stays scoped to just the authenticated API's own sub-router rather than blanket-applied to the whole listener, so the public routes stay unauthenticated by design.
 - No custom client tooling needed: `kubectl config set-credentials ... --token=...` and Terraform's `kubernetes_provider` `token` argument both send exactly this header natively, regardless of how many tokens the shim currently considers valid.
 - **From this phase onward, every `curl` example against the authenticated API elsewhere in this document assumes `-H "Authorization: Bearer $TOKEN"` is included — omitted from later snippets for brevity, not because it's optional.**
 
 **Files to create/modify:**
 - `src/auth.rs` (new) - bearer-token middleware: list iteration, constant-time comparison per entry, expiration check
 - `src/k8s_status.rs` (new) - builds Kubernetes-shaped `Status` error responses (401 here; reused by Phase 5's 403 admission check and any future validation rejection)
-- `src/main.rs` - wrap the authenticated router in the auth middleware; the `:8080` router (Phase 14) never gets it
+- `src/main.rs` - wrap the authenticated router in the auth middleware, scoped so it doesn't also apply to the public status/health sub-router mounted later on the same listener (Phase 14)
 - `src/config.rs` - add `api_tokens: Vec<{token, expires_at: Option<DateTime>}>`; refuse to boot if none currently valid
 - `bootstrap/provision.sh` - generate the first token during first-time provisioning, print/save it once for the operator to copy into their kubeconfig/Terraform vars
 
@@ -202,7 +206,7 @@ Note: the token only protects the connection if TLS is actually used (already sh
   - **SLSA Build Level 3 provenance** is generated for every architecture-specific image and the joined manifest, via `actions/attest` (GitHub's native attestation action) run from a separate reusable workflow (`release-build.yml`) — not `slsa-framework/slsa-github-generator`, which an earlier version of this plan used; switched to match the same pattern already proven out in this project's sibling repos. The separate-workflow isolation (not a step folded into the same job that built the image) is what actually earns Level 3 rather than Level 1/2 either way — see `release-build.yml`'s own header comment.
   - A `verify-version` job cross-checks the pushed tag against `Cargo.toml`'s version before building anything, as a cheap sanity net (normally redundant, since `release-please` keeps them in sync itself, but cheap insurance against a stray manual tag).
 - `bootstrap/provision.sh` rewritten around this: installs rootless podman; drops the earlier `scp` binary + hand-written systemd unit flow.
-- A podman quadlet unit (`deploy/kube-shim.container`) defining: the image reference, bind mounts for persistent state (`/var/lib/kube-shim` on the host → `/data` in the container — holds `db.sqlite`, the TLS certs, and `config.toml`), and port publishing. Ports were originally chosen as `:6443`/`:8080` specifically because both are >1024, letting rootless podman bind them with no special capability or sysctl tweak — **revisited in Phase 4**, where ACME requires standard `:443`/`:80` for the authenticated API and challenge responder respectively; `:8080` (status page) is unaffected and stays as-is.
+- A podman quadlet unit (`deploy/kube-shim.container`) defining: the image reference, bind mounts for persistent state (`/var/lib/kube-shim` on the host → `/data` in the container — holds `db.sqlite`, the TLS certs, and `config.toml`), and port publishing. Ports were originally chosen as `:6443`/`:8080` specifically because both are >1024, letting rootless podman bind them with no special capability or sysctl tweak — **revisited in Phase 4**, where ACME requires standard `:443`/`:80` for the authenticated API and challenge responder respectively; **`:8080` is dropped entirely once Phase 14 lands**, once it turns out the public status page/health endpoints don't need a port of their own either — see Phase 14.
 - Because job/volume/VM/budget state lives entirely in SQLite (not in-process memory) and worker VMs run independently of the shim process, restarting the container for an update is safe even with jobs in flight — the reconciliation loop just resumes on its next tick, using the schema migrations that already run automatically on startup (Phase 1).
 - **Updating: two supported modes, not one.** The quadlet unit as checked in tracks `:latest` with `AutoUpdate=registry`, and `podman-auto-update.timer` (a systemd `--user` timer, enabled once during provisioning) polls the registry and restarts the container whenever a new image lands — so the actual `kube-shim.brawer.ch` instance rolls forward automatically on every release, with no SSH session required. This is a deliberate trade for development-loop speed while the project is young, not a general recommendation: an unattended rollout of an untested release is a real risk given the shim spends real money orchestrating cloud resources. It's judged acceptable here specifically because UpCloud's billing is prepaid with no auto-recharge — a bad release that misbehaves can burn at most the current prepaid balance, not an unbounded card charge, which bounds the downside of "wrong code ran unattended" to something already priced in. A deployment that doesn't have that backstop (a different provider with postpaid/card-on-file billing, or once this moves past personal-project status) should instead pin an explicit `vX.Y.Z` tag, drop the `AutoUpdate=registry` label, and go back to the deliberate `podman pull` + `systemctl --user restart kube-shim` flow — both modes are just a one-line edit to the same quadlet unit, not different infrastructure.
 
@@ -243,11 +247,11 @@ systemctl --user restart kube-shim
 **Deliverables:**
 - The authenticated Kubernetes API moves from `:6443` to standard `:443`, and a new minimal responder listens on `:80` for Let's Encrypt's HTTP-01 challenge — the two ports Caddy itself uses, and the two ports a plain hostname (`https://kube-shim.brawer.ch/`, no `:6443` in the URL) needs. This reverses Phase 3's original "both ports >1024, so rootless podman needs no special capability" choice; whether rootless podman can actually publish `:443`/`:80` without extra capabilities (`net.ipv4.ip_unprivileged_port_start`, or `podman run --cap-add`/quadlet's `AddCapability=`) needs to be verified hands-on against the real target distribution, the same way Phase 3's own podman/rootless mechanics were verified directly rather than assumed.
 - ACME client logic (issuance + automatic renewal) built on `rustls-acme` or equivalent, integrated with the existing `axum-server`/`rustls` TLS setup from Phase 1/3 rather than replacing it — `rustls-acme` in particular is designed to plug into exactly that stack (hands the TLS acceptor a certificate resolver that swaps in fresh certs on renewal, no listener restart needed).
-- `:80` serves *only* `/.well-known/acme-challenge/{token}` — the same "explicit allowlist, not just an auth gate" pattern already used for the `:8080` public status page (Phase 14): every other path 404s, by construction, not by convention.
+- `:80` serves *only* `/.well-known/acme-challenge/{token}` — the same "explicit allowlist, not just an auth gate" pattern later used for the public status page/health endpoints on `:443` (Phase 14): every other path 404s, by construction, not by convention.
 - Config: `hostname` (the real public DNS name to request a certificate for) and `acme_directory` (`staging` | `production`, or a literal ACME directory URL) — staging uses Let's Encrypt's staging environment (higher rate limits, a certificate chain that isn't publicly trusted) so development/testing never risks tripping the production environment's real rate limits. `config-dev.toml` defaults to `staging`; the real deployment's config uses `production`.
 - **Cold start vs. renewal failure handled differently, on purpose:** if the shim has no cached certificate yet (first boot, or a wiped `/data`) and ACME issuance fails, it retries a bounded number of times with backoff and then **fails to start** rather than serving broken or absent TLS — an operator needs to know immediately that DNS/networking/rate-limits are misconfigured, not discover it when a client's TLS handshake mysteriously fails. A **renewal** failure for a certificate that's still valid, by contrast, logs the failure and keeps retrying quietly in the background on its normal schedule, continuing to serve the still-valid certificate in the meantime — a transient Let's Encrypt outage or rate-limit bump shouldn't cause a self-inflicted outage of an otherwise-healthy service.
 - **Local dev/CI fallback:** when no `hostname` is configured (or it resolves to `localhost`/a private address), ACME is skipped entirely and the shim falls back to generating a self-signed certificate for that hostname — the same behavior Phase 1 already shipped, now demoted to "the fallback" rather than "the only option."
-- `deploy/kube-shim.container` updated: `PublishPort=443:443` and `PublishPort=80:80` replace the old `:6443` mapping; `:8080` (status page) is untouched.
+- `deploy/kube-shim.container` updated: `PublishPort=443:443` and `PublishPort=80:80` replace the old `:6443` mapping. `:8080` is left in place for now (it isn't wired to anything real yet, since the status page doesn't exist as code until Phase 14) — Phase 14 removes it once the status page/health endpoints turn out not to need a port of their own either.
 
 **Files to create/modify:**
 - `src/tls.rs` - extend `load_tls_config()` with ACME issuance/renewal via `rustls-acme` (or equivalent), keeping the existing self-signed path as the no-hostname-configured fallback
@@ -642,29 +646,43 @@ curl -k https://localhost:443/apis/cost.kube-shim.io/v1/report?from=2026-09-01&t
 
 ---
 
-### Phase 14: Public Status Page (Days 15-16)
-**Goal:** A simple, always-reachable, read-only page — no VPN or `kubectl` needed — showing recent events, currently running jobs, and accumulated cost.
+### Phase 14: Public Status Page + Health Endpoints (Days 15-16)
+**Goal:** A simple, always-reachable, read-only landing page plus standard Kubernetes-style health endpoints — no VPN or `kubectl` needed — all served from the same `:443` listener and ACME certificate as the authenticated API, not a separate plaintext port.
 
 **Deliverables:**
-- A second Axum router, bound to `0.0.0.0:8080` over plain HTTP, entirely separate from the authenticated `:443` API and the `:80` ACME-challenge responder (Phase 4). Only GET routes are ever registered on this router — by construction, not just by an auth check — so a bug elsewhere can't accidentally expose a write path on the public port. Port 8080 (rather than an alternative low port) means rootless podman can publish it with no special capability or sysctl tweak, unlike `:443`/`:80` (Phase 4).
-- Single server-rendered HTML page, auto-refreshing (`<meta http-equiv="refresh">` or a few lines of polling JS), showing:
+- A small, separately-scoped Axum `Router` — GET routes only, by construction, not just by an auth check, so a bug elsewhere can't accidentally expose a write path here — merged into the main `:443` app at specific paths, and deliberately excluded from Phase 2's bearer-token middleware. This requires that middleware to be scoped to just the authenticated API's own sub-router by this point (a small refactor of how Phase 2's wrapping is structured, not new behavior) rather than blanket-applied at the top of the whole `:443` app the way it could be back when `:6443`/now `:443` had only API routes on it.
+- `/` and a `/statusz` alias (nodding to the informal "zPages" debug-page tradition from gRPC/OpenCensus, not a literal Kubernetes API-server convention): single server-rendered HTML page, auto-refreshing (`<meta http-equiv="refresh">` or a few lines of polling JS), showing:
   - Recent events (Phase 12)
   - Currently running jobs ("nodes"/pods): name, job type, elapsed time, VM size
   - Accumulated cost and current budget balance / rollover cap, in `main_currency` (Phase 13)
-- An explicit allowlist of what's rendered — job names, timestamps, event reasons/messages, cost figures. Secret values, S3 credentials, SSH details, and worker VM IPs must never appear here, since this listener has no authentication at all.
-- The `:8080` port-publish line is added to the podman quadlet unit (`deploy/kube-shim.container`, Phase 3).
+- `/healthz`, `/livez`, `/readyz`: standard, genuinely Kubernetes-API-server-defined health-check endpoints, unauthenticated by the same convention real clusters use (infra health checks — load balancers, monitoring — can't always present a token). `/livez` reflects whether the process itself is up; `/readyz` additionally reflects whether the reconciliation loop and DB are actually functioning; `/healthz` mirrors `/readyz`, kept for compatibility with tooling that only knows the older combined name.
+- `/metrics` (a Prometheus self-instrumentation endpoint) is explicitly *not* built in this phase — deferred as a placeholder, see "Future Work: Prometheus `/metrics` Self-Instrumentation". Not to be confused with the already-planned, authenticated `metrics.k8s.io` API (Phase 12), which reports job/pod resource usage for `kubectl top`, a different concern with a different audience.
+- An explicit allowlist of what's rendered on `/`/`/statusz` — job names, timestamps, event reasons/messages, cost figures. Secret values, S3 credentials, SSH details, and worker VM IPs must never appear here, since these routes have no authentication at all.
+- `deploy/kube-shim.container`'s `:8080` port publish, left in place since Phase 3, is removed — nothing built across this whole plan ends up needing a port of its own beyond `:443`/`:80` (Phase 4).
 
 **Files to create/modify:**
-- `src/status_page.rs` (new) - renders the HTML page from DB reads (events, jobs, pricing/budget)
-- `src/main.rs` - start the third listener on `:8080` with its own router
-- `deploy/kube-shim.container` - publish `:8080`
+- `src/status_page.rs` (new) - renders the HTML page from DB reads (events, jobs, pricing/budget); also implements `/healthz`/`/livez`/`/readyz`
+- `src/main.rs` - merge the public sub-router into the `:443` app, outside the auth middleware's scope; rescope that middleware to the authenticated API's own sub-router if it wasn't already
+- `deploy/kube-shim.container` - remove the now-unused `:8080` port publish
 
 **Testing:**
 ```bash
-curl http://<vps-ip>:8080/
-# From a phone browser: http://<vps-ip>:8080/
+curl -k https://kube-shim.brawer.ch/
+curl -k https://kube-shim.brawer.ch/statusz   # same content as /
+curl -k https://kube-shim.brawer.ch/healthz
+curl -k https://kube-shim.brawer.ch/livez
+curl -k https://kube-shim.brawer.ch/readyz
+# All of the above: no Authorization header sent, still 200 OK
+
+# From a phone browser: https://kube-shim.brawer.ch/
 # Confirm no Secret values, tokens, or SSH details appear anywhere in the page source
-# Confirm POST/PUT/DELETE to :8080 all 404 (no such routes exist on this router)
+# Confirm POST/PUT/DELETE to any of the above paths all 404 (no such
+# routes exist on the public sub-router)
+
+# Confirm the public sub-router did NOT accidentally widen the
+# authenticated API's own exemption:
+curl -k https://kube-shim.brawer.ch/api/v1
+# Still 401 Unauthorized with no Authorization header
 ```
 
 ---
@@ -720,7 +738,7 @@ terraform apply
 # Monitor:
 journalctl -u kube-shim -f
 curl -k https://localhost:443/debug/status (every hour)
-curl http://<vps-ip>:8080/   # public status page, from your phone
+curl -k https://<hostname>/   # public status page, from your phone
 # UpCloud control panel (watch volume + VM count across all jobs)
 
 # After jobs complete
@@ -737,7 +755,7 @@ curl -k https://localhost:443/debug/status | jq '.total_cost, .budget_balance'
 | File | Purpose | Status |
 |------|---------|--------|
 | `Cargo.toml` | Rust dependencies | Phases 1, 3 |
-| `src/main.rs` | Server entry point, all listeners (`:443`, `:80`, `:8080`) | Phases 1-4, 14 |
+| `src/main.rs` | Server entry point, both listeners (`:443`, `:80`) | Phases 1-4, 14 |
 | `src/auth.rs` | Bearer-token authentication middleware for the API | Create (Phase 2) |
 | `src/k8s_status.rs` | Kubernetes-shaped `Status` error responses (401 here, reused for 403/422) | Create (Phase 2) |
 | `.github/workflows/release.yml` | CI: build musl binary, publish OCI image to ghcr.io | Create (Phase 3) |
@@ -757,7 +775,7 @@ curl -k https://localhost:443/debug/status | jq '.total_cost, .budget_balance'
 | `src/pricing/*.rs` | Cost tracking + rolling budget guard, in `main_currency` | Create (Phase 13) |
 | `src/api/cost_report.rs` | CSV cost report, grouped by job label | Create (Phase 13) |
 | `src/ssh.rs` | SSH client built on `russh` | Create (Phase 10) |
-| `src/status_page.rs` | Public read-only status page (port 8080) | Create (Phase 14) |
+| `src/status_page.rs` | Public status page + `/healthz`/`/livez`/`/readyz`, served on `:443` | Create (Phase 14) |
 | `src/naming.rs` | `resource_prefix`-aware resource name generation | Create (Phase 15) |
 | `src/config.rs` | Configuration parsing | Phases 1-2, 4-5, 7 |
 | `config.toml` | Runtime config template | Create (Phase 1) |
@@ -814,7 +832,7 @@ A job passes through `BudgetWait` before `VolumePending` if its estimated cost e
 A running job that exceeds its `activeDeadlineSeconds` (Phase 11) is force-killed and transitions to `Failed` with reason `DeadlineExceeded` — the same terminology real Kubernetes Jobs use for this exact situation.
 
 ### Authentication
-The authenticated API (`:443`, Phase 4) requires `Authorization: Bearer <token>` on every request (Phase 2), checked against every non-expired entry in `api_tokens` with a constant-time comparison. A missing or wrong token gets a standard Kubernetes `Status` object with `reason: Unauthorized` (HTTP 401) — separate from the `reason: Forbidden` (HTTP 403) used for admission denials below, matching real API server conventions. `:80` (ACME challenges, Phase 4) and `:8080` (status page, Phase 14) are both deliberately excluded from this middleware; they're meant to be public. Supporting a *list* of tokens (each with an optional expiry) rather than a single one is what makes rotation possible: add a new token, migrate clients, then remove the old one — never a single atomic cutover with no overlap window.
+The authenticated API (`:443`, Phase 4) requires `Authorization: Bearer <token>` on every request (Phase 2), checked against every non-expired entry in `api_tokens` with a constant-time comparison. A missing or wrong token gets a standard Kubernetes `Status` object with `reason: Unauthorized` (HTTP 401) — separate from the `reason: Forbidden` (HTTP 403) used for admission denials below, matching real API server conventions. `:80` (ACME challenges, Phase 4) and the public status/health sub-router mounted on `:443` (Phase 14) are both deliberately excluded from this middleware; they're meant to be public — the latter via scoping the middleware to just the authenticated API's own sub-router, not a separate listener. Supporting a *list* of tokens (each with an optional expiry) rather than a single one is what makes rotation possible: add a new token, migrate clients, then remove the old one — never a single atomic cutover with no overlap window.
 
 Secrets (this project's own `api_tokens`, cloud-provider credentials, and K8s `Secret` object contents) are stored in SQLite/`config.toml` **in plaintext, not encrypted at rest** — a deliberate decision, not an oversight. The only realistic threat model where DB-file encryption would help is an attacker who already has filesystem read access to the VPS; at that point they can also read `config.toml` (which holds the bearer tokens and cloud-provider API token in plaintext regardless) and, on a single-tenant personal VPS with no external KMS/HSM, would likely be able to recover whatever key the shim itself would need at startup to decrypt anything anyway. Encrypting the database would add real complexity (key management, migration risk) against a threat model it doesn't actually close off. TLS-in-transit (Phase 2/4) and ordinary OS file permissions on `db.sqlite`/`config.toml` are the controls that actually matter here.
 
@@ -866,7 +884,7 @@ The shim ships as a `FROM scratch` OCI image (Phase 3): a statically-linked musl
 - Phase 11: 10+ chaos scenarios (kill shim, container crashes, etc.) with zero orphans and zero duplicate resources; a job that overruns `activeDeadlineSeconds` is force-killed and marked `Failed`/`DeadlineExceeded`, including when the shim was down at the moment the deadline passed
 - Phase 12: kubectl describe shows events, kubectl top shows metrics across all running jobs
 - Phase 13: costs calculated per job and per family in `main_currency`; a job whose estimate exceeds the budget balance waits in `BudgetWait` and launches once enough has accrued; a job that finishes early returns its unused margin to the balance; the CSV cost report groups correctly by label
-- Phase 14: status page reachable with no auth on port 8080, shows events/jobs/cost, never leaks secrets, and rejects all non-GET requests
+- Phase 14: status page and `/healthz`/`/livez`/`/readyz` reachable with no auth on `:443` (same listener/cert as the authenticated API), show events/jobs/cost, never leak secrets, reject all non-GET requests, and don't widen the authenticated API's own auth requirement
 - Phase 15: all resources named with the configured `resource_prefix`, cleanup script works, two instances with different prefixes don't interfere with each other's orphan scans
 - Phase 16: real osmdiffs job and at least one other cronjob complete successfully, concurrently at least once, cost accurate
 
@@ -883,7 +901,7 @@ The shim ships as a `FROM scratch` OCI image (Phase 3): a statically-linked musl
 #    - kubectl get pod shows Succeeded status
 #    - UpCloud control panel: volumes/VMs created, then deleted
 #    - Cost calculated per job and aggregated across the family, in main_currency
-#    - Public status page (port 8080) matches the authenticated debug/status output
+#    - Public status page (/ and /statusz) matches the authenticated debug/status output; /healthz, /livez, /readyz all respond with no auth
 #    - Shim logs: no errors, all state transitions clean
 # 6. Run 2-3 more scheduled cycles (over 1-2 weeks) with zero manual intervention
 # 7. Let one real release roll out via podman-auto-update.timer: confirm state
@@ -904,7 +922,7 @@ All questions below are resolved or deliberately deferred — none block startin
 
 4. **Monitoring / alerting**: deliberately deferred, not implemented in the initial scope. There's no single established generic webhook standard for arbitrary Kubernetes events — the closest ecosystem convention is Prometheus Alertmanager's webhook receiver (built on metrics + alerting rules) or ad hoc event-forwarders like `eventrouter`, both of which are downstream tooling the cluster operator adds, not something the API server defines. OpenTelemetry itself is a telemetry *data pipeline* (traces/metrics/logs), not an alerting system — alerting is a separate concern layered on top of an OTel-fed backend (Grafana, Prometheus, or a vendor). None of that infrastructure is warranted for a single-VPS personal project. If this gets built later, the lightest-weight fit is a simple outbound webhook POST (a JSON payload) on specific events — job `Failed`/`DeadlineExceeded`, budget balance running low — to a user-configured URL (a Slack incoming webhook, `ntfy.sh`, `healthchecks.io`, etc.), no Prometheus/OTel Collector required. For now: journalctl + the status page only.
 
-5. **RBAC/AuthN**: resolved for the initial scope. Full RBAC is still out of scope (single-user trusted setup), but Phase 2 requires a bearer token — mirroring Kubernetes' own built-in static-token-file authenticator — on every request to the authenticated API, closing the "must stay bound to VPN" gap without needing a VPN or any special networking. The public `:8080` status page remains deliberately unauthenticated by design (read-only, structurally unable to mutate state) — see Phase 14.
+5. **RBAC/AuthN**: resolved for the initial scope. Full RBAC is still out of scope (single-user trusted setup), but Phase 2 requires a bearer token — mirroring Kubernetes' own built-in static-token-file authenticator — on every request to the authenticated API, closing the "must stay bound to VPN" gap without needing a VPN or any special networking. The public status page and health endpoints remain deliberately unauthenticated by design (read-only, structurally unable to mutate state) even after they move onto the same `:443` listener as the authenticated API — see Phase 14.
 
 6. **Volume model — reclaim policy vs. tier**: resolved, and revised from the original plan. Implementing full standard Kubernetes dynamic provisioning (a real `StorageClass` + `PersistentVolume` resource pair, with a Retain option) would be meaningfully more work for no practical benefit at this scale and for workloads that are, in practice, always genuinely ephemeral — so the shim uses real Kubernetes **generic ephemeral volumes** (inline in the pod template) instead of standalone PVCs, and repurposes the PVC's `spec.storageClassName` field to select a *performance tier* (`kube-shim-standard`/`kube-shim-fast`) rather than a reclaim policy, since nothing is ever retained across runs at all. See Phase 5 and "Generic Ephemeral Volumes / Storage Tiers" under Key Implementation Details. Standalone `PersistentVolumeClaim` support for data that genuinely needs to survive across runs is deferred — see "Future Work."
 
@@ -927,6 +945,8 @@ All questions below are resolved or deliberately deferred — none block startin
 15. **Naming for multiple concurrent instances**: resolved. `resource_prefix` (default `"kube-shim"`, Phase 5/15) replaces a hardcoded literal in both resource naming and orphan-scan matching, so more than one independent kube-shim instance can run against the same cloud account without collisions or cross-instance interference.
 
 16. **Volume performance tiers / IOPS**: resolved. See item 6 above and "Generic Ephemeral Volumes / Storage Tiers" under Key Implementation Details — `storageClassName` selects from a small, fixed, per-provider-mapped set of tier names rather than a portable numeric IOPS target, since even real Kubernetes/CSI doesn't standardize IOPS as a cross-provider parameter, and these providers offer discrete tiers, not a continuously dialable number.
+
+17. **Public status page port, once ACME exists**: resolved. Once Phase 4 gives kube-shim a real, CA-trusted certificate, keeping the status page on a separate plaintext `:8080` stopped making sense — it moves onto the same `:443` listener as the authenticated API instead (Phase 14), as a structurally separate GET-only sub-router kept outside the bearer-token middleware's scope, rather than a physically separate port. Along the way, added `/healthz`/`/livez`/`/readyz` (genuinely standard Kubernetes API-server health endpoints) and a `/statusz` alias for `/` (the informal gRPC/OpenCensus "zPages" convention, not a literal Kubernetes convention — worth being precise about the difference). A literal Prometheus `/metrics` self-instrumentation endpoint was considered at the same time but deliberately deferred — see "Future Work: Prometheus `/metrics` Self-Instrumentation".
 
 ---
 
@@ -958,6 +978,16 @@ Not in the initial scope. UpCloud (like most VPS providers) has multiple datacen
 - Real Kubernetes convention for this: the standard `topology.kubernetes.io/region` and `topology.kubernetes.io/zone` node labels, matched via a pod's `nodeSelector` or `nodeAffinity` — there's no broader established convention beyond those two label keys; Kubernetes doesn't mandate specific *values* for them, only that they exist.
 - If/when this is needed: honor `nodeSelector` matching those two keys against UpCloud's actual zone identifiers (e.g. `fi-hel1`, `de-fra1`), passed straight through to the `create_server` call. An unmatched/unknown zone would be rejected the same way an unknown `storageClassName` is (HTTP 422, `reason: Invalid`).
 - Sequencing: deferred because there's no concrete need yet — the cronjob family doesn't currently care which zone a worker VM lands in, and a single-zone deployment is simpler in every way that matters until that changes.
+
+---
+
+## Future Work: Prometheus `/metrics` Self-Instrumentation
+
+Not in the initial scope — deferred by explicit choice when the status-page/z-pages design was discussed (see Phase 14 and Open Question 17), not because it's hard:
+
+- A literal Prometheus text-exposition endpoint at `/metrics`, unauthenticated, on the same public sub-router as `/healthz`/`/livez`/`/readyz` (Phase 14) — self-instrumentation for the shim process itself (uptime, reconciliation tick count/duration, jobs-by-state gauges, current budget balance, ...).
+- Not to be confused with the already-planned, authenticated `metrics.k8s.io` API (Phase 12), which reports job/pod resource usage for `kubectl top` — a different concern (workload metrics) with a different audience (`kubectl`/Terraform, behind the bearer token) than this one (shim self-instrumentation, for an operator's own Prometheus, unauthenticated).
+- Straightforward to add later with the `prometheus` (or `metrics`) crate once there's an actual reason to scrape kube-shim itself (e.g. wiring it into existing personal Grafana/Prometheus infra, if any exists) — no design obstacle, just not needed for this round.
 
 ---
 
