@@ -4,18 +4,23 @@ After=network-online.target
 Wants=network-online.target
 
 [Container]
-Image=ghcr.io/brawer/kube-shim:v0.1.0
-# Bump this tag manually to update. Deliberately no AutoUpdate=registry
-# label here -- see docs/IMPLEMENTATION_PLAN.md Phase 3: updates are always
-# a deliberate `podman pull` + restart, never an unattended auto-update,
-# given the shim spends real money orchestrating cloud resources.
+Image=ghcr.io/brawer/kube-shim:latest
+# Auto-updates on every release via podman-auto-update.timer -- see
+# docs/IMPLEMENTATION_PLAN.md Phase 3. This trades update-safety for
+# development-loop speed: acceptable here specifically because UpCloud's
+# billing is prepaid with no auto-recharge, so a bad release can burn at
+# most the current prepaid balance, not an unbounded card charge.
+#
+# For a deployment without that backstop, prefer the safer, deliberate
+# alternative instead: pin an explicit version (e.g.
+# Image=ghcr.io/brawer/kube-shim:v0.1.0), remove the AutoUpdate= label
+# below, and update by hand: `podman pull` + `systemctl --user restart`.
+AutoUpdate=registry
 Volume=%h/kube-shim-data:/data:Z
 PublishPort=6443:6443
 PublishPort=8080:8080
 
 [Service]
-# Restart-on-crash is process supervision, not an auto-updater: it always
-# restarts the *same* pinned image tag above, never pulls a new one.
 Restart=on-failure
 RestartSec=10
 
