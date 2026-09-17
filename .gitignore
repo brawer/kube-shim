@@ -18,6 +18,12 @@ certs/
 # Config
 config.toml
 
+# Local credentials -- never committed. `secrets/` specifically holds
+# real, live provider API tokens used for manual local testing against
+# real infrastructure (e.g. secrets/upcloud_token) -- not test fixtures,
+# not anything meant to ever reach git history.
+secrets/
+
 # IDE
 .vscode/
 .idea/
