@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.4](https://github.com/brawer/kube-shim/compare/v0.1.3...v0.1.4) (2026-09-18)
+
+
+### 🐞 Bug Fixes
+
+* ACME challenge-responder deadlock + sysctl value ([#24](https://github.com/brawer/kube-shim/issues/24)) ([0877242](https://github.com/brawer/kube-shim/commit/0877242ba24e2005639c377dc20ce310390c1146))
+
 ## [0.1.3](https://github.com/brawer/kube-shim/compare/v0.1.2...v0.1.3) (2026-09-18)
 
 
