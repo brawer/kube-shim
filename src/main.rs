@@ -45,32 +45,22 @@ async fn main() -> Result<()> {
             // cached); a cold-start failure returns an error and this
             // process exits non-zero rather than serving broken TLS.
             tracing::info!("ACME enabled for hostname {hostname}; obtaining certificate...");
-            let acme::Acme {
-                acceptor,
-                challenge_router,
-            } = acme::setup(&cfg.server).await?;
-
-            let challenge_addr: SocketAddr =
-                format!("{}:{}", cfg.server.host, cfg.server.acme_challenge_port)
-                    .parse()
-                    .context("Invalid server host/acme_challenge_port")?;
-
-            tracing::info!(
-                "ACME HTTP-01 challenge responder listening on http://{}",
-                challenge_addr
-            );
-            let challenge_server =
-                axum_server::bind(challenge_addr).serve(challenge_router.into_make_service());
+            // acme::setup() starts the :80 HTTP-01 challenge responder
+            // itself (as a background task) before waiting for the first
+            // certificate -- issuance depends on that responder already
+            // being reachable, so starting it only *after* setup()
+            // returned would deadlock.
+            let acceptor = acme::setup(&cfg.server).await?;
 
             tracing::info!(
                 "Server listening on https://{} (ACME cert for {hostname})",
                 addr
             );
-            let api_server = axum_server::bind(addr)
+            axum_server::bind(addr)
                 .acceptor(acceptor)
-                .serve(router.into_make_service());
-
-            tokio::try_join!(api_server, challenge_server).context("Server error")?;
+                .serve(router.into_make_service())
+                .await
+                .context("Server error")?;
         }
         None => {
             // No public hostname configured -- local dev/CI fallback:
