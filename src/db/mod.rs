@@ -1,3 +1,5 @@
+mod migrations;
+
 use anyhow::{Context, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::path::Path;
@@ -19,13 +21,18 @@ pub async fn init_pool<P: AsRef<Path>>(db_path: P) -> Result<SqlitePool> {
         .await
         .context("Failed to connect to SQLite database")?;
 
-    // Run migrations
-    run_migrations(&pool).await?;
+    // Base schema: safe to re-run on every startup, since every statement
+    // in schema.sql is a CREATE TABLE/INDEX IF NOT EXISTS -- a no-op
+    // against a table that already exists, which is also exactly why it
+    // can't handle a column added to an existing table (see
+    // db/migrations.rs, run right after, for that).
+    run_schema(&pool).await?;
+    migrations::run(&pool).await?;
 
     Ok(pool)
 }
 
-async fn run_migrations(pool: &SqlitePool) -> Result<()> {
+async fn run_schema(pool: &SqlitePool) -> Result<()> {
     let schema = include_str!("schema.sql");
 
     // Execute all statements in schema

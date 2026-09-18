@@ -357,7 +357,7 @@ curl -X POST .../cronjobs -d '{"spec": {"jobTemplate": {"spec": {
 - Error handling + retry tracking per job — deferred in substance to Phase 10 (nothing can actually *fail* yet, since every transition is mocked); this phase just makes sure `retry_count`/`version`/`last_transition_time` get touched correctly on every advance, so Phase 10 has real bookkeeping to build retry logic on top of rather than adding it from scratch.
 - Startup reconciliation (detect orphaned jobs from crashed shim) — `src/reconcile/startup.rs` logs every non-terminal job found at boot and confirms it resumes reconciling normally on the very next tick. No actual cleanup logic yet (nothing external exists to clean up) — that's Phase 10.
 
-**A real, discovered gap, not part of the original plan:** `src/db/mod.rs`'s "migrations" only ever re-run `CREATE TABLE IF NOT EXISTS`/`CREATE INDEX IF NOT EXISTS` — there is no `ALTER TABLE` step, so adding a column to an *already-existing* table would silently never reach the already-deployed `kube-shim.brawer.ch` database (a `CREATE TABLE IF NOT EXISTS` against a table that already exists, missing the new column, is a no-op). This phase's own design sidesteps needing to find out the hard way: rather than adding a `last_scheduled_time` column to `cronjobs`, the "was this schedule already handled?" check derives the answer from `MAX(jobs.created_at) WHERE cronjob_name = ...` instead — arguably more correct anyway (one source of truth, no risk of the two ever disagreeing), and it happens to need no schema change at all. The underlying gap remains real and unaddressed, though — flagged here rather than silently worked around every time, since a future phase that genuinely needs a new column on an existing table (unlikely given how much of the schema was already front-loaded in Phase 1, but not impossible) will hit it for real.
+**A real, discovered gap, not part of the original plan — found and fixed in this same phase:** `src/db/mod.rs`'s "migrations" only ever re-ran `CREATE TABLE IF NOT EXISTS`/`CREATE INDEX IF NOT EXISTS` — there was no `ALTER TABLE` step, so adding a column to an *already-existing* table would have silently never reached the already-deployed `kube-shim.brawer.ch` database (a `CREATE TABLE IF NOT EXISTS` against a table that already exists, missing the new column, is a no-op). This phase's schedule-due-ness check (below) doesn't actually need a new column — deriving "was this schedule already handled?" from `MAX(jobs.created_at) WHERE cronjob_name = ...` is arguably the better design on its own merits regardless (see that function's own comment for why) — but the underlying gap was real and worth closing properly rather than leaning on "we happened not to need one this time." Fixed with **`src/db/migrations.rs`**: a small, explicit `(table, column, type)` list, applied idempotently on every startup — checked via `PRAGMA table_info` first, so it's safe to run against both a database that predates the column and a fresh one where `schema.sql` already includes it. Empty for now (nothing currently needs it), but real and tested (`apply_added_columns()` is exercised directly against an explicit test list, not just the empty production one), so the mechanism is proven before the day it's actually needed. New columns on an existing table go here from now on, not by editing that table's `CREATE TABLE` in `schema.sql` after it's already shipped.
 
 **Files created/modified:**
 - `src/reconcile/mod.rs` (new) - reconciliation loop entry point (`run`/`tick`), `Notify`-based wake-up alongside the fallback interval
@@ -368,6 +368,8 @@ curl -X POST .../cronjobs -d '{"spec": {"jobTemplate": {"spec": {
 - `src/app.rs` - `build_router()` takes the shared `Notify` via `Extension`, not `State`, so only `create_cronjob` needs to know about it
 - `src/main.rs` - runs startup recovery, then spawns the reconciliation loop as a background task before serving any requests
 - `src/db/schema.sql` - **no changes**: `retry_count`, `last_error`, `volume_id`, `worker_vm_id` (and everything else this phase touches) were already present from Phase 1's original schema, which front-loaded far more of the eventual column set than that phase's own scope suggested at the time
+- `src/db/migrations.rs` (new) - the `ALTER TABLE`-based column-migration mechanism described above
+- `src/db/mod.rs` - runs `migrations::run()` right after the existing `schema.sql` pass
 
 **No external API calls yet.** Just:
 - Poll SQLite for jobs not in terminal state
@@ -376,10 +378,10 @@ curl -X POST .../cronjobs -d '{"spec": {"jobTemplate": {"spec": {
 
 **Testing:**
 ```bash
-cargo test   # 95 tests total, incl. unit tests for next_state()/schedule
-             # due-ness/startup recovery, plus a timing-based test proving
-             # Notify wakes the loop faster than a (deliberately long)
-             # fallback interval
+cargo test   # 99 tests total, incl. unit tests for next_state()/schedule
+             # due-ness/startup recovery/the ALTER TABLE migration
+             # mechanism, plus a timing-based test proving Notify wakes
+             # the loop faster than a (deliberately long) fallback interval
 
 # Real end-to-end, not just unit tests: create a CronJob with an
 # every-minute schedule against a live local server, then watch actual

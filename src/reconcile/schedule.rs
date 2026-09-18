@@ -81,15 +81,20 @@ pub async fn schedule_due_jobs(pool: &SqlitePool) -> Result<usize> {
 }
 
 /// The most recent instant a run was actually created for this CronJob,
-/// derived from the `jobs` table itself (not a separate `last_scheduled`
-/// column on `cronjobs`) -- deliberately, since this project's migration
-/// mechanism only ever re-runs `CREATE TABLE IF NOT EXISTS` (see
-/// `src/db/mod.rs`), which cannot add a column to an already-existing
-/// table. Adding one now would silently never apply to the already-
-/// deployed kube-shim.brawer.ch database. Deriving it from `MAX(jobs.
-/// created_at)` avoids needing a schema change at all, and is arguably
-/// more correct anyway (single source of truth, no risk of the two ever
-/// disagreeing).
+/// derived from the `jobs` table itself rather than stored in a separate
+/// `last_scheduled` column on `cronjobs`. Deliberately, on its own
+/// merits -- not because adding a column would have been hard (`src/db/
+/// migrations.rs` handles that safely now): a dedicated column would be
+/// redundant state that only one code path (this one, right here) ever
+/// writes, so it could never legitimately drift from `MAX(jobs.
+/// created_at)` -- one fewer thing to keep in sync for zero benefit
+/// today. It also sidesteps a real question a dedicated column would
+/// force: once Phase 13's budget guard exists, a due schedule can be
+/// held in `BudgetWait` *before* a `jobs` row exists for it, so "due" and
+/// "a run was created" stop being the same instant -- a stored column
+/// would need an explicit answer for which of those two moments it
+/// tracks. Deriving from `jobs.created_at` answers that by construction:
+/// it only ever reflects runs that were actually created.
 async fn last_scheduled_time(
     pool: &SqlitePool,
     cronjob_name: &str,
