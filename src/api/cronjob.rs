@@ -4,12 +4,14 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx::{Row, SqlitePool};
+use std::sync::Arc;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +34,7 @@ pub struct CreateCronJobRequest {
 
 pub async fn create_cronjob(
     State(pool): State<SqlitePool>,
+    Extension(notify): Extension<Arc<Notify>>,
     Json(req): Json<CreateCronJobRequest>,
 ) -> Response {
     // Admission checks first, before anything is written -- same ordering
@@ -59,6 +62,16 @@ pub async fn create_cronjob(
         Ok(s) => s,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
+    // Phase 6's reconciliation loop (src/reconcile/schedule.rs) needs the
+    // real schedule to check due-ness against -- this used to be hardcoded
+    // to "" ("will be extracted... in Phase 2", a stale comment from an
+    // earlier phase numbering that never actually did it).
+    let schedule = req
+        .spec
+        .get("schedule")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("")
+        .to_string();
 
     let insert_result = sqlx::query(
         r#"
@@ -72,7 +85,7 @@ pub async fn create_cronjob(
     .bind(&spec_json)
     .bind(now)
     .bind(now)
-    .bind("") // schedule will be extracted from spec in Phase 2
+    .bind(&schedule)
     .bind(1)
     .execute(&pool)
     .await;
@@ -80,6 +93,11 @@ pub async fn create_cronjob(
     if let Err(e) = insert_result {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
+
+    // Wake the reconciliation loop immediately rather than waiting up to
+    // reconcile::FALLBACK_INTERVAL for it to notice this CronJob's
+    // schedule on its next poll.
+    notify.notify_one();
 
     let cronjob = CronJob {
         api_version: "batch/v1".to_string(),

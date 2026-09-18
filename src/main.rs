@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use kube_shim::{acme, app, config, db, tls};
+use kube_shim::{acme, app, config, db, reconcile, tls};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::sync::Notify;
 
 #[derive(Parser, Debug)]
 #[command(name = "kube-shim")]
@@ -30,8 +31,20 @@ async fn main() -> Result<()> {
     let pool = db::init_pool(&cfg.database.path).await?;
     tracing::info!("Database initialized at: {}", cfg.database.path);
 
+    // Startup recovery (Phase 6): surface any job a previous crash left
+    // mid-flight before the reconciliation loop starts polling normally.
+    let recovered = reconcile::startup::recover(&pool).await?;
+    tracing::info!("Startup recovery: {recovered} job(s) resumed");
+
+    // Reconciliation loop (Phase 6), running in the background for the
+    // lifetime of the process. `notify` is also handed to the API router
+    // below so a new CronJob can wake it immediately instead of waiting
+    // for the fallback poll.
+    let notify = Arc::new(Notify::new());
+    tokio::spawn(reconcile::run(pool.clone(), notify.clone()));
+
     // Build router
-    let router = app::build_router(pool, Arc::new(cfg.server.api_tokens.clone()));
+    let router = app::build_router(pool, Arc::new(cfg.server.api_tokens.clone()), notify);
 
     let addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port)
         .parse()

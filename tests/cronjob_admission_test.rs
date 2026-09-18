@@ -20,6 +20,7 @@ async fn test_router() -> axum::Router {
             token: TOKEN.to_string(),
             expires_at: None,
         }]),
+        Arc::new(tokio::sync::Notify::new()),
     )
 }
 
