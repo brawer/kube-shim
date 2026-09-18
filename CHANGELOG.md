@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.6](https://github.com/brawer/kube-shim/compare/v0.1.5...v0.1.6) (2026-09-18)
+
+
+### 🆕 Enhancements
+
+* reconciliation loop skeleton (Phase 6) ([#28](https://github.com/brawer/kube-shim/issues/28)) ([7311c2f](https://github.com/brawer/kube-shim/commit/7311c2fc9d9281d5acd92ef3f233f69b8dabaf44))
+
 ## [0.1.5](https://github.com/brawer/kube-shim/compare/v0.1.4...v0.1.5) (2026-09-18)
 
 
