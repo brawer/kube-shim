@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.1.3](https://github.com/brawer/kube-shim/compare/v0.1.2...v0.1.3) (2026-09-18)
+
+
+### 🆕 Enhancements
+
+* automatic TLS via ACME (Phase 4) ([#23](https://github.com/brawer/kube-shim/issues/23)) ([f334c4a](https://github.com/brawer/kube-shim/commit/f334c4ab6561e3b9d570fd710262920b4913edd2))
+
+
+### 🐞 Bug Fixes
+
+* gitignore the local secrets/ directory ([#17](https://github.com/brawer/kube-shim/issues/17)) ([e6ce0f2](https://github.com/brawer/kube-shim/commit/e6ce0f2737cfe8131795ec4836e67944296c7b81))
+
+
+### 📚 Documentation
+
+* fold ACME/UpCloud/ephemeral-volumes design round into the plan ([#20](https://github.com/brawer/kube-shim/issues/20)) ([1302dd3](https://github.com/brawer/kube-shim/commit/1302dd336171f3e51e904435793028a78a7c72b6))
+* fold the ACME/UpCloud/ephemeral-volumes design round into the plan ([1302dd3](https://github.com/brawer/kube-shim/commit/1302dd336171f3e51e904435793028a78a7c72b6))
+* move public status page onto :443, add z-pages, defer /metrics ([#21](https://github.com/brawer/kube-shim/issues/21)) ([16071fd](https://github.com/brawer/kube-shim/commit/16071fddd1e15ec7f6cab1a129e2265d39832bec))
+* record verified rootless-podman privileged-port finding (Phase 4) ([#22](https://github.com/brawer/kube-shim/issues/22)) ([ebb25e0](https://github.com/brawer/kube-shim/commit/ebb25e0de6c83a46d5e019792fdfaed4a4572792))
+* switch worker containers to podman, enable auto-update for kube-shim.brawer.ch ([#18](https://github.com/brawer/kube-shim/issues/18)) ([92293a3](https://github.com/brawer/kube-shim/commit/92293a3e5d97e51deca2fb8a5f121267f2cd2c95))
+
 ## [0.1.2](https://github.com/brawer/kube-shim/compare/v0.1.1...v0.1.2) (2026-09-16)
 
 
