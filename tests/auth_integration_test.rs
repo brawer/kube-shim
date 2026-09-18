@@ -27,7 +27,11 @@ async fn start_server(api_tokens: Vec<ApiToken>) -> String {
         .unwrap();
 
     let pool = kube_shim::db::init_pool(":memory:").await.unwrap();
-    let router = kube_shim::app::build_router(pool, Arc::new(api_tokens));
+    let router = kube_shim::app::build_router(
+        pool,
+        Arc::new(api_tokens),
+        Arc::new(tokio::sync::Notify::new()),
+    );
 
     let std_listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
     let addr: SocketAddr = std_listener.local_addr().unwrap();

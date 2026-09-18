@@ -7,6 +7,7 @@ pub mod auth;
 pub mod config;
 pub mod db;
 pub mod k8s_status;
+pub mod reconcile;
 pub mod tls;
 pub mod volumes;
 pub mod workload;

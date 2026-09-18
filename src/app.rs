@@ -7,9 +7,10 @@ use axum::{
     http::{HeaderName, HeaderValue},
     middleware,
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
 use std::sync::Arc;
+use tokio::sync::Notify;
 use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer};
 
 /// A `Server: kube-shim/x.y.z` header, stamped from `Cargo.toml`'s own
@@ -26,7 +27,17 @@ pub fn server_header_layer() -> SetResponseHeaderLayer<HeaderValue> {
     )
 }
 
-pub fn build_router(pool: sqlx::SqlitePool, api_tokens: Arc<Vec<config::ApiToken>>) -> Router {
+/// `notify`: shared with the reconciliation loop (Phase 6) via
+/// `Extension`, not axum's `State` -- only `create_cronjob` needs it (to
+/// wake the loop immediately on a new `CronJob` instead of waiting up to
+/// `reconcile::FALLBACK_INTERVAL`), and `Extension` lets it reach just
+/// that one handler without changing every other handler's `State<...>`
+/// extractor.
+pub fn build_router(
+    pool: sqlx::SqlitePool,
+    api_tokens: Arc<Vec<config::ApiToken>>,
+    notify: Arc<Notify>,
+) -> Router {
     Router::new()
         // Discovery endpoints
         .route("/api/v1", get(api::discovery_v1))
@@ -51,6 +62,7 @@ pub fn build_router(pool: sqlx::SqlitePool, api_tokens: Arc<Vec<config::ApiToken
             "/apis/batch/v1/namespaces/:namespace/cronjobs/:name",
             get(api::cronjob::get_cronjob).delete(api::cronjob::delete_cronjob),
         )
+        .layer(Extension(notify))
         .layer(CorsLayer::permissive())
         // Runs before CORS and before any handler, so an unauthenticated
         // request never reaches application logic at all.

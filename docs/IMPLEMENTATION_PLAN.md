@@ -346,37 +346,50 @@ curl -X POST .../cronjobs -d '{"spec": {"jobTemplate": {"spec": {
 
 ---
 
-### Phase 6: Reconciliation Loop Skeleton (Days 6-7)
+### Phase 6: Reconciliation Loop Skeleton (Days 6-7) — ✅ Complete
 **Goal:** Build the state machine that will drive all orchestration.
 
 **Deliverables:**
-- Reconciliation loop: `tokio::time::interval` every 10 seconds as the **fallback** cadence — not the only trigger. A `tokio::sync::Notify` lets specific events wake the loop immediately instead of waiting up to 10s: a new job submitted via the API, and (once Phase 13 exists) the budget balance crossing a job out of `BudgetWait`. The 10s poll stays in place regardless, since it's still what catches external state changes the shim wouldn't otherwise hear about (e.g. a provider-side VM failure) — the `Notify` is purely a responsiveness improvement for the cases the shim already knows about immediately, not a replacement for polling.
-- Job state machine: defined states + transition logic
+- Reconciliation loop: `tokio::time::interval` every 10 seconds as the **fallback** cadence — not the only trigger. A `tokio::sync::Notify` lets specific events wake the loop immediately instead of waiting up to 10s: a new `CronJob` submitted via the API, and (once Phase 13 exists) the budget balance crossing a job out of `BudgetWait`. The 10s poll stays in place regardless, since it's still what catches external state changes the shim wouldn't otherwise hear about (e.g. a provider-side VM failure) — the `Notify` is purely a responsiveness improvement for the cases the shim already knows about immediately, not a replacement for polling. `tokio::time::interval`'s *first* tick fires immediately by design, so the loop's very first pass also happens right at startup, not after the first 10s — a genuine feature (reconcile immediately on boot), not something worked around.
+- **A piece the original plan text didn't spell out but turned out to be load-bearing: something has to turn a `CronJob`'s schedule into actual job runs** — otherwise the `jobs` table (which the rest of this phase reconciles) would only ever have zero rows. Built as `src/reconcile/schedule.rs`, the shim-internal equivalent of real Kubernetes' cronjob controller: parses `spec.schedule` (standard 5-field POSIX cron, via the `cron` crate — prepending a fixed `"0 "` seconds field to bridge to the 6-field form that crate expects) and creates a new `jobs` row whenever at least one scheduled instant has passed since the last run (or since the `CronJob`'s own creation, if it's never run) — coalescing any missed instants into a single catch-up run rather than bursting one per missed minute, the same way real `Allow`-policy CronJobs behave. There's no `concurrencyPolicy` support (`Forbid`/`Replace`) — nothing in this plan needs it.
+- Job state machine: the full pipeline from "Reconciliation Loop State Machine" under Key Implementation Details (minus `BudgetWait`, which needs Phase 13's budget guard to mean anything) — one state per reconciliation tick, mocked (no real work happens, `Succeeded`/`Failed` collapses to always `Succeeded` since there's no real container execution yet to have an outcome).
 - Database updates for job status, volume_id, worker_vm_id, etc.
-- Error handling + retry tracking per job
-- Startup reconciliation (detect orphaned jobs from crashed shim)
+- Error handling + retry tracking per job — deferred in substance to Phase 10 (nothing can actually *fail* yet, since every transition is mocked); this phase just makes sure `retry_count`/`version`/`last_transition_time` get touched correctly on every advance, so Phase 10 has real bookkeeping to build retry logic on top of rather than adding it from scratch.
+- Startup reconciliation (detect orphaned jobs from crashed shim) — `src/reconcile/startup.rs` logs every non-terminal job found at boot and confirms it resumes reconciling normally on the very next tick. No actual cleanup logic yet (nothing external exists to clean up) — that's Phase 10.
 
-**Files to create/modify:**
-- `src/reconcile/mod.rs` - reconciliation loop entry point, `Notify`-based wake-up alongside the fallback interval
-- `src/reconcile/job.rs` - job-specific reconciliation steps
-- `src/reconcile/startup.rs` - startup recovery logic
-- `src/db/schema.sql` - add retry_count, last_error, volume_id, worker_vm_id columns
+**A real, discovered gap, not part of the original plan:** `src/db/mod.rs`'s "migrations" only ever re-run `CREATE TABLE IF NOT EXISTS`/`CREATE INDEX IF NOT EXISTS` — there is no `ALTER TABLE` step, so adding a column to an *already-existing* table would silently never reach the already-deployed `kube-shim.brawer.ch` database (a `CREATE TABLE IF NOT EXISTS` against a table that already exists, missing the new column, is a no-op). This phase's own design sidesteps needing to find out the hard way: rather than adding a `last_scheduled_time` column to `cronjobs`, the "was this schedule already handled?" check derives the answer from `MAX(jobs.created_at) WHERE cronjob_name = ...` instead — arguably more correct anyway (one source of truth, no risk of the two ever disagreeing), and it happens to need no schema change at all. The underlying gap remains real and unaddressed, though — flagged here rather than silently worked around every time, since a future phase that genuinely needs a new column on an existing table (unlikely given how much of the schema was already front-loaded in Phase 1, but not impossible) will hit it for real.
+
+**Files created/modified:**
+- `src/reconcile/mod.rs` (new) - reconciliation loop entry point (`run`/`tick`), `Notify`-based wake-up alongside the fallback interval
+- `src/reconcile/job.rs` (new) - the state sequence + `next_state()`, `advance_all()`
+- `src/reconcile/schedule.rs` (new) - turns a due `CronJob` schedule into a new `jobs` row (see above — not in the original file list, but necessary for this phase to do anything observable)
+- `src/reconcile/startup.rs` (new) - startup recovery logic
+- `src/api/cronjob.rs` - `create_cronjob` now actually stores `spec.schedule` (previously hardcoded to `""`, a stale placeholder from an earlier phase-numbering pass that never got filled in) and wakes the reconciliation loop via `Extension<Arc<Notify>>` after a successful insert
+- `src/app.rs` - `build_router()` takes the shared `Notify` via `Extension`, not `State`, so only `create_cronjob` needs to know about it
+- `src/main.rs` - runs startup recovery, then spawns the reconciliation loop as a background task before serving any requests
+- `src/db/schema.sql` - **no changes**: `retry_count`, `last_error`, `volume_id`, `worker_vm_id` (and everything else this phase touches) were already present from Phase 1's original schema, which front-loaded far more of the eventual column set than that phase's own scope suggested at the time
 
 **No external API calls yet.** Just:
 - Poll SQLite for jobs not in terminal state
-- Mock state transitions (e.g., `Pending` → `VolumeCreating` → `VolumeCreated` etc.)
+- Mock state transitions (`Created` → `VolumePending` → `VolumeCreating` → ... → `Archived`)
 - Log state changes
 
 **Testing:**
 ```bash
-# Create a job via Terraform
-terraform apply
-# Watch logs to see reconciliation loop detect it and advance state --
-# it should fire within milliseconds of the API call, not wait for the
-# 10s fallback tick
-journalctl -u kube-shim -f
-# Verify state progression in SQLite
-sqlite3 db.sqlite "SELECT name, status, retry_count FROM jobs"
+cargo test   # 95 tests total, incl. unit tests for next_state()/schedule
+             # due-ness/startup recovery, plus a timing-based test proving
+             # Notify wakes the loop faster than a (deliberately long)
+             # fallback interval
+
+# Real end-to-end, not just unit tests: create a CronJob with an
+# every-minute schedule against a live local server, then watch actual
+# job rows appear and advance over real wall-clock time:
+curl -k -X POST https://localhost:6443/apis/batch/v1/namespaces/default/cronjobs \
+  -H "Authorization: Bearer $TOKEN" -d '{..."schedule": "* * * * *"...}'
+sqlite3 db.sqlite "SELECT name, cronjob_name, status FROM jobs"
+# Confirmed: one job row per elapsed minute, each independently advancing
+# through the mocked pipeline (older ones reaching Archived, newer ones
+# still partway through) -- verified hands-on, not just asserted in a test
 ```
 
 ---
@@ -824,6 +837,7 @@ webpki-roots = "0.26"
 russh = "0.45"
 rustls-acme = "0.15"      # Phase 4 (shipped): ACME issuance/renewal against axum-server's rustls stack -- default-features disabled, "ring" re-enabled explicitly to match tls.rs's own provider choice
 tokio-stream = "0.1"      # Phase 4 (shipped): drives rustls-acme's event stream
+cron = "0.17"             # Phase 6 (shipped): parses CronJob schedules to trigger job runs
 quick-xml = "0.36"        # Phase 13: parsing the ECB's daily exchange-rate feed
 ```
 No dedicated cloud-provider crate: UpCloud has no official Rust SDK, so `src/providers/upcloud/` is a hand-rolled REST client on `reqwest` (Phase 7) rather than an `hcloud`-style dependency.
