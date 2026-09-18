@@ -241,7 +241,7 @@ systemctl --user restart kube-shim
 
 ---
 
-### Phase 4: Automatic TLS via ACME (Days 4-5)
+### Phase 4: Automatic TLS via ACME (Days 4-5) — ✅ Complete
 **Goal:** Replace Phase 1's self-signed bootstrap certificate with a real, automatically issued and renewed TLS certificate — Caddy-like: point a hostname at the shim and it manages its own valid certificate, no manual cert copying, no CDN required in front of it.
 
 **Deliverables:**
@@ -249,27 +249,33 @@ systemctl --user restart kube-shim
   - **Verified hands-on** (not assumed) by standing up `kube-shim.brawer.ch` for real on UpCloud, ahead of this phase's actual code: rootless podman *can* publish a host port `<1024` with no special capability, once the host's `net.ipv4.ip_unprivileged_port_start` sysctl is lowered (`bootstrap/provision.sh` needs a step for this: `net.ipv4.ip_unprivileged_port_start=443` via `/etc/sysctl.d/`) — that governs `rootlessport`, which does the actual low-port bind *in the host's own network namespace*. But that sysctl does **not** extend into the *container's* own network namespace: the shim process itself, running as non-root UID 1000 inside the container (Phase 3), still cannot bind `<1024` there, and fails at startup with a plain `Permission denied` if `config.toml`'s `server.port` is set to `443` directly. The fix isn't a capability grant (`--cap-add=CAP_NET_BIND_SERVICE`) — it's simpler: publish asymmetrically, host `443` → a container-internal unprivileged port (e.g. `PublishPort=443:8443` in the quadlet unit, `server.port = 8443` in `config.toml`). The binary never needs to bind a privileged port at all; only `rootlessport`, on the host side, does.
 - ACME client logic (issuance + automatic renewal) built on `rustls-acme` or equivalent, integrated with the existing `axum-server`/`rustls` TLS setup from Phase 1/3 rather than replacing it — `rustls-acme` in particular is designed to plug into exactly that stack (hands the TLS acceptor a certificate resolver that swaps in fresh certs on renewal, no listener restart needed).
 - `:80` serves *only* `/.well-known/acme-challenge/{token}` — the same "explicit allowlist, not just an auth gate" pattern later used for the public status page/health endpoints on `:443` (Phase 14): every other path 404s, by construction, not by convention.
-- Config: `hostname` (the real public DNS name to request a certificate for) and `acme_directory` (`staging` | `production`, or a literal ACME directory URL) — staging uses Let's Encrypt's staging environment (higher rate limits, a certificate chain that isn't publicly trusted) so development/testing never risks tripping the production environment's real rate limits. `config-dev.toml` defaults to `staging`; the real deployment's config uses `production`.
-- **Cold start vs. renewal failure handled differently, on purpose:** if the shim has no cached certificate yet (first boot, or a wiped `/data`) and ACME issuance fails, it retries a bounded number of times with backoff and then **fails to start** rather than serving broken or absent TLS — an operator needs to know immediately that DNS/networking/rate-limits are misconfigured, not discover it when a client's TLS handshake mysteriously fails. A **renewal** failure for a certificate that's still valid, by contrast, logs the failure and keeps retrying quietly in the background on its normal schedule, continuing to serve the still-valid certificate in the meantime — a transient Let's Encrypt outage or rate-limit bump shouldn't cause a self-inflicted outage of an otherwise-healthy service.
-- **Local dev/CI fallback:** when no `hostname` is configured (or it resolves to `localhost`/a private address), ACME is skipped entirely and the shim falls back to generating a self-signed certificate for that hostname — the same behavior Phase 1 already shipped, now demoted to "the fallback" rather than "the only option."
-- `deploy/kube-shim.container` updated: `PublishPort=443:8443` and `PublishPort=80:8080` (asymmetric host:container mappings — see the verified finding above; the binary itself keeps listening on unprivileged ports internally, `8443`/`8080`, matching `config.toml`'s `server.port`/ACME-challenge-port) replace the old `:6443` mapping.
-- `bootstrap/provision.sh` gains a step writing `net.ipv4.ip_unprivileged_port_start=443` to `/etc/sysctl.d/`, applied once during provisioning — required for `rootlessport` to publish `:443`/`:80` on the host side at all (see the verified finding above).
+- Config: `hostname: Option<String>` (the real public DNS name to request a certificate for) and `acme_directory: String` — `"staging"` or `"production"` select Let's Encrypt's own two environments (staging has much higher rate limits but issues a certificate chain that isn't publicly trusted); any other value is used verbatim as a custom ACME directory URL (e.g. a local Pebble test server), rather than a closed enum, since that's one less thing to extend later for a case this cheap to support generically. Plus `acme_contact_email: Option<String>` (optional, Let's Encrypt only uses it for expiry/problem notifications), `acme_challenge_port: u16` (default `8080`), and `acme_cache_dir: String` (default `"acme-cache"`, but any real deployment sets it to `/data/acme-cache` — see below). All four are `#[serde(default)]`, so the config schema change is purely additive: the already-deployed `kube-shim.brawer.ch` `config.toml`, which predates all of this, keeps parsing and keeps behaving exactly as before (self-signed fallback) with zero edits required. `config-dev.toml` is left with no `hostname` at all (self-signed, as always); the real deployment's `config.toml` gets `hostname`/`acme_directory` uncommented deliberately, later, once DNS is confirmed ready — not automatically by `provision.sh`, since a cold-start ACME failure refusing to start would otherwise trigger on a box whose DNS isn't live yet.
+- **Cold start vs. renewal failure handled differently, on purpose:** if the shim has no cached certificate yet (first boot, or a wiped `/data`) and ACME issuance fails, it retries (bounded by a 5-minute wall-clock `tokio::time::timeout`, not a fixed attempt count — `rustls-acme`'s own state machine paces retries with its own internal backoff, so the timeout is a ceiling on top of that rather than a reimplementation of it) and then **fails to start** rather than serving broken or absent TLS — an operator needs to know immediately that DNS/networking/rate-limits are misconfigured, not discover it when a client's TLS handshake mysteriously fails. A **renewal** failure for a certificate that's still valid, by contrast, is handed off to a background `tokio::spawn` task that only ever logs — the certificate already deployed keeps serving traffic regardless, since the acceptor's resolver only updates on a successful renewal event. A transient Let's Encrypt outage or rate-limit bump is a log line, not a self-inflicted outage.
+- **Local dev/CI fallback:** when `hostname` is unset, ACME is skipped entirely and the shim falls back to the self-signed certificate at `tls_cert_path`/`tls_key_path` — exactly Phase 1's original (and until now, only) behavior, unchanged in `tls.rs`, now just demoted to "the fallback" rather than "the only option," selected by a `match &cfg.server.hostname` in `main.rs`.
+- `deploy/kube-shim.container` updated: `PublishPort=443:8443` and `PublishPort=80:8080` (asymmetric host:container mappings — see the verified finding above; the binary itself keeps listening on unprivileged ports internally, `8443`/`8080`, matching `config.toml`'s `server.port`/`acme_challenge_port`) replace the old `:6443`/`:8080` mappings.
+- `bootstrap/provision.sh` gains a step writing `net.ipv4.ip_unprivileged_port_start=443` to `/etc/sysctl.d/`, applied once during provisioning — required for `rootlessport` to publish `:443`/`:80` on the host side at all (see the verified finding above). Also picked up two more real, hands-on-verified fixes along the way, both worth generalizing beyond just this phase: installing `systemd-container` (`machinectl shell`, used by the script's own "Next steps," isn't installed by default on stock Ubuntu 24.04), and a `podman unshare chown 1000:1000` step on the data directory after every file in it exists — the container's non-root UID 1000 (Phase 3) does not map back to the host `kube-shim` user's own UID under rootless podman's user namespace, so a plain `chown kube-shim:kube-shim` alone leaves the bind mount unwritable from inside the container (fails at startup with "unable to open database file").
+- **Revised from the original plan wording**: self-signed certificate generation stays in `provision.sh` unconditionally (not dropped from the "real deployment" path as originally sketched) — it's a harmless, always-available safety net regardless of whether ACME ends up configured, and removing it would have added script complexity for no real benefit. `hostname` is simply left commented out in the generated `config.toml`, with the reasoning (and how to enable it) written directly into that file's own comments.
 
-**Files to create/modify:**
-- `src/tls.rs` - extend `load_tls_config()` with ACME issuance/renewal via `rustls-acme` (or equivalent), keeping the existing self-signed path as the no-hostname-configured fallback
-- `src/acme_challenge.rs` (new) - the minimal challenge-only router (internal unprivileged port, published externally as `:80`)
-- `src/main.rs` - start the API listener (internal unprivileged port, published externally as `:443`) and the new ACME-challenge listener
-- `src/config.rs` - add `hostname: Option<String>`, `acme_directory: AcmeDirectory` (staging/production/custom URL)
+**Files created/modified:**
+- `src/acme.rs` (new) - ACME issuance/renewal on top of `rustls-acme`: `setup()` blocks (bounded by the cold-start timeout) until a certificate is deployed, then hands ongoing renewal to a background task
+- `src/main.rs` - branches on `cfg.server.hostname`: `Some` drives `acme::setup()` and runs both the `:443`-published API listener (via the ACME acceptor) and the `:80`-published challenge listener concurrently (`tokio::try_join!`); `None` keeps the original single self-signed listener from Phase 1/3, unchanged
+- `src/config.rs` - `ServerConfig` gains `hostname`, `acme_directory`, `acme_contact_email`, `acme_challenge_port`, `acme_cache_dir`, all `#[serde(default)]`
+- `src/app.rs` - `server_header_layer()` factored out (shared by the authenticated API router and the new ACME challenge router) — see the `Server:` header addendum below
+- `Cargo.toml` - `rustls-acme` (default features disabled, `ring` re-enabled explicitly in their place, matching `tls.rs`'s own crypto-provider choice for musl-friendliness), `tokio-stream`, `tower-http`'s `set-header` feature
 - `deploy/kube-shim.container` - port publishing updated to the asymmetric `443:8443`/`80:8080` mappings
-- `bootstrap/provision.sh` - add the `ip_unprivileged_port_start` sysctl step
-- `bootstrap/provision.sh` - drop self-signed cert generation from the real-deployment path (still used as the code-level fallback, just no longer provisioned up front); document that DNS must point at the VPS before first start
+- `bootstrap/provision.sh` - the `ip_unprivileged_port_start` sysctl step, the `systemd-container` package, the `podman unshare chown` fix, and the new (commented-out-by-default) `config.toml` fields
+
+**Addendum: `Server:` version header.** Not part of the original Phase 4 scope, but small enough to fold into the same change: every response, from every router (the authenticated API and the ACME challenge router alike), now carries `Server: kube-shim/x.y.z`, stamped from `Cargo.toml`'s own package version at compile time (`env!("CARGO_PKG_VERSION")`) via a shared `tower_http::set_header::SetResponseHeaderLayer` applied as the outermost layer — including on a `401`, since knowing which release actually answered a request is exactly what you want while debugging a stale deployment, auth failures very much included. Verifiable with nothing more than `curl -I https://kube-shim.brawer.ch/`.
 
 **Testing:**
 ```bash
 # Local dev, no hostname configured: falls back to self-signed, exactly
-# as Phase 1 already behaved
+# as Phase 1 already behaved (config-dev.toml's own configured port,
+# unchanged -- ACME doesn't force local dev onto :443)
 cargo run -- -c config-dev.toml
-curl -k https://localhost:443/api/v1
+curl -k https://localhost:6443/api/v1
+curl -sk -D - https://localhost:6443/api/v1 -o /dev/null | grep -i ^server:
+#   -> server: kube-shim/x.y.z
 
 # Real hostname, staging directory (safe to repeat without hitting
 # production rate limits):
@@ -279,8 +285,8 @@ curl --cacert <(curl -s https://letsencrypt.org/certs/staging/letsencrypt-stg-ro
   https://kube-shim.brawer.ch/api/v1
 
 # Cold-start failure: point hostname at a non-existent/unreachable DNS
-# name and confirm the shim logs the failure and exits non-zero, rather
-# than starting with no/broken TLS
+# name and confirm the shim logs the failure and exits non-zero within
+# ~5 minutes, rather than starting with no/broken TLS
 
 # Renewal-failure resilience: force a renewal attempt to fail (e.g. block
 # outbound to the ACME directory briefly) while an existing valid cert is
@@ -764,8 +770,8 @@ curl -k https://localhost:443/debug/status | jq '.total_cost, .budget_balance'
 | `.github/workflows/release.yml` | CI: build musl binary, publish OCI image to ghcr.io | Create (Phase 3) |
 | `Containerfile` | Multi-stage build → `FROM scratch` image | Create (Phase 3) |
 | `deploy/kube-shim.container` | Podman quadlet unit (image ref, bind mounts, ports) | Phases 3, 4, 14 |
-| `src/tls.rs` | TLS config: self-signed bootstrap (Phase 1), ACME issuance/renewal (Phase 4) | Phases 1, 4 |
-| `src/acme_challenge.rs` | `:80` HTTP-01 challenge-only responder | Create (Phase 4) |
+| `src/tls.rs` | TLS config: self-signed bootstrap/fallback (Phase 1, unchanged since) | Phase 1 |
+| `src/acme.rs` | ACME (Let's Encrypt) issuance/renewal + `:80` HTTP-01 challenge router | Create (Phase 4) |
 | `src/api/*.rs` | Kubernetes API handlers | Phases 1, 5, 12 |
 | `src/volumes.rs` | `storageClassName` → provider storage-tier lookup | Create (Phase 5) |
 | `src/workload.rs` | `WorkloadKind` abstraction (CronJob now, Deployment later) | Create (Phase 5) |
@@ -808,7 +814,8 @@ config = "0.14"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 webpki-roots = "0.26"
 russh = "0.45"
-rustls-acme = "0.13"      # Phase 4: ACME issuance/renewal against axum-server's rustls stack
+rustls-acme = "0.15"      # Phase 4 (shipped): ACME issuance/renewal against axum-server's rustls stack -- default-features disabled, "ring" re-enabled explicitly to match tls.rs's own provider choice
+tokio-stream = "0.1"      # Phase 4 (shipped): drives rustls-acme's event stream
 quick-xml = "0.36"        # Phase 13: parsing the ECB's daily exchange-rate feed
 ```
 No dedicated cloud-provider crate: UpCloud has no official Rust SDK, so `src/providers/upcloud/` is a hand-rolled REST client on `reqwest` (Phase 7) rather than an `hcloud`-style dependency.

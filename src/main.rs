@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use kube_shim::{app, config, db, tls};
+use kube_shim::{acme, app, config, db, tls};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -33,21 +33,63 @@ async fn main() -> Result<()> {
     // Build router
     let router = app::build_router(pool, Arc::new(cfg.server.api_tokens.clone()));
 
-    // Load TLS configuration
-    let tls_config = tls::load_tls_config(&cfg.server.tls_cert_path, &cfg.server.tls_key_path)
-        .await
-        .context("Failed to load TLS configuration")?;
-
     let addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port)
         .parse()
         .context("Invalid server host/port")?;
 
-    tracing::info!("Server listening on https://{}", addr);
+    match &cfg.server.hostname {
+        Some(hostname) => {
+            // Real, CA-trusted certificate via ACME (Let's Encrypt),
+            // Caddy-like -- see docs/IMPLEMENTATION_PLAN.md Phase 4. Blocks
+            // here until a certificate is actually available (fresh or
+            // cached); a cold-start failure returns an error and this
+            // process exits non-zero rather than serving broken TLS.
+            tracing::info!("ACME enabled for hostname {hostname}; obtaining certificate...");
+            let acme::Acme {
+                acceptor,
+                challenge_router,
+            } = acme::setup(&cfg.server).await?;
 
-    axum_server::bind_rustls(addr, tls_config)
-        .serve(router.into_make_service())
-        .await
-        .context("Server error")?;
+            let challenge_addr: SocketAddr =
+                format!("{}:{}", cfg.server.host, cfg.server.acme_challenge_port)
+                    .parse()
+                    .context("Invalid server host/acme_challenge_port")?;
+
+            tracing::info!(
+                "ACME HTTP-01 challenge responder listening on http://{}",
+                challenge_addr
+            );
+            let challenge_server =
+                axum_server::bind(challenge_addr).serve(challenge_router.into_make_service());
+
+            tracing::info!(
+                "Server listening on https://{} (ACME cert for {hostname})",
+                addr
+            );
+            let api_server = axum_server::bind(addr)
+                .acceptor(acceptor)
+                .serve(router.into_make_service());
+
+            tokio::try_join!(api_server, challenge_server).context("Server error")?;
+        }
+        None => {
+            // No public hostname configured -- local dev/CI fallback:
+            // the same self-signed certificate Phase 1 always used.
+            tracing::info!(
+                "No server.hostname configured; using self-signed certificate (local dev/CI)"
+            );
+            let tls_config =
+                tls::load_tls_config(&cfg.server.tls_cert_path, &cfg.server.tls_key_path)
+                    .await
+                    .context("Failed to load TLS configuration")?;
+
+            tracing::info!("Server listening on https://{}", addr);
+            axum_server::bind_rustls(addr, tls_config)
+                .serve(router.into_make_service())
+                .await
+                .context("Server error")?;
+        }
+    }
 
     Ok(())
 }

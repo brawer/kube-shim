@@ -15,6 +15,9 @@ pub struct Config {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Self-signed certificate used only as a fallback when `hostname`
+    /// below is unset -- e.g. local dev/CI, where there's no public DNS
+    /// for ACME to issue a real certificate against.
     pub tls_cert_path: String,
     pub tls_key_path: String,
     /// Bearer tokens accepted on the authenticated API. A *list*, not a
@@ -23,6 +26,46 @@ pub struct ServerConfig {
     /// of one atomic cutover -- mirrors Kubernetes' own built-in
     /// static-token-file authenticator.
     pub api_tokens: Vec<ApiToken>,
+    /// Real public hostname to request an ACME (Let's Encrypt) certificate
+    /// for, Caddy-like. When unset, ACME is skipped entirely and the shim
+    /// falls back to the self-signed certificate above -- this is what
+    /// keeps local dev/CI working with no public DNS at all. All fields
+    /// below this one are only consulted when `hostname` is set.
+    #[serde(default)]
+    pub hostname: Option<String>,
+    /// "staging" or "production" select Let's Encrypt's own two
+    /// environments (staging has much higher rate limits but issues a
+    /// certificate chain that isn't publicly trusted -- safe to hammer
+    /// while testing); any other value is used verbatim as a custom ACME
+    /// directory URL (e.g. a local Pebble test server).
+    #[serde(default = "default_acme_directory")]
+    pub acme_directory: String,
+    /// Optional contact email for the ACME account. Let's Encrypt only
+    /// ever uses it for expiry/problem notifications; never required.
+    #[serde(default)]
+    pub acme_contact_email: Option<String>,
+    /// Port for the minimal HTTP-01 challenge responder -- a separate
+    /// listener/router from the authenticated API, not a path carved out
+    /// of it (see docs/IMPLEMENTATION_PLAN.md Phase 4).
+    #[serde(default = "default_acme_challenge_port")]
+    pub acme_challenge_port: u16,
+    /// Where the ACME account key and issued certificates are cached
+    /// across restarts. Without this, every restart would re-issue a
+    /// certificate from scratch and risk Let's Encrypt's rate limits.
+    #[serde(default = "default_acme_cache_dir")]
+    pub acme_cache_dir: String,
+}
+
+fn default_acme_directory() -> String {
+    "staging".to_string()
+}
+
+fn default_acme_challenge_port() -> u16 {
+    8080
+}
+
+fn default_acme_cache_dir() -> String {
+    "acme-cache".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,6 +258,61 @@ interval_secs = 10
             },
         ];
         assert!(config.ensure_has_valid_api_token(now).is_ok());
+    }
+
+    #[test]
+    fn test_acme_fields_default_when_absent() {
+        // The already-deployed kube-shim.brawer.ch config.toml predates
+        // these fields entirely -- this must keep parsing, and must default
+        // to "ACME disabled, self-signed fallback" (hostname: None), not
+        // fail closed or silently enable ACME with no hostname to target.
+        let config: Config = toml::from_str(&base_toml()).expect("Failed to parse config");
+        assert!(config.server.hostname.is_none());
+        assert_eq!(config.server.acme_directory, "staging");
+        assert!(config.server.acme_contact_email.is_none());
+        assert_eq!(config.server.acme_challenge_port, 8080);
+        assert_eq!(config.server.acme_cache_dir, "acme-cache");
+    }
+
+    #[test]
+    fn test_acme_fields_explicit() {
+        let toml_str = r#"
+[server]
+host = "0.0.0.0"
+port = 8443
+tls_cert_path = "/path/to/cert.pem"
+tls_key_path = "/path/to/key.pem"
+hostname = "kube-shim.brawer.ch"
+acme_directory = "production"
+acme_contact_email = "sascha@example.com"
+acme_challenge_port = 8080
+acme_cache_dir = "/data/acme-cache"
+
+[[server.api_tokens]]
+token = "test-token"
+
+[database]
+path = "db.sqlite"
+
+[hetzner]
+token = "test-token"
+dry_run = true
+
+[reconciliation]
+interval_secs = 10
+"#;
+        let config: Config = toml::from_str(toml_str).expect("Failed to parse config");
+        assert_eq!(
+            config.server.hostname.as_deref(),
+            Some("kube-shim.brawer.ch")
+        );
+        assert_eq!(config.server.acme_directory, "production");
+        assert_eq!(
+            config.server.acme_contact_email.as_deref(),
+            Some("sascha@example.com")
+        );
+        assert_eq!(config.server.acme_challenge_port, 8080);
+        assert_eq!(config.server.acme_cache_dir, "/data/acme-cache");
     }
 
     #[test]

@@ -24,11 +24,27 @@ echo "=== Kube-Shim VPS Provisioning ==="
 SERVICE_USER="kube-shim"
 
 # Update system, install podman + the few tools we still need directly
-# (openssl for cert/token generation; curl for troubleshooting).
+# (openssl for cert/token generation; curl for troubleshooting;
+# systemd-container for `machinectl shell`, used below and in the "Next
+# steps" instructions to properly enter the service user's systemd --user
+# session -- verified hands-on that it is NOT installed by default on a
+# stock Ubuntu 24.04 image, even though it ships `systemctl --user` itself).
 echo "Updating system packages..."
 apt-get update
 apt-get upgrade -y
-apt-get install -y curl openssl podman
+apt-get install -y curl openssl podman systemd-container
+
+# Rootless podman's rootlessport *can* publish a host port <1024 (needed
+# for :443/:80, Phase 4's ACME listener) with no special capability, but
+# only once this sysctl is lowered -- verified hands-on against a fresh
+# VPS; without it, podman fails with "cannot expose privileged port 443
+# ... bind: permission denied". This governs the HOST-side bind only; the
+# container's own process still can't bind <1024 inside its own network
+# namespace, which is why deploy/kube-shim.container maps host 443/80 to
+# unprivileged container-internal ports rather than the same port number.
+echo "Allowing rootless podman to publish privileged ports (443/80)..."
+echo 'net.ipv4.ip_unprivileged_port_start=443' > /etc/sysctl.d/99-podman-unprivileged-ports.conf
+sysctl --system >/dev/null
 
 # Create a dedicated, unprivileged user to run the container as. Rootless
 # podman's isolation only means something if the podman process itself
@@ -89,9 +105,26 @@ if [ ! -f "$DATA_DIR/config.toml" ]; then
     cat > "$DATA_DIR/config.toml" << EOF
 [server]
 host = "0.0.0.0"
-port = 6443
+# Unprivileged port: deploy/kube-shim.container maps the real, public
+# 443 to this one -- see that file's own comments (Phase 4).
+port = 8443
 tls_cert_path = "/data/cert.pem"
 tls_key_path = "/data/key.pem"
+
+# hostname is left unset here on purpose: ACME (Phase 4) engages the
+# moment it's set, and a cold-start certificate failure makes the shim
+# refuse to start -- which would happen immediately if DNS for this
+# host isn't already pointing here yet. Once it is (see docs/RELEASING.md
+# / your DNS provider), uncomment and set it, e.g.:
+#   hostname = "kube-shim.brawer.ch"
+#   acme_directory = "staging"  # flip to "production" once verified
+#   acme_contact_email = "you@example.com"
+#
+# Set regardless of whether ACME is enabled yet, so the ACME account
+# key/certs land on the persistent bind mount (not the container's own
+# ephemeral filesystem, which is what the default relative path would
+# resolve to) as soon as hostname above is uncommented.
+acme_cache_dir = "/data/acme-cache"
 
 [[server.api_tokens]]
 token = "${API_TOKEN}"
@@ -120,12 +153,31 @@ fi
 
 chown -R "${SERVICE_USER}:${SERVICE_USER}" "$USER_HOME/kube-shim-data" "$USER_HOME/.config"
 
+# The container runs as non-root UID 1000 (Phase 3), which under rootless
+# podman's user namespace does NOT map back to $SERVICE_USER's own host
+# UID -- it maps to a *different* host UID somewhere in the subuid range
+# allocated above. A bind-mounted directory merely chown'd to
+# $SERVICE_USER (as just done) is therefore NOT writable by the container
+# process; verified hands-on, it fails at startup with "unable to open
+# database file". `podman unshare` runs inside the same user namespace
+# podman itself will use, so `chown 1000:1000` there resolves to the
+# correct (mapped) host UID automatically, without needing to compute the
+# subuid arithmetic by hand. Must run after every file above already
+# exists (it does, at this point in the script).
+echo "Fixing data directory ownership for the container's own UID 1000..."
+SERVICE_UID=$(id -u "$SERVICE_USER")
+sudo -u "$SERVICE_USER" -H env XDG_RUNTIME_DIR="/run/user/${SERVICE_UID}" \
+    podman unshare chown -R 1000:1000 "$DATA_DIR"
+
 echo ""
 echo "=== Provisioning Complete ==="
 echo ""
 echo "Next steps:"
 echo "1. Edit $DATA_DIR/config.toml and set hetzner.token to your real"
-echo "   Hetzner Cloud API token (currently REPLACE_ME)."
+echo "   Hetzner Cloud API token (currently REPLACE_ME). If DNS for this"
+echo "   host is already set up, also uncomment and set hostname (and"
+echo "   review acme_directory/acme_contact_email) to enable ACME -- see"
+echo "   the comments already in that file."
 echo "2. Copy deploy/kube-shim.container to $QUADLET_DIR/kube-shim.container."
 echo "   As checked in, it tracks :latest and auto-updates on every release --"
 echo "   see the comments in that file for how to pin an explicit version"

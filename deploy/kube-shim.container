@@ -17,8 +17,18 @@ Image=ghcr.io/brawer/kube-shim:latest
 # below, and update by hand: `podman pull` + `systemctl --user restart`.
 AutoUpdate=registry
 Volume=%h/kube-shim-data:/data:Z
-PublishPort=6443:6443
-PublishPort=8080:8080
+# Asymmetric host:container port mappings, not host:same-port -- verified
+# hands-on against the real kube-shim.brawer.ch deployment (Phase 4):
+# rootless podman's rootlessport *can* publish a host port <1024 once
+# net.ipv4.ip_unprivileged_port_start is lowered on the host (see
+# bootstrap/provision.sh), but that sysctl doesn't reach into the
+# container's own network namespace -- the shim process itself, running
+# as non-root UID 1000, still can't bind <1024 there directly. So the
+# container keeps listening on unprivileged ports internally (matching
+# config.toml's server.port / server.acme_challenge_port), and only the
+# host-side publish uses the real, public 443/80.
+PublishPort=443:8443
+PublishPort=80:8080
 
 [Service]
 Restart=on-failure

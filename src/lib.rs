@@ -1,4 +1,5 @@
 // Library exports for testing and reuse
+pub mod acme;
 pub mod api;
 pub mod app;
 pub mod auth;
