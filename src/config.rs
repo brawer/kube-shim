@@ -18,6 +18,15 @@ pub struct Config {
     #[serde(alias = "hetzner")]
     pub upcloud: UpCloudConfig,
     pub reconciliation: ReconciliationConfig,
+    /// Shim-wide settings that aren't specific to the HTTP server, the
+    /// database, or any one cloud provider. Optional in TOML (defaults to
+    /// `ShimConfig::default()` if the whole `[shim]` table is absent) --
+    /// see Phase 5, which only reserves this shape; nothing reads
+    /// `budget_daily_rate`/`budget_rollover_cap_days`/`main_currency` yet
+    /// (Phase 13), and `resource_prefix` isn't threaded through naming
+    /// until Phase 15.
+    #[serde(default)]
+    pub shim: ShimConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +116,51 @@ pub struct UpCloudConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReconciliationConfig {
     pub interval_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShimConfig {
+    /// Prefix on every cloud resource this shim instance creates (volumes,
+    /// VMs, ...), so more than one independent kube-shim instance can run
+    /// against the same cloud account without naming collisions or
+    /// cross-instance orphan-scan interference (Phase 15).
+    #[serde(default = "default_resource_prefix")]
+    pub resource_prefix: String,
+    /// The currency cost figures are reported in -- the operator's own
+    /// choice (e.g. "CHF"), converted from the cloud provider's real
+    /// EUR-denominated spend via the ECB's daily reference rate (Phase 13).
+    #[serde(default = "default_main_currency")]
+    pub main_currency: String,
+    /// Rolling budget accrual rate, in `main_currency` per day (Phase 13).
+    #[serde(default)]
+    pub budget_daily_rate: f64,
+    /// Caps how many days of unspent `budget_daily_rate` can accrue before
+    /// it stops growing further (Phase 13).
+    #[serde(default = "default_budget_rollover_cap_days")]
+    pub budget_rollover_cap_days: u32,
+}
+
+impl Default for ShimConfig {
+    fn default() -> Self {
+        Self {
+            resource_prefix: default_resource_prefix(),
+            main_currency: default_main_currency(),
+            budget_daily_rate: 0.0,
+            budget_rollover_cap_days: default_budget_rollover_cap_days(),
+        }
+    }
+}
+
+fn default_resource_prefix() -> String {
+    "kube-shim".to_string()
+}
+
+fn default_main_currency() -> String {
+    "EUR".to_string()
+}
+
+fn default_budget_rollover_cap_days() -> u32 {
+    7
 }
 
 impl Config {
@@ -294,6 +348,30 @@ interval_secs = 10
         assert!(config.server.acme_contact_email.is_none());
         assert_eq!(config.server.acme_challenge_port, 8080);
         assert_eq!(config.server.acme_cache_dir, "acme-cache");
+    }
+
+    #[test]
+    fn test_shim_config_defaults_when_absent() {
+        // Same backward-compatibility requirement as the ACME fields: the
+        // already-deployed config.toml has no [shim] section at all.
+        let config: Config = toml::from_str(&base_toml()).expect("Failed to parse config");
+        assert_eq!(config.shim.resource_prefix, "kube-shim");
+        assert_eq!(config.shim.main_currency, "EUR");
+        assert_eq!(config.shim.budget_daily_rate, 0.0);
+        assert_eq!(config.shim.budget_rollover_cap_days, 7);
+    }
+
+    #[test]
+    fn test_shim_config_explicit() {
+        let toml_str = format!(
+            "{}\n[shim]\nresource_prefix = \"kube-shim-work\"\nmain_currency = \"CHF\"\nbudget_daily_rate = 2.5\nbudget_rollover_cap_days = 14\n",
+            base_toml()
+        );
+        let config: Config = toml::from_str(&toml_str).expect("Failed to parse config");
+        assert_eq!(config.shim.resource_prefix, "kube-shim-work");
+        assert_eq!(config.shim.main_currency, "CHF");
+        assert_eq!(config.shim.budget_daily_rate, 2.5);
+        assert_eq!(config.shim.budget_rollover_cap_days, 14);
     }
 
     #[test]

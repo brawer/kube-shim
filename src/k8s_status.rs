@@ -19,7 +19,24 @@ struct Status {
     status: &'static str,
     message: String,
     reason: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<StatusDetails>,
     code: u16,
+}
+
+/// Real Kubernetes `Status.details` for a field-validation failure --
+/// `causes` is what lets a programmatic consumer point at exactly which
+/// field was wrong, rather than only having the human-readable `message`.
+#[derive(Debug, Serialize)]
+struct StatusDetails {
+    causes: Vec<StatusCause>,
+}
+
+#[derive(Debug, Serialize)]
+struct StatusCause {
+    reason: &'static str,
+    message: String,
+    field: String,
 }
 
 /// Builds a `kind: Status` error response with the given HTTP status code
@@ -30,6 +47,15 @@ pub fn status_error(
     reason: &'static str,
     message: impl Into<String>,
 ) -> axum::response::Response {
+    status_error_with_details(code, reason, message, None)
+}
+
+fn status_error_with_details(
+    code: StatusCode,
+    reason: &'static str,
+    message: impl Into<String>,
+    details: Option<StatusDetails>,
+) -> axum::response::Response {
     let body = Status {
         kind: "Status",
         api_version: "v1",
@@ -37,6 +63,7 @@ pub fn status_error(
         status: "Failure",
         message: message.into(),
         reason,
+        details,
         code: code.as_u16(),
     };
     (code, Json(body)).into_response()
@@ -47,6 +74,32 @@ pub fn status_error(
 /// credentials were valid but the request is denied anyway.
 pub fn unauthorized(message: impl Into<String>) -> axum::response::Response {
     status_error(StatusCode::UNAUTHORIZED, "Unauthorized", message)
+}
+
+/// 422 Unprocessable Entity, `reason: Invalid`: a field's value isn't one
+/// of the values this API supports for it -- the same shape a real cluster
+/// uses for an unsupported enum-style field value (e.g. an unknown
+/// `storageClassName`), distinct from `Forbidden` (403), which is a
+/// cluster *policy* denying an otherwise well-formed request.
+pub fn invalid_field_value(
+    object_description: impl Into<String>,
+    field: &str,
+    value: &str,
+) -> axum::response::Response {
+    let object_description = object_description.into();
+    let cause_message = format!("Unsupported value: \"{value}\"");
+    status_error_with_details(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "Invalid",
+        format!("{object_description} is invalid: {field}: {cause_message}"),
+        Some(StatusDetails {
+            causes: vec![StatusCause {
+                reason: "FieldValueNotSupported",
+                message: cause_message,
+                field: field.to_string(),
+            }],
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -80,5 +133,31 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["reason"], "Forbidden");
         assert_eq!(json["code"], 403);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_field_value_shape() {
+        let response = invalid_field_value(
+            "CronJob \"osmdiffs-weekly\"",
+            "spec.storageClassName",
+            "bogus",
+        );
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["kind"], "Status");
+        assert_eq!(json["reason"], "Invalid");
+        assert_eq!(json["code"], 422);
+        assert!(json["message"]
+            .as_str()
+            .unwrap()
+            .contains("spec.storageClassName"));
+
+        let cause = &json["details"]["causes"][0];
+        assert_eq!(cause["reason"], "FieldValueNotSupported");
+        assert_eq!(cause["field"], "spec.storageClassName");
+        assert!(cause["message"].as_str().unwrap().contains("bogus"));
     }
 }

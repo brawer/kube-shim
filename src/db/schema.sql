@@ -45,6 +45,21 @@ CREATE TABLE IF NOT EXISTS jobs (
     version INTEGER NOT NULL DEFAULT 1
 );
 
+-- Generic ephemeral volumes (Phase 5): one row per job *run*, not a
+-- durable row reused across runs -- nothing here is ever retained, so
+-- there's no Pending/Bound/Released lifecycle to track. Not yet written
+-- to by anything: reserved schema, populated once the reconciliation
+-- loop (Phase 6+) actually creates job runs to attach volumes to.
+CREATE TABLE IF NOT EXISTS job_volumes (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    size_gb INTEGER NOT NULL,
+    storage_class_name TEXT NOT NULL,
+    provider_volume_id TEXT,
+    mount_point TEXT,
+    created_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id TEXT PRIMARY KEY,
     job_id TEXT,
@@ -71,3 +86,4 @@ CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_cronjob ON jobs(cronjob_name);
 CREATE INDEX IF NOT EXISTS idx_events_job ON events(job_id);
 CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
+CREATE INDEX IF NOT EXISTS idx_job_volumes_job ON job_volumes(job_id);
