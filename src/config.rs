@@ -111,6 +111,17 @@ pub struct DatabaseConfig {
 pub struct UpCloudConfig {
     pub token: String,
     pub dry_run: bool,
+    /// UpCloud zone to provision volumes/servers in, e.g. `"de-fra1"`
+    /// (the zone kube-shim.brawer.ch itself actually runs in). Real
+    /// multi-zone/`nodeSelector` support is deferred -- see
+    /// docs/IMPLEMENTATION_PLAN.md "Future Work: Zone / Region Placement"
+    /// -- so this is a single, shim-wide default for now, not per-job.
+    #[serde(default = "default_upcloud_zone")]
+    pub zone: String,
+}
+
+fn default_upcloud_zone() -> String {
+    "de-fra1".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

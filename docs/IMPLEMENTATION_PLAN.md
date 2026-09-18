@@ -396,38 +396,60 @@ sqlite3 db.sqlite "SELECT name, cronjob_name, status FROM jobs"
 
 ---
 
-### Phase 7: Cloud Provider Integration (Dry-Run Mode) (Days 7-8)
+### Phase 7: Cloud Provider Integration (Dry-Run Mode) (Days 7-8) — ✅ Complete
 **Goal:** Call the real UpCloud API but don't actually create resources yet — and define the provider interface so UpCloud isn't hardcoded throughout the codebase.
 
 **Deliverables:**
-- A `CloudProvider` trait (`create_volume`, `delete_volume`, `attach_volume`, `create_server`, `delete_server`, `create_firewall_rules`, `get_pricing`, ...) defined *before* writing any UpCloud-specific code. `create_firewall_rules` is what Phase 9 uses to lock worker VMs down to no inbound traffic except from the shim itself. `UpCloudProvider` is the only implementation for now. This is what lets Hetzner and Infomaniak (OpenStack) be added later as additional implementations instead of a rewrite (see "Future Work") — but it's a lightweight seam, not a finished multi-cloud abstraction; expect its exact method signatures to need adjustment once a second provider is actually implemented against it.
-- UpCloud client: no official Rust SDK exists, so this is a hand-rolled REST client on `reqwest` (already a dependency) rather than a provider-specific crate like the originally-planned `hcloud`. UpCloud's API (`https://api.upcloud.com/1.3/...`) uses `Authorization: Bearer <token>` the same shape as this project's own bearer-token auth (Phase 2), which simplifies the config story: `[upcloud] token = "..."` alongside the same kind of secret already handled elsewhere.
+- A `CloudProvider` trait (`create_volume`, `delete_volume`, `attach_volume`, `detach_volume`, `create_server`, `get_server`, `delete_server`, `create_firewall_rules`, `list_firewall_rules`, `get_pricing`) defined *before* writing any UpCloud-specific code. Two additions beyond the plan's original list, both directly implied by the async-quirks bullet below rather than guessed: `get_server` (for Phase 9's create-then-poll loop) and `list_firewall_rules` (for Phase 9's apply-then-verify step) — a trait that only exposed `create_*` with no way to check on an async operation's real state wouldn't actually let the reconciliation loop model those quirks. `create_firewall_rules` is what Phase 9 uses to lock worker VMs down to no inbound traffic except from the shim itself. `UpCloudProvider` is the only implementation for now. This is what lets Hetzner and Infomaniak (OpenStack) be added later as additional implementations instead of a rewrite (see "Future Work") — but it's a lightweight seam, not a finished multi-cloud abstraction; expect its exact method signatures to need adjustment once a second provider is actually implemented against it.
+- UpCloud client: no official Rust SDK exists, so this is a hand-rolled REST client on `reqwest` (already a dependency) rather than a provider-specific crate like the originally-planned `hcloud`. UpCloud's API (`https://api.upcloud.com/1.3/...`) uses `Authorization: Bearer <token>` the same shape as this project's own bearer-token auth (Phase 2), which simplifies the config story: `[upcloud] token = "..."` alongside the same kind of secret already handled elsewhere. Every endpoint shape used (`POST`/`DELETE /1.3/storage`, `POST /1.3/server/{uuid}/storage/attach`\`/detach`, `POST /1.3/server`, `DELETE /1.3/server/{uuid}`, `POST`/`GET /1.3/server/{uuid}/firewall_rule`, `GET /1.3/price`) was verified against UpCloud's own API reference directly (fetched and grepped for the real `METHOD /1.3/...` lines, not summarized/guessed) before being implemented — matching how every other UpCloud detail in this plan was already established.
 - **UpCloud's API has real asynchrony/timing quirks the reconciliation loop needs to model explicitly, discovered from its own API reference rather than assumed:**
   - `POST /1.3/server` (create) is **asynchronous** — the response returns before the server is actually ready, so a `VMCreating` → `VMRunning` transition needs an explicit poll/wait step, not a synchronous "create returns a ready server" assumption.
   - `POST /1.3/storage` (create volume) is synchronous; attach/detach go through their own dedicated endpoints and are also synchronous, and can run against a live (already-running) server.
   - Firewall rules (`POST`/`PUT /1.3/server/{uuid}/firewall_rule`) are **asynchronous in effect**: the API call returns immediately, but the rule takes roughly 1-2 minutes to actually apply. This matters for a security-relevant guarantee ("worker VM is unreachable inbound") — the reconciliation loop must not consider a worker VM's network isolation established the instant the firewall API call returns; it needs its own explicit wait/verify step before the VM is treated as safe to leave running unattended (see Phase 9).
   - `GET /1.3/price` returns prices in the account's own billing currency — for this project's UpCloud account, that's EUR (UpCloud doesn't offer CHF billing), which is exactly why Phase 13's `main_currency` conversion exists.
-- `DRY_RUN=true` config flag
-- Reconciliation step: `VolumePending` → attempt volume creation (logged, not executed)
-- Reconciliation step: `VMPending` → attempt VM creation (logged, not executed)
-- Error handling for UpCloud API authentication failures
+- `dry_run` config flag (already existed on `UpCloudConfig` since Phase 1's original scaffold — this phase is the first to actually read it). New `[upcloud] zone` field alongside it (default `"de-fra1"`, the zone `kube-shim.brawer.ch` itself runs in) — real multi-zone/`nodeSelector` support stays deferred (see "Future Work"), so this is one shim-wide default, not per-job, for now.
+- Reconciliation step: `VolumePending` → attempt volume creation (logged, not executed) — implemented in `src/reconcile/job.rs`, extracting the requested size/tier from the job's own stored pod-template spec (via `src/volumes.rs`'s `parse_storage_quantity_gb`/`StorageTier`, both built in Phase 5 and getting their first real caller here).
+- Reconciliation step: `VMPending` → attempt VM creation (logged, not executed) — same pattern, extracting `resources.requests.cpu`/`.memory` and resolving them via `src/workload.rs`'s `smallest_fitting_server_plan` (Phase 5) plus a new `parse_cpu_cores` helper (CPU quantities use their own `"2"`/`"500m"` format, distinct from the `Ki`/`Mi`/`Gi` format memory shares with storage).
+  - **On `dry_run`'s actual effect right now**: both log lines above fire regardless of `dry_run`'s value, since Phase 7's own explicit scope is "don't actually create resources yet" — there's no real call for `dry_run=false` to fall back to until Phase 8 exists. The flag is genuinely threaded through and read (`main.rs` → `reconcile::run` → `job::advance_all`), so Phase 8 only has to add the real branch, not build the plumbing to reach it.
+- Error handling for UpCloud API authentication failures: `ProviderError::AuthenticationFailed`, returned distinctly from a generic `ProviderError::Api` for any `401`/`403` response. Consumed by a best-effort startup connectivity check (`GET /1.3/account`) in `main.rs`, logged as a warning on failure, **never fatal** — the already-deployed `kube-shim.brawer.ch` config still has `upcloud.token = "REPLACE_ME"`, so a hard failure here would crash-loop that instance on its next auto-update for no operational reason (nothing in this phase actually depends on UpCloud working yet).
 
-**Files to modify:**
-- `src/providers/mod.rs` (new) - `CloudProvider` trait
-- `src/providers/upcloud/mod.rs` (new) - UpCloud REST client wrapper implementing the trait, built on `reqwest`
-- `src/providers/upcloud/volumes.rs` (new) - volume (storage) operations
-- `src/providers/upcloud/servers.rs` (new) - server operations, incl. the create-then-poll pattern
-- `src/reconcile/job.rs` - add DRY_RUN checks before API calls
-- `src/config.rs` - add dry_run boolean, `[upcloud] token`
-- `config-dev.toml` - set dry_run = true
+**Files created/modified:**
+- `src/providers/mod.rs` (new) - `CloudProvider` trait + request/response types (`CreateVolumeRequest`, `Volume`, `CreateServerRequest`, `Server`, `FirewallRule`, `PriceEntry`, `ProviderError`)
+- `src/providers/upcloud/mod.rs` (new) - `UpCloudProvider`: the shared `reqwest` client/auth/error-mapping plumbing, plus `check_connectivity()`
+- `src/providers/upcloud/volumes.rs` (new) - `create_volume`/`delete_volume`/`attach_volume`/`detach_volume`
+- `src/providers/upcloud/servers.rs` (new) - `create_server`/`get_server`/`delete_server`, incl. the public-IP extraction real server responses need
+- `src/providers/upcloud/firewall.rs` (new) - `create_firewall_rules` (one `POST` per rule -- UpCloud's own create endpoint has no bulk form) / `list_firewall_rules`
+- `src/providers/upcloud/pricing.rs` (new) - `get_pricing`, extracting one `(zone, price_key)` entry from the full catalog
+- `src/volumes.rs` - no changes needed; `parse_storage_quantity_gb`/`StorageTier` (Phase 5) got their first real caller
+- `src/workload.rs` - add `parse_cpu_cores`
+- `src/reconcile/job.rs` - add the dry-run-aware logging at `VolumePending`/`VMPending`
+- `src/config.rs` - add `[upcloud] zone` (`dry_run` already existed)
+- `src/main.rs` - construct `UpCloudProvider`, run the best-effort startup connectivity check, thread `dry_run` into `reconcile::run`
 
 **Testing:**
 ```bash
+cargo test   # 115 tests total. Every UpCloudProvider method is tested
+             # against a real local HTTP server (axum, OS-assigned port --
+             # the same pattern tests/tls_integration_test.rs already uses),
+             # exercising the real request-building and response-parsing
+             # round trip, not a hand-mocked reqwest layer.
+
+# Real hands-on verification against the actual UpCloud API (not just
+# mocks), using a throwaway example binary written for this, run once by
+# hand, then discarded -- not part of the committed test suite:
+#   check_connectivity()  -> OK
+#   get_pricing("de-fra1", "server_plan_DEV-1xCPU-1GB-10GB")
+#     -> amount=1 price=0.4464 (matches the exact value found during
+#        Phase 7's original UpCloud API research)
+#   create_volume(1GB, standard, "kube-shim-phase7-verify") -> real UUID
+#   delete_volume(that UUID) -> confirmed gone via a follow-up
+#     GET /1.3/storage/normal listing (no orphan left behind)
+
 # Apply osmdiffs CronJob (small test version, 1GB volumes)
 terraform apply
 # Watch logs:
-# "DRY-RUN: Would create volume kube-shim-vol-osmdiffs-weekly-20260915-abc size=1GB"
-# "DRY-RUN: Would launch VM kube-shim-worker-osmdiffs-weekly-20260915-abc"
+# "DRY-RUN: would create volume for job default/osmdiffs-weekly-...: 1GB, tier Standard"
+# "DRY-RUN: would launch VM for job default/osmdiffs-weekly-...: plan DEV-...(...)"
 # Verify NO resources created in UpCloud's control panel
 ```
 
@@ -438,17 +460,16 @@ terraform apply
 
 **Deliverables:**
 - Set `dry_run = false` in config
-- Real volume (storage) creation in the reconciliation loop, at the size and tier (`kube-shim-standard`/`kube-shim-fast`, Phase 5) the job's ephemeral volume spec requests
+- **The `UpCloudProvider` HTTP client itself (`create_volume`/`delete_volume`/`attach_volume`/`detach_volume`) already exists, real and tested against the live API — built in Phase 7, ahead of this phase's original schedule, since implementing `CloudProvider` for real was cheaper to do together with defining the trait than to split across two phases.** This phase's actual remaining work is wiring those already-real calls into the reconciliation loop's `VolumeCreating`/`VolumeAttaching`/`VolumeAttached` states (replacing the `dry_run`-gated logging from Phase 7 with real calls + real error handling on the `dry_run=false` path), and populating `job_volumes` (reserved since Phase 5, still empty) with the resulting `provider_volume_id` once a volume is actually created.
 - Volume attachment to the worker VM
 - Error handling + retry logic with timeouts (5 min for volume creation)
 - Orphan detection: scan UpCloud for storage/servers with our `resource_prefix`, delete if not tracked in DB
-- Database: track volume_id, volume_device, mount_point
+- Database: track `provider_volume_id`/mount point on `job_volumes` (Phase 5's reserved table) — `jobs.volume_device`/`.mount_point` already exist too, front-loaded in Phase 1's original schema (see Phase 6's own note on this pattern)
 
 **Files to modify:**
-- `src/providers/upcloud/volumes.rs` - implement real create/attach/detach/delete
-- `src/reconcile/job.rs` - implement volume state steps (VolumeCreating, VolumeAttaching, VolumeAttached)
+- `src/reconcile/job.rs` - implement volume state steps (VolumeCreating, VolumeAttaching, VolumeAttached), calling the already-real `CloudProvider` methods
 - `src/reconcile/orphan_scan.rs` (new) - periodic orphan detection + cleanup
-- `src/db/schema.sql` - add volume_device, mount_point columns
+- `src/db/schema.sql` - **no changes expected** — verify against the current schema before assuming a column is missing; Phase 1 front-loaded far more of this than any individual phase's own scope suggested at the time (see Phase 6 and Phase 7's own notes on this same pattern)
 
 **Testing:**
 ```bash
@@ -482,12 +503,11 @@ terraform apply
 - Database: track worker_vm_id, worker_vm_name, worker_ssh_ip
 
 **Files to create/modify:**
-- `src/providers/upcloud/servers.rs` - implement real server create/delete + the create→poll-until-running pattern
-- `src/providers/upcloud/firewall.rs` (new) - creates the restrictive firewall ruleset for every worker VM, polls until applied
+- **`src/providers/upcloud/servers.rs` and `firewall.rs` already have real, tested `create_server`/`get_server`/`delete_server`/`create_firewall_rules`/`list_firewall_rules` methods — built in Phase 7, ahead of schedule, same reasoning as Phase 8's volume methods.** This phase's actual remaining work is the create→poll-until-running loop and the apply→list-and-verify loop *using* those methods, both living in `src/reconcile/job.rs`, not in the provider client itself.
 - `src/cloud_init.rs` (new) - generate cloud-init script with proper escaping
-- `src/reconcile/job.rs` - add VM state steps (VMCreating, VMRunning, FirewallApplying, FirewallVerified, etc.)
+- `src/reconcile/job.rs` - add VM state steps (VMCreating, VMRunning, FirewallApplying, FirewallVerified, etc.), each calling the already-real `CloudProvider` methods
 - `bootstrap/cloud-init-template.sh` (new) - bash template for VM startup
-- `src/db/schema.sql` - add worker_vm_id, worker_ssh_ip, worker_vm_name, exit_code columns
+- `src/db/schema.sql` - **no changes expected** — `jobs.worker_vm_id`/`.worker_ssh_ip`/`.worker_vm_name`/`.exit_code` already exist, front-loaded in Phase 1's original schema (see Phase 6/7/8's own notes on this same pattern); verify against the current schema before assuming otherwise
 
 **Test scenario:**
 ```bash
@@ -802,7 +822,7 @@ curl -k https://localhost:443/debug/status | jq '.total_cost, .budget_balance'
 | `src/db/schema.sql` | SQLite schema | Phases 1, 5-6, 8-9, 11-13 |
 | `src/reconcile/*.rs` | State machine loop, `Notify`-based wake-up, `activeDeadlineSeconds` enforcement | Create (Phases 6, 8-9, 11, 13) |
 | `src/providers/*.rs` | `CloudProvider` trait + UpCloud implementation | Create (Phases 7-9, 13) |
-| `src/providers/upcloud/firewall.rs` | Firewall rules for worker VMs (create + poll-until-applied) | Create (Phase 9) |
+| `src/providers/upcloud/firewall.rs` | Firewall rules for worker VMs (create + list, both real since Phase 7; poll-until-applied logic itself is Phase 9) | Create (Phase 7) |
 | `src/currency.rs` | ECB daily exchange-rate sync + conversion to `main_currency` | Create (Phase 13) |
 | `src/pricing/*.rs` | Cost tracking + rolling budget guard, in `main_currency` | Create (Phase 13) |
 | `src/api/cost_report.rs` | CSV cost report, grouped by job label | Create (Phase 13) |
