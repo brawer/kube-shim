@@ -297,44 +297,51 @@ curl --cacert <(curl -s https://letsencrypt.org/certs/staging/letsencrypt-stg-ro
 
 ---
 
-### Phase 5: Generic Ephemeral Volumes + Multi-Job Resource Model (Days 5-6)
+### Phase 5: Generic Ephemeral Volumes + Multi-Job Resource Model (Days 5-6) — ✅ Complete
 **Goal:** Let Terraform provision per-job scratch storage the same way real Kubernetes does for genuinely ephemeral storage — inline in the pod template — and remove the hardcoded single-workload assumptions from Phase 1 before the reconciliation loop is built on top of them.
 
 **Deliverables:**
 - Support for the CronJob pod template's `volumes: - name: scratch ephemeral: volumeClaimTemplate: spec: {resources.requests.storage, storageClassName}` field — real Kubernetes' "generic ephemeral volumes" (GA since 1.23) — instead of a standalone `PersistentVolumeClaim` resource type with its own CRUD handlers and a separate binding step. Simpler than this plan's original PVC-based design (see GitHub issue #16) and a better match for reality: nothing built here needs to survive across job runs, so there's no `Pending`/`Bound`/`Released` lifecycle, no cross-resource lookup, and no orphaned-claim bookkeeping to get wrong. Standalone `PersistentVolumeClaim`/`PersistentVolume` support for a job that *does* want to cache data across runs is deferred — see "Future Work" below.
 - `spec.storageClassName` is repurposed from the original plan: since nothing is ever retained, it no longer selects a reclaim policy. Instead it selects a **performance tier** — two built-in, hardcoded class names, `kube-shim-standard` (the default when omitted) and `kube-shim-fast` — mapped internally, per cloud provider, to that provider's closest matching storage tier (UpCloud: `standard` / `maxiops`). No real `StorageClass` resource or general CSI-style pluggable parameters: providers in this space (UpCloud, and likely Infomaniak/Hetzner too) offer a small number of discrete storage tiers, not a continuously tunable IOPS number, and even real Kubernetes doesn't standardize IOPS as a portable parameter — that's left entirely to whichever CSI driver is bound. A small, fixed, hardcoded per-provider lookup table (`match classname { ... }` inside each `CloudProvider` implementation) is both simpler and more honest about what these providers actually offer than inventing a numeric abstraction they can't precisely honor. An unknown class name is rejected the standard way: HTTP 422, `Status` object, `reason: Invalid`, `causes: [{reason: FieldValueNotSupported, field: "...storageClassName"}]` — built via `src/k8s_status.rs` (Phase 2), same as every other structured error in this API.
-- Database: `job_volumes` table (job_id, size_gb, storage_class_name, provider_volume_id, mount_point) — one row per job *run*, not a durable row reused across runs, since nothing here persists between runs.
-- Per-job VM sizing: read `resources.requests.cpu` / `.memory` from the CronJob's pod template and map to a cloud-provider server size (small lookup table), instead of a fixed single size — needed now that the shim runs more than one workload shape.
-- Config: `resource_prefix` (default `"kube-shim"`), reserved here since this is the first phase that gives cloud resources shim-managed names — actually threaded through naming and orphan-scan matching in Phase 15. Also reserves the rolling-budget parameters (`budget_daily_rate`, `budget_rollover_cap_days`, in `main_currency` — see Phase 13) and `main_currency` itself — this just reserves the config shape; the accrual/enforcement/conversion logic is built in Phase 13, once cost calculation and ECB-rate sync exist.
-- Internal `WorkloadKind` enum (`CronJob` for now) threaded through the reconciliation types, so the Phase 8+ VM-provisioning and volume-handling code isn't written in a way that assumes "CronJob" is the only possible workload kind. This is purely an internal abstraction — no new API surface — done now so the future Deployment support (see "Future Work") doesn't require rewriting this layer.
-- **Admission check on CronJob create/update: `spec.jobTemplate.spec.activeDeadlineSeconds` must be set.** `activeDeadlineSeconds` is optional in the real Kubernetes API, but the shim needs a hard worst-case runtime bound for every job to make the budget guard (Phase 13) and deadline enforcement (Phase 11) meaningful, so it requires it via policy the same way a real cluster's `ValidatingAdmissionPolicy`/webhook would. A CronJob submitted without it is rejected with the same response shape a real admission webhook denial produces: HTTP 403, a `Status` object (`kind: Status`, `reason: Forbidden`, built via Phase 2's `src/k8s_status.rs`), message `admission webhook "kube-shim.io/require-active-deadline" denied the request: spec.jobTemplate.spec.activeDeadlineSeconds must be set (bounds the job's worst-case cost against the budget guard)`. `kubectl`/Terraform surface this exactly like any real admission denial — resolves Open Question 9.
+- Database: `job_volumes` table (job_id, size_gb, storage_class_name, provider_volume_id, mount_point) — one row per job *run*, not a durable row reused across runs, since nothing here persists between runs. **Reserved schema only in this phase**: nothing writes to it yet, since there's no reconciliation loop (Phase 6) turning a CronJob's schedule into actual job runs for a row to represent.
+- Per-job VM sizing: read `resources.requests.cpu` / `.memory` from the CronJob's pod template and map to a cloud-provider server size (small lookup table), instead of a fixed single size — needed now that the shim runs more than one workload shape. **Built as a standalone, tested `src/workload.rs` function** (`smallest_fitting_server_plan`), using real UpCloud plan names/specs confirmed against the actual API (Phase 7's own research) rather than placeholders — but deliberately a small, incomplete starting table: osmdiffs' real profile (6 CPU/8GB) already exceeds every plan listed, and finding its actual match is left to Phase 9 (VM provisioning), the same way every other provider-specific sizing decision in this plan gets settled hands-on rather than guessed in advance. Not wired into any live request path yet — nothing provisions VMs until Phase 9.
+- Config: `resource_prefix` (default `"kube-shim"`), reserved here since this is the first phase that gives cloud resources shim-managed names — actually threaded through naming and orphan-scan matching in Phase 15. Also reserves the rolling-budget parameters (`budget_daily_rate`, `budget_rollover_cap_days`, in `main_currency` — see Phase 13) and `main_currency` itself — this just reserves the config shape; the accrual/enforcement/conversion logic is built in Phase 13, once cost calculation and ECB-rate sync exist. **Landed as a new top-level `[shim]` config section** (not nested under `[server]` or any provider section, since none of these four fields is specific to the HTTP listener or to UpCloud) — `#[serde(default)]` throughout, so the already-deployed `kube-shim.brawer.ch` config.toml (which predates this section entirely) keeps parsing unchanged.
+- Internal `WorkloadKind` enum (`CronJob` for now), in `src/workload.rs`. Purely an internal abstraction — no new API surface, and not yet referenced by any reconciliation code (there isn't any until Phase 6) — done now so the future Deployment support (see "Future Work") doesn't require rewriting this layer once it exists.
+- **Admission check on CronJob create/update: `spec.jobTemplate.spec.activeDeadlineSeconds` must be set.** `activeDeadlineSeconds` is optional in the real Kubernetes API, but the shim needs a hard worst-case runtime bound for every job to make the budget guard (Phase 13) and deadline enforcement (Phase 11) meaningful, so it requires it via policy the same way a real cluster's `ValidatingAdmissionPolicy`/webhook would. A CronJob submitted without it is rejected with the same response shape a real admission webhook denial produces: HTTP 403, a `Status` object (`kind: Status`, `reason: Forbidden`, built via Phase 2's `src/k8s_status.rs`), message `admission webhook "kube-shim.io/require-active-deadline" denied the request: spec.jobTemplate.spec.activeDeadlineSeconds must be set (bounds the job's worst-case cost against the budget guard)`. `kubectl`/Terraform surface this exactly like any real admission denial — resolves Open Question 9. **Only wired into `create_cronjob`**: there's no update/PATCH handler yet for CronJobs (Phase 1 only ever built create/read/list/delete), so "on update" is aspirational until that exists.
+- `src/k8s_status.rs` (Phase 2) gained a second builder, `invalid_field_value()`, alongside the existing `status_error()` — produces the full real-Kubernetes shape for a field-validation failure (`Status.details.causes[]`, `reason: FieldValueNotSupported`), not just the message string, so a programmatic consumer can find exactly which field was wrong.
 
-**Files to create/modify:**
-- `src/api/cronjob.rs` - parse/validate the pod template's `ephemeral` volume field; add the `activeDeadlineSeconds` admission check on create/update
-- `src/admission.rs` (new) - the `activeDeadlineSeconds` policy check itself, reusing Phase 2's `src/k8s_status.rs` for the response
-- `src/volumes.rs` (new) - `storageClassName` → provider-tier lookup, shared across providers
-- `src/db/schema.sql` - add `job_volumes` table
-- `src/config.rs` - add `resource_prefix`, `main_currency`, `budget_daily_rate`, `budget_rollover_cap_days`
-- `src/workload.rs` (new) - `WorkloadKind` enum + shared resource-sizing helpers
+**Files created/modified:**
+- `src/api/cronjob.rs` - run both admission checks on `create_cronjob`, before anything is written; handler now returns `axum::response::Response` directly (unifying admission-rejection responses with the existing DB-error paths) rather than `Result<_, (StatusCode, String)>`
+- `src/admission.rs` (new) - `require_active_deadline_seconds()` and `validate_ephemeral_volume_storage_classes()`, both reusing `src/k8s_status.rs` for the response. Return `Option<Response>` rather than `Result<(), Response>` — `Response` is too large for clippy's `result_large_err` lint to accept as an `Err` variant, and `Option` reads just as clearly at the call site (`if let Some(rejection) = ...`)
+- `src/volumes.rs` (new) - `StorageTier` (`storageClassName` → tier → UpCloud tier name lookup) and `parse_storage_quantity_gb()` (Kubernetes resource-quantity parsing, binary/decimal suffixes, ready for `job_volumes.size_gb` once Phase 6+ needs it)
+- `src/k8s_status.rs` - add `invalid_field_value()`
+- `src/db/schema.sql` - add `job_volumes` table (reserved, unpopulated) + its index
+- `src/config.rs` - new `ShimConfig`/`[shim]` section: `resource_prefix`, `main_currency`, `budget_daily_rate`, `budget_rollover_cap_days`
+- `src/workload.rs` (new) - `WorkloadKind` enum + `ServerPlan`/`smallest_fitting_server_plan()`
+- `tests/cronjob_admission_test.rs` (new) - both admission checks exercised through the real router (same construction `main.rs` uses), not just the underlying functions in isolation
 
 **Testing:**
 ```bash
-terraform apply   # CronJob's pod template now includes an inline ephemeral volume
-kubectl get pod osmdiffs-weekly-... -o yaml   # shows the ephemeral volume spec
-sqlite3 db.sqlite "SELECT job_id, size_gb, storage_class_name FROM job_volumes"
-# Apply a second, differently-sized cronjob and confirm both are stored
-# independently with no naming collisions.
+cargo test   # 79 tests: unit tests for StorageTier/parse_storage_quantity_gb/
+             # smallest_fitting_server_plan/ShimConfig defaults, plus
+             # tests/cronjob_admission_test.rs exercising both admission
+             # checks through the real HTTP router
+
+# Admission check (activeDeadlineSeconds):
+curl -X POST .../cronjobs -d '{"spec": {"jobTemplate": {"spec": {"template": {...}}}}}'
+# 403 Forbidden, Status object:
+# admission webhook "kube-shim.io/require-active-deadline" denied the request: ...
 
 # Storage tier:
-kubectl apply -f cronjob-with-unknown-storage-class.yaml
-# Error from server (Invalid): ...storageClassName: Unsupported value...
-# Apply one with storageClassName: kube-shim-fast and confirm it's accepted
-
-# Admission check:
-kubectl apply -f cronjob-no-deadline.yaml
-# Error from server (Forbidden): error when creating "cronjob-no-deadline.yaml":
-# admission webhook "kube-shim.io/require-active-deadline" denied the request: ...
-terraform apply   # same manifest via Terraform: apply fails with the same message, cleanly
+curl -X POST .../cronjobs -d '{"spec": {"jobTemplate": {"spec": {
+  "activeDeadlineSeconds": 3600,
+  "template": {"spec": {"volumes": [{"ephemeral": {"volumeClaimTemplate": {"spec": {
+    "storageClassName": "premium-ultra-disk"
+  }}}}]}}
+}}}}'
+# 422 Unprocessable Entity, Status object with details.causes[0].reason ==
+# "FieldValueNotSupported"; storageClassName: kube-shim-fast (or omitted,
+# or kube-shim-standard) all accepted (201)
 ```
 
 ---

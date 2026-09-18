@@ -1,7 +1,9 @@
 use super::secret::ObjectMeta;
+use crate::admission;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
+    response::{IntoResponse, Response},
     Json,
 };
 use chrono::Utc;
@@ -31,7 +33,21 @@ pub struct CreateCronJobRequest {
 pub async fn create_cronjob(
     State(pool): State<SqlitePool>,
     Json(req): Json<CreateCronJobRequest>,
-) -> Result<(StatusCode, Json<CronJob>), (StatusCode, String)> {
+) -> Response {
+    // Admission checks first, before anything is written -- same ordering
+    // a real cluster's admission chain uses (validate, then persist), and
+    // it means neither check needs to worry about cleaning up a
+    // half-created row on rejection.
+    let object_description = format!("CronJob \"{}\"", req.metadata.name);
+    if let Some(response) = admission::require_active_deadline_seconds(&req.spec) {
+        return response;
+    }
+    if let Some(response) =
+        admission::validate_ephemeral_volume_storage_classes(&object_description, &req.spec)
+    {
+        return response;
+    }
+
     let namespace = req
         .metadata
         .namespace
@@ -39,10 +55,12 @@ pub async fn create_cronjob(
         .unwrap_or_else(|| "default".to_string());
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().timestamp();
-    let spec_json =
-        serde_json::to_string(&req.spec).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let spec_json = match serde_json::to_string(&req.spec) {
+        Ok(s) => s,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
 
-    sqlx::query(
+    let insert_result = sqlx::query(
         r#"
         INSERT INTO cronjobs (id, name, namespace, spec, created_at, updated_at, schedule, version)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -57,8 +75,11 @@ pub async fn create_cronjob(
     .bind("") // schedule will be extracted from spec in Phase 2
     .bind(1)
     .execute(&pool)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .await;
+
+    if let Err(e) = insert_result {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
 
     let cronjob = CronJob {
         api_version: "batch/v1".to_string(),
@@ -73,7 +94,7 @@ pub async fn create_cronjob(
         status: None,
     };
 
-    Ok((StatusCode::CREATED, Json(cronjob)))
+    (StatusCode::CREATED, Json(cronjob)).into_response()
 }
 
 pub async fn get_cronjob(
