@@ -11,6 +11,7 @@ use axum::Router;
 use rustls_acme::axum::AxumAcceptor;
 use rustls_acme::{caches::DirCache, AcmeConfig, AcmeState, EventOk, UseChallenge};
 use std::fmt::Debug;
+use std::net::SocketAddr;
 use std::time::Duration;
 use tokio_stream::StreamExt;
 
@@ -26,27 +27,24 @@ const DIRECTORY_PRODUCTION: &str = "production";
 /// only ever logs.
 const COLD_START_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
-pub struct Acme {
-    /// Hands to `axum_server::Server::acceptor()` for the `:443`-published
-    /// listener; resolves whatever certificate ACME has most recently
-    /// deployed.
-    pub acceptor: AxumAcceptor,
-    /// The minimal, GET-only-in-spirit router that answers Let's Encrypt's
-    /// HTTP-01 challenge on `server.acme_challenge_port` -- nothing else is
-    /// ever registered on it.
-    pub challenge_router: Router,
-}
-
-/// Builds the ACME-issued TLS acceptor and HTTP-01 challenge router,
-/// blocking until a certificate is actually available to serve -- either
-/// freshly issued, or a still-valid one loaded from `acme_cache_dir` -- or
-/// failing with an error if that doesn't happen within
-/// `COLD_START_TIMEOUT`. Once that first certificate is in hand, ongoing
-/// renewal is handed off to a background task that only logs.
+/// Builds the ACME-issued TLS acceptor, blocking until a certificate is
+/// actually available to serve -- either freshly issued, or a still-valid
+/// one loaded from `acme_cache_dir` -- or failing with an error if that
+/// doesn't happen within `COLD_START_TIMEOUT`. Once that first certificate
+/// is in hand, ongoing renewal is handed off to a background task that
+/// only logs.
+///
+/// The `:80` HTTP-01 challenge responder is started here too (as a
+/// background task), *before* waiting for the first certificate --
+/// deliberately: issuance itself depends on that responder already being
+/// reachable, so waiting for issuance to complete before starting it would
+/// deadlock. Only the returned acceptor (for the `:443` listener) needs
+/// any further wiring in `main.rs`; the challenge responder is otherwise
+/// self-contained.
 ///
 /// Must only be called when `cfg.hostname` is `Some`; the self-signed
 /// fallback in `tls.rs` is what handles the `None` case.
-pub async fn setup(cfg: &ServerConfig) -> Result<Acme> {
+pub async fn setup(cfg: &ServerConfig) -> Result<AxumAcceptor> {
     let hostname = cfg
         .hostname
         .as_ref()
@@ -82,6 +80,11 @@ pub async fn setup(cfg: &ServerConfig) -> Result<Acme> {
         .route_service("/.well-known/acme-challenge/:token", challenge_service)
         .layer(server_header_layer());
 
+    let challenge_addr: SocketAddr = format!("{}:{}", cfg.host, cfg.acme_challenge_port)
+        .parse()
+        .context("Invalid server host/acme_challenge_port")?;
+    spawn_challenge_responder(challenge_addr, challenge_router);
+
     tokio::time::timeout(COLD_START_TIMEOUT, wait_for_first_certificate(&mut state))
         .await
         .with_context(|| {
@@ -95,10 +98,24 @@ pub async fn setup(cfg: &ServerConfig) -> Result<Acme> {
 
     spawn_renewal_task(state, hostname);
 
-    Ok(Acme {
-        acceptor,
-        challenge_router,
-    })
+    Ok(acceptor)
+}
+
+/// Runs the HTTP-01 challenge responder for as long as the process lives.
+/// A bind/serve failure here is logged, not fatal on its own -- if it
+/// really does mean the challenge port is unreachable, `setup()`'s own
+/// cold-start timeout above will surface that as a clear, attributable
+/// error instead of a silently hanging process.
+fn spawn_challenge_responder(addr: SocketAddr, router: Router) {
+    tokio::spawn(async move {
+        tracing::info!("ACME HTTP-01 challenge responder listening on http://{addr}");
+        if let Err(err) = axum_server::bind(addr)
+            .serve(router.into_make_service())
+            .await
+        {
+            tracing::error!("ACME HTTP-01 challenge responder failed: {err:?}");
+        }
+    });
 }
 
 /// Drives the ACME state machine's event stream until the first
@@ -138,10 +155,11 @@ where
 /// Keeps driving the ACME state machine forever in the background, so
 /// certificates get renewed automatically ahead of expiry. A renewal
 /// failure is only ever logged, never fatal: the certificate already
-/// deployed (and referenced by `Acme::acceptor`'s resolver) keeps serving
-/// traffic regardless, and rustls-acme retries renewal on its own
-/// schedule. This is what makes a transient Let's Encrypt outage or
-/// rate-limit bump a non-event instead of a self-inflicted outage.
+/// deployed (and referenced by the acceptor's resolver, returned from
+/// `setup()`) keeps serving traffic regardless, and rustls-acme retries
+/// renewal on its own schedule. This is what makes a transient Let's
+/// Encrypt outage or rate-limit bump a non-event instead of a
+/// self-inflicted outage.
 fn spawn_renewal_task<EC, EA>(mut state: AcmeState<EC, EA>, hostname: String)
 where
     EC: Debug + Send + 'static,

@@ -35,15 +35,20 @@ apt-get upgrade -y
 apt-get install -y curl openssl podman systemd-container
 
 # Rootless podman's rootlessport *can* publish a host port <1024 (needed
-# for :443/:80, Phase 4's ACME listener) with no special capability, but
-# only once this sysctl is lowered -- verified hands-on against a fresh
-# VPS; without it, podman fails with "cannot expose privileged port 443
-# ... bind: permission denied". This governs the HOST-side bind only; the
-# container's own process still can't bind <1024 inside its own network
-# namespace, which is why deploy/kube-shim.container maps host 443/80 to
-# unprivileged container-internal ports rather than the same port number.
-echo "Allowing rootless podman to publish privileged ports (443/80)..."
-echo 'net.ipv4.ip_unprivileged_port_start=443' > /etc/sysctl.d/99-podman-unprivileged-ports.conf
+# for both :443 and :80, Phase 4's ACME listener) with no special
+# capability, but only once this sysctl is lowered -- verified hands-on
+# against a fresh VPS; without it, podman fails with "cannot expose
+# privileged port 443 ... bind: permission denied". Set to 80, not 443:
+# the threshold is a floor on which ports count as unprivileged, so 443
+# alone would still leave 80 itself blocked (verified hands-on too, the
+# hard way -- this shipped wrong as =443 first, which broke the :80
+# challenge responder specifically while :443 kept working). This governs
+# the HOST-side bind only; the container's own process still can't bind
+# <1024 inside its own network namespace, which is why
+# deploy/kube-shim.container maps host 443/80 to unprivileged
+# container-internal ports rather than the same port numbers.
+echo "Allowing rootless podman to publish privileged ports (443, 80)..."
+echo 'net.ipv4.ip_unprivileged_port_start=80' > /etc/sysctl.d/99-podman-unprivileged-ports.conf
 sysctl --system >/dev/null
 
 # Create a dedicated, unprivileged user to run the container as. Rootless
