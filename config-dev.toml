@@ -12,8 +12,8 @@ token = "dev-only-insecure-token"
 [database]
 path = "db.sqlite"
 
-[hetzner]
-token = "YOUR_HETZNER_TOKEN_HERE"
+[upcloud]
+token = "YOUR_UPCLOUD_TOKEN_HERE"
 dry_run = true
 
 [reconciliation]

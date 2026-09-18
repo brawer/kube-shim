@@ -132,8 +132,8 @@ token = "${API_TOKEN}"
 [database]
 path = "/data/db.sqlite"
 
-[hetzner]
-# REPLACE with your real Hetzner Cloud API token before starting the service.
+[upcloud]
+# REPLACE with your real UpCloud API token before starting the service.
 token = "REPLACE_ME"
 dry_run = true
 
@@ -173,8 +173,8 @@ echo ""
 echo "=== Provisioning Complete ==="
 echo ""
 echo "Next steps:"
-echo "1. Edit $DATA_DIR/config.toml and set hetzner.token to your real"
-echo "   Hetzner Cloud API token (currently REPLACE_ME). If DNS for this"
+echo "1. Edit $DATA_DIR/config.toml and set upcloud.token to your real"
+echo "   UpCloud API token (currently REPLACE_ME). If DNS for this"
 echo "   host is already set up, also uncomment and set hostname (and"
 echo "   review acme_directory/acme_contact_email) to enable ACME -- see"
 echo "   the comments already in that file."

@@ -7,7 +7,16 @@ use std::path::Path;
 pub struct Config {
     pub server: ServerConfig,
     pub database: DatabaseConfig,
-    pub hetzner: HetznerConfig,
+    /// `#[serde(alias = "hetzner")]`: the primary cloud provider switched
+    /// from Hetzner to UpCloud (see docs/IMPLEMENTATION_PLAN.md, Open
+    /// Question 1) before any provider-specific code existed to actually
+    /// consume this section -- only the config shape was ever reserved
+    /// (Phase 5). The alias exists purely so the already-deployed
+    /// kube-shim.brawer.ch config.toml, which predates the rename and
+    /// still has `[hetzner]`, keeps parsing with zero edits; new configs
+    /// should use `[upcloud]`.
+    #[serde(alias = "hetzner")]
+    pub upcloud: UpCloudConfig,
     pub reconciliation: ReconciliationConfig,
 }
 
@@ -90,7 +99,7 @@ pub struct DatabaseConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HetznerConfig {
+pub struct UpCloudConfig {
     pub token: String,
     pub dry_run: bool,
 }
@@ -145,7 +154,7 @@ token = "test-token"
 [database]
 path = "db.sqlite"
 
-[hetzner]
+[upcloud]
 token = "test-token"
 dry_run = true
 
@@ -159,10 +168,23 @@ interval_secs = 10
     fn test_config_parse() {
         let config: Config = toml::from_str(&base_toml()).expect("Failed to parse config");
         assert_eq!(config.server.port, 6443);
-        assert!(config.hetzner.dry_run);
+        assert!(config.upcloud.dry_run);
         assert_eq!(config.server.api_tokens.len(), 1);
         assert_eq!(config.server.api_tokens[0].token, "test-token");
         assert!(config.server.api_tokens[0].expires_at.is_none());
+    }
+
+    #[test]
+    fn test_hetzner_section_name_still_parses_as_alias() {
+        // The already-deployed kube-shim.brawer.ch config.toml predates the
+        // Hetzner -> UpCloud primary-provider switch and still has
+        // `[hetzner]`, not `[upcloud]` -- this must keep parsing with zero
+        // edits to that live file.
+        let toml_str = base_toml().replace("[upcloud]", "[hetzner]");
+        assert!(toml_str.contains("[hetzner]"));
+        let config: Config = toml::from_str(&toml_str).expect("[hetzner] alias must still parse");
+        assert!(config.upcloud.dry_run);
+        assert_eq!(config.upcloud.token, "test-token");
     }
 
     #[test]
@@ -184,7 +206,7 @@ token = "new-token"
 [database]
 path = "db.sqlite"
 
-[hetzner]
+[upcloud]
 token = "test-token"
 dry_run = true
 
@@ -294,7 +316,7 @@ token = "test-token"
 [database]
 path = "db.sqlite"
 
-[hetzner]
+[upcloud]
 token = "test-token"
 dry_run = true
 
@@ -330,7 +352,7 @@ api_tokens = []
 [database]
 path = "db.sqlite"
 
-[hetzner]
+[upcloud]
 token = "test-token"
 dry_run = true
 
