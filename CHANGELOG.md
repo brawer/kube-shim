@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.5](https://github.com/brawer/kube-shim/compare/v0.1.4...v0.1.5) (2026-09-18)
+
+
+### 🆕 Enhancements
+
+* generic ephemeral volumes + CronJob admission checks (Phase 5) ([#26](https://github.com/brawer/kube-shim/issues/26)) ([cdf7ca7](https://github.com/brawer/kube-shim/commit/cdf7ca71ed1146bb4197120b698468512a6fc662))
+
 ## [0.1.4](https://github.com/brawer/kube-shim/compare/v0.1.3...v0.1.4) (2026-09-18)
 
 
