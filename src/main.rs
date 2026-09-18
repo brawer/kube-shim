@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use kube_shim::providers::upcloud::UpCloudProvider;
 use kube_shim::{acme, app, config, db, reconcile, tls};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -36,12 +37,29 @@ async fn main() -> Result<()> {
     let recovered = reconcile::startup::recover(&pool).await?;
     tracing::info!("Startup recovery: {recovered} job(s) resumed");
 
+    // Best-effort UpCloud connectivity/auth check (Phase 7) -- logged as a
+    // warning on failure, never fatal. The already-deployed
+    // kube-shim.brawer.ch config still has upcloud.token = "REPLACE_ME";
+    // nothing in this phase actually depends on UpCloud working yet (real
+    // operations don't happen until Phase 8), so a hard failure here would
+    // crash-loop that instance on its next auto-update for no operational
+    // reason.
+    let upcloud = UpCloudProvider::new(cfg.upcloud.token.clone());
+    match upcloud.check_connectivity().await {
+        Ok(()) => tracing::info!("UpCloud connectivity check succeeded"),
+        Err(err) => tracing::warn!("UpCloud connectivity check failed (continuing anyway): {err}"),
+    }
+
     // Reconciliation loop (Phase 6), running in the background for the
     // lifetime of the process. `notify` is also handed to the API router
     // below so a new CronJob can wake it immediately instead of waiting
     // for the fallback poll.
     let notify = Arc::new(Notify::new());
-    tokio::spawn(reconcile::run(pool.clone(), notify.clone()));
+    tokio::spawn(reconcile::run(
+        pool.clone(),
+        notify.clone(),
+        cfg.upcloud.dry_run,
+    ));
 
     // Build router
     let router = app::build_router(pool, Arc::new(cfg.server.api_tokens.clone()), notify);

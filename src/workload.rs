@@ -75,6 +75,34 @@ pub fn smallest_fitting_server_plan(cpu_cores: u32, memory_gb: u32) -> Option<&'
         .min_by_key(|plan| (plan.cpu_cores, plan.memory_gb))
 }
 
+/// Parses a Kubernetes CPU resource quantity (`resources.requests.cpu`,
+/// e.g. `"2"` or `"500m"` for 500 millicores) into a whole number of
+/// cores, rounding up so a request never ends up under-provisioned.
+/// `resources.requests.memory` uses the exact same `Ki`/`Mi`/`Gi`/`Ti`
+/// quantity format `src/volumes.rs` already parses for storage, so memory
+/// requests reuse `volumes::parse_storage_quantity_gb()` directly rather
+/// than duplicating that logic here.
+pub fn parse_cpu_cores(quantity: &str) -> Result<u32, String> {
+    let quantity = quantity.trim();
+    if let Some(millicores) = quantity.strip_suffix('m') {
+        let millicores: f64 = millicores
+            .parse()
+            .map_err(|_| format!("not a valid CPU quantity: {quantity:?}"))?;
+        if millicores < 0.0 {
+            return Err(format!("CPU quantity must not be negative: {quantity:?}"));
+        }
+        return Ok((millicores / 1000.0).ceil() as u32);
+    }
+
+    let cores: f64 = quantity
+        .parse()
+        .map_err(|_| format!("not a valid CPU quantity: {quantity:?}"))?;
+    if cores < 0.0 {
+        return Err(format!("CPU quantity must not be negative: {quantity:?}"));
+    }
+    Ok(cores.ceil() as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +138,28 @@ mod tests {
     fn test_workload_kind_cronjob_exists() {
         let kind = WorkloadKind::CronJob;
         assert_eq!(kind, WorkloadKind::CronJob);
+    }
+
+    #[test]
+    fn test_parse_cpu_cores_whole_number() {
+        assert_eq!(parse_cpu_cores("2"), Ok(2));
+    }
+
+    #[test]
+    fn test_parse_cpu_cores_millicores_rounds_up() {
+        assert_eq!(parse_cpu_cores("500m"), Ok(1));
+        assert_eq!(parse_cpu_cores("1500m"), Ok(2));
+        assert_eq!(parse_cpu_cores("1000m"), Ok(1));
+    }
+
+    #[test]
+    fn test_parse_cpu_cores_rejects_garbage() {
+        assert!(parse_cpu_cores("not-a-number").is_err());
+    }
+
+    #[test]
+    fn test_parse_cpu_cores_rejects_negative() {
+        assert!(parse_cpu_cores("-2").is_err());
+        assert!(parse_cpu_cores("-500m").is_err());
     }
 }

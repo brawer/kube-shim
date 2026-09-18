@@ -1452,6 +1452,7 @@ name = "kube-shim"
 version = "0.1.6"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "axum-server",
  "chrono",

@@ -30,12 +30,19 @@ const FALLBACK_INTERVAL: Duration = Duration::from_secs(10);
 /// `FALLBACK_INTERVAL` for the change to be noticed.
 ///
 /// Intended to be spawned once as a background task from `main.rs`, after
-/// `startup::recover()` has already run.
-pub async fn run(pool: SqlitePool, notify: Arc<Notify>) {
-    run_with_interval(pool, notify, FALLBACK_INTERVAL).await
+/// `startup::recover()` has already run. `dry_run` is threaded straight
+/// through to `job::advance_all()` -- see that function's own docs
+/// (Phase 7).
+pub async fn run(pool: SqlitePool, notify: Arc<Notify>, dry_run: bool) {
+    run_with_interval(pool, notify, FALLBACK_INTERVAL, dry_run).await
 }
 
-async fn run_with_interval(pool: SqlitePool, notify: Arc<Notify>, interval_duration: Duration) {
+async fn run_with_interval(
+    pool: SqlitePool,
+    notify: Arc<Notify>,
+    interval_duration: Duration,
+    dry_run: bool,
+) {
     let mut interval = tokio::time::interval(interval_duration);
 
     loop {
@@ -44,7 +51,7 @@ async fn run_with_interval(pool: SqlitePool, notify: Arc<Notify>, interval_durat
             _ = notify.notified() => {}
         }
 
-        if let Err(err) = tick(&pool).await {
+        if let Err(err) = tick(&pool, dry_run).await {
             tracing::error!("reconciliation tick failed: {err:?}");
         }
     }
@@ -52,9 +59,9 @@ async fn run_with_interval(pool: SqlitePool, notify: Arc<Notify>, interval_durat
 
 /// One reconciliation pass: check every `CronJob`'s schedule for a due
 /// run, then advance every non-terminal job by one state.
-pub async fn tick(pool: &SqlitePool) -> Result<()> {
+pub async fn tick(pool: &SqlitePool, dry_run: bool) -> Result<()> {
     let scheduled = schedule::schedule_due_jobs(pool).await?;
-    let advanced = job::advance_all(pool).await?;
+    let advanced = job::advance_all(pool, dry_run).await?;
     if scheduled > 0 || advanced > 0 {
         tracing::debug!(
             "reconciliation tick: scheduled {scheduled} new job(s), advanced {advanced}"
@@ -86,7 +93,7 @@ mod tests {
         // below happens quickly, it can only be because Notify woke the
         // loop, not because the fallback tick happened to land first.
         tokio::spawn(async move {
-            run_with_interval(loop_pool, loop_notify, Duration::from_secs(30)).await;
+            run_with_interval(loop_pool, loop_notify, Duration::from_secs(30), true).await;
         });
 
         // tokio::time::interval's *first* tick fires immediately (by
@@ -142,7 +149,7 @@ mod tests {
         .await
         .unwrap();
 
-        tick(&pool).await.unwrap();
+        tick(&pool, true).await.unwrap();
 
         let status: String =
             sqlx::query_scalar("SELECT status FROM jobs WHERE cronjob_name = 'every-minute'")

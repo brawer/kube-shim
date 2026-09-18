@@ -39,6 +39,11 @@ subtle = "2"
 # wants a 6-field form (seconds first) -- src/reconcile/schedule.rs
 # prepends "0 " to bridge that, see its own comment for why.
 cron = "0.17"
+# Phase 7: CloudProvider needs to be usable as a trait object (Arc<dyn
+# CloudProvider>, shared into the reconciliation loop the same way
+# Arc<Notify> already is) -- native async-fn-in-traits isn't dyn-safe, so
+# this crate's Box<dyn Future> desugaring is what makes that possible.
+async-trait = "0.1"
 # default-features disabled to force `ring` instead of the default
 # `aws-lc-rs`, matching tls.rs's own crypto-provider choice (ring doesn't
 # need a C/cmake toolchain, which matters for cross-compiling to musl --
