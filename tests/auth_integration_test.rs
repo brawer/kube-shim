@@ -73,6 +73,43 @@ async fn test_no_token_rejected() {
     assert_eq!(body["code"], 401);
 }
 
+/// The Server header must name the actual running version (stamped from
+/// Cargo.toml at compile time) on every response -- including a 401, since
+/// knowing which release answered a request is exactly what you want while
+/// debugging a stale deployment, auth failures included.
+#[tokio::test]
+async fn test_server_header_present_on_success_and_on_401() {
+    let base_url = start_server(vec![ApiToken {
+        token: "correct-token".to_string(),
+        expires_at: None,
+    }])
+    .await;
+    let expected = format!("kube-shim/{}", env!("CARGO_PKG_VERSION"));
+
+    let authenticated = insecure_client()
+        .get(format!("{base_url}/api/v1"))
+        .bearer_auth("correct-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authenticated.status(), 200);
+    assert_eq!(
+        authenticated.headers().get("server").unwrap(),
+        expected.as_str()
+    );
+
+    let unauthenticated = insecure_client()
+        .get(format!("{base_url}/api/v1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), 401);
+    assert_eq!(
+        unauthenticated.headers().get("server").unwrap(),
+        expected.as_str()
+    );
+}
+
 #[tokio::test]
 async fn test_wrong_token_rejected() {
     let base_url = start_server(vec![ApiToken {

@@ -4,12 +4,27 @@
 
 use crate::{api, auth, config};
 use axum::{
+    http::{HeaderName, HeaderValue},
     middleware,
     routing::{get, post},
     Router,
 };
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
+use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer};
+
+/// A `Server: kube-shim/x.y.z` header, stamped from `Cargo.toml`'s own
+/// package version at compile time -- so it's always possible to tell
+/// which release is actually live on a given deployment (e.g.
+/// kube-shim.brawer.ch) with nothing more than `curl -I`. Shared between
+/// every router the binary serves (the authenticated API here, and the
+/// ACME HTTP-01 challenge router, Phase 4), not just this one, so it's
+/// factored out rather than inlined into `build_router` alone.
+pub fn server_header_layer() -> SetResponseHeaderLayer<HeaderValue> {
+    SetResponseHeaderLayer::overriding(
+        HeaderName::from_static("server"),
+        HeaderValue::from_static(concat!("kube-shim/", env!("CARGO_PKG_VERSION"))),
+    )
+}
 
 pub fn build_router(pool: sqlx::SqlitePool, api_tokens: Arc<Vec<config::ApiToken>>) -> Router {
     Router::new()
@@ -37,11 +52,16 @@ pub fn build_router(pool: sqlx::SqlitePool, api_tokens: Arc<Vec<config::ApiToken
             get(api::cronjob::get_cronjob).delete(api::cronjob::delete_cronjob),
         )
         .layer(CorsLayer::permissive())
-        // Outermost layer: runs before CORS and before any handler, so an
-        // unauthenticated request never reaches application logic at all.
+        // Runs before CORS and before any handler, so an unauthenticated
+        // request never reaches application logic at all.
         .layer(middleware::from_fn_with_state(
             api_tokens,
             auth::require_bearer_token,
         ))
+        // Truly outermost: applied to every response, auth failures
+        // included -- which version answered a request isn't sensitive,
+        // and is exactly what you want to see on a 401 while debugging a
+        // stale deployment.
+        .layer(server_header_layer())
         .with_state(pool)
 }

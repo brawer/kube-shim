@@ -27,7 +27,7 @@ config = "0.14"
 toml = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tower = "0.4"
-tower-http = { version = "0.5", features = ["trace", "cors"] }
+tower-http = { version = "0.5", features = ["trace", "cors", "set-header"] }
 http = "1.0"
 hyper = "1.0"
 rustls = { version = "0.23", features = ["ring"] }
@@ -35,6 +35,14 @@ rustls-pemfile = "2.0"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 clap = { version = "4.0", features = ["derive"] }
 subtle = "2"
+# default-features disabled to force `ring` instead of the default
+# `aws-lc-rs`, matching tls.rs's own crypto-provider choice (ring doesn't
+# need a C/cmake toolchain, which matters for cross-compiling to musl --
+# see docs/IMPLEMENTATION_PLAN.md Phase 3). "tls12" and "webpki-roots" are
+# both on by default upstream and still needed (the latter for the ACME
+# directory's own outbound HTTPS calls), so they're re-added explicitly.
+rustls-acme = { version = "0.15", default-features = false, features = ["ring", "tls12", "webpki-roots", "axum", "tower"] }
+tokio-stream = "0.1"
 
 [dev-dependencies]
 rcgen = "0.13"

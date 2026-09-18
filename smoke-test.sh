@@ -100,7 +100,7 @@ token = "${TOKEN}"
 [database]
 path = "${WORK_DIR}/db.sqlite"
 
-[hetzner]
+[upcloud]
 token = "smoke-test-placeholder"
 dry_run = true
 
