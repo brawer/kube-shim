@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/brawer/kube-shim/compare/v0.1.6...v0.1.7) (2026-09-18)
+
+
+### 🆕 Enhancements
+
+* UpCloud CloudProvider integration, dry-run mode (Phase 7) ([#30](https://github.com/brawer/kube-shim/issues/30)) ([926b4b4](https://github.com/brawer/kube-shim/commit/926b4b405738fda63764516c800faf0c94870a3a))
+
 ## [0.1.6](https://github.com/brawer/kube-shim/compare/v0.1.5...v0.1.6) (2026-09-18)
 
 
