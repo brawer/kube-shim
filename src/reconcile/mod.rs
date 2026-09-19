@@ -6,8 +6,11 @@
 //! phases build directly on top of, not a throwaway prototype.
 
 pub mod job;
+pub mod orphan_scan;
 pub mod schedule;
 pub mod startup;
+
+pub use job::JobContext;
 
 use anyhow::Result;
 use sqlx::SqlitePool;
@@ -30,18 +33,18 @@ const FALLBACK_INTERVAL: Duration = Duration::from_secs(10);
 /// `FALLBACK_INTERVAL` for the change to be noticed.
 ///
 /// Intended to be spawned once as a background task from `main.rs`, after
-/// `startup::recover()` has already run. `dry_run` is threaded straight
-/// through to `job::advance_all()` -- see that function's own docs
-/// (Phase 7).
-pub async fn run(pool: SqlitePool, notify: Arc<Notify>, dry_run: bool) {
-    run_with_interval(pool, notify, FALLBACK_INTERVAL, dry_run).await
+/// `startup::recover()` has already run. `ctx` is threaded straight
+/// through to `job::advance_all()`/`orphan_scan::scan_and_clean()` -- see
+/// their own docs (Phase 7/8).
+pub async fn run(pool: SqlitePool, notify: Arc<Notify>, ctx: JobContext) {
+    run_with_interval(pool, notify, FALLBACK_INTERVAL, ctx).await
 }
 
 async fn run_with_interval(
     pool: SqlitePool,
     notify: Arc<Notify>,
     interval_duration: Duration,
-    dry_run: bool,
+    ctx: JobContext,
 ) {
     let mut interval = tokio::time::interval(interval_duration);
 
@@ -51,29 +54,49 @@ async fn run_with_interval(
             _ = notify.notified() => {}
         }
 
-        if let Err(err) = tick(&pool, dry_run).await {
+        if let Err(err) = tick(&pool, &ctx).await {
             tracing::error!("reconciliation tick failed: {err:?}");
         }
     }
 }
 
 /// One reconciliation pass: check every `CronJob`'s schedule for a due
-/// run, then advance every non-terminal job by one state.
-pub async fn tick(pool: &SqlitePool, dry_run: bool) -> Result<()> {
+/// run, advance every non-terminal job by one state, then scan for
+/// orphaned volumes (Phase 8 -- servers join this scan in Phase 9).
+pub async fn tick(pool: &SqlitePool, ctx: &JobContext) -> Result<()> {
     let scheduled = schedule::schedule_due_jobs(pool).await?;
-    let advanced = job::advance_all(pool, dry_run).await?;
+    let advanced = job::advance_all(pool, ctx).await?;
     if scheduled > 0 || advanced > 0 {
         tracing::debug!(
             "reconciliation tick: scheduled {scheduled} new job(s), advanced {advanced}"
         );
     }
+
+    match orphan_scan::scan_and_clean(pool, ctx).await {
+        Ok(cleaned) if cleaned > 0 => {
+            tracing::warn!("orphan scan: cleaned up {cleaned} untracked volume(s)")
+        }
+        Ok(_) => {}
+        Err(err) => tracing::error!("orphan scan failed: {err:?}"),
+    }
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::upcloud::UpCloudProvider;
     use std::time::Instant;
+
+    fn mock_ctx() -> JobContext {
+        JobContext {
+            provider: Arc::new(UpCloudProvider::new("unused-in-dry-run")),
+            dry_run: true,
+            resource_prefix: "kube-shim-test".to_string(),
+            zone: "de-fra1".to_string(),
+        }
+    }
 
     #[tokio::test]
     async fn test_notify_wakes_the_loop_faster_than_the_fallback_interval() {
@@ -93,7 +116,7 @@ mod tests {
         // below happens quickly, it can only be because Notify woke the
         // loop, not because the fallback tick happened to land first.
         tokio::spawn(async move {
-            run_with_interval(loop_pool, loop_notify, Duration::from_secs(30), true).await;
+            run_with_interval(loop_pool, loop_notify, Duration::from_secs(30), mock_ctx()).await;
         });
 
         // tokio::time::interval's *first* tick fires immediately (by
@@ -149,7 +172,7 @@ mod tests {
         .await
         .unwrap();
 
-        tick(&pool, true).await.unwrap();
+        tick(&pool, &mock_ctx()).await.unwrap();
 
         let status: String =
             sqlx::query_scalar("SELECT status FROM jobs WHERE cronjob_name = 'every-minute'")

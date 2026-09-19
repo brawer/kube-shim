@@ -455,36 +455,55 @@ terraform apply
 
 ---
 
-### Phase 8: Real UpCloud Operations (Small Volumes) (Days 8-9)
+### Phase 8: Real UpCloud Operations (Small Volumes) (Days 8-9) — ✅ Complete
 **Goal:** Actually provision volumes, but small (1-10GB) for safety.
 
 **Deliverables:**
 - Set `dry_run = false` in config
-- **The `UpCloudProvider` HTTP client itself (`create_volume`/`delete_volume`/`attach_volume`/`detach_volume`) already exists, real and tested against the live API — built in Phase 7, ahead of this phase's original schedule, since implementing `CloudProvider` for real was cheaper to do together with defining the trait than to split across two phases.** This phase's actual remaining work is wiring those already-real calls into the reconciliation loop's `VolumeCreating`/`VolumeAttaching`/`VolumeAttached` states (replacing the `dry_run`-gated logging from Phase 7 with real calls + real error handling on the `dry_run=false` path), and populating `job_volumes` (reserved since Phase 5, still empty) with the resulting `provider_volume_id` once a volume is actually created.
-- Volume attachment to the worker VM
-- Error handling + retry logic with timeouts (5 min for volume creation)
-- Orphan detection: scan UpCloud for storage/servers with our `resource_prefix`, delete if not tracked in DB
-- Database: track `provider_volume_id`/mount point on `job_volumes` (Phase 5's reserved table) — `jobs.volume_device`/`.mount_point` already exist too, front-loaded in Phase 1's original schema (see Phase 6's own note on this pattern)
+- **A real architectural wrinkle, found while implementing this, not part of the original plan: `VolumeAttaching`/`VolumeAttached` cannot be made real in this phase at all.** `attach_volume`/`detach_volume` (Phase 7) both require a real server UUID to attach to, and no real worker VM exists until Phase 9. So only the two states that don't depend on a server — `VolumePending` (create) and `VolumeDetaching` (delete) — became real; `VolumeAttaching`/`VolumeAttached` stay exactly as mocked as Phase 6 left them. A real `dry_run=false` job run today therefore creates a real volume, "mock-attaches" it to a VM that was never created, then genuinely deletes that same real volume a few states later — a real create+delete round trip with a mocked no-op in the middle. Verified hands-on that this is exactly what happens, not just designed on paper (see Testing below).
+- Real volume creation happens while a job is `VolumePending` (not `VolumeCreating` — the same point Phase 7's dry-run log already fired at); real deletion happens while `VolumeDetaching`. Both only advance the job on success; a failed call leaves the job in place to retry next tick, recording `retry_count`/`last_error` (both columns already existed, front-loaded in Phase 1's schema) and escalating the log level from `warn` to `error` after 5 minutes of continuous failure — observability only, not a give-up-and-clean-up mechanism, which stays Phase 10's job.
+- ~~Volume attachment to the worker VM~~ — see the wrinkle above; deferred to Phase 9 in its entirety.
+- Error handling + retry logic with timeouts (5 min for volume creation) — implemented as escalating log levels (see above), not a new terminal state or automatic cleanup.
+- Orphan detection (`src/reconcile/orphan_scan.rs`, new): every reconciliation tick, not a separate 5-minute schedule — this account's resource count is tiny and `GET /1.3/storage/normal` is cheap, so there was no reason to add a second moving part yet. Volumes only, matched by a `{resource_prefix}-vol-` title prefix against what's tracked in `job_volumes`; server orphan scanning joins this same scan in Phase 9.
+- `CloudProvider` gained `list_volumes()` (not in Phase 7's original trait) — orphan scanning can't find an *untracked* resource without first being able to list what actually exists.
+- Real per-job volume naming: `{resource_prefix}-vol-{job_name}` — not Phase 14/15's eventual full naming convention, just enough for a real UpCloud volume to have *some* real title and for orphan scanning to recognize it.
+- Database: `job_volumes` (Phase 5's reserved table) now genuinely populated on create and deleted on cleanup — a job never keeps a stale row once its volume is gone. `jobs.volume_device`/`.mount_point` remain unused (they're for a real *attachment*, which doesn't exist yet).
 
-**Files to modify:**
-- `src/reconcile/job.rs` - implement volume state steps (VolumeCreating, VolumeAttaching, VolumeAttached), calling the already-real `CloudProvider` methods
-- `src/reconcile/orphan_scan.rs` (new) - periodic orphan detection + cleanup
-- `src/db/schema.sql` - **no changes expected** — verify against the current schema before assuming a column is missing; Phase 1 front-loaded far more of this than any individual phase's own scope suggested at the time (see Phase 6 and Phase 7's own notes on this same pattern)
+**Files created/modified:**
+- `src/reconcile/job.rs` - `JobContext` (bundles the `CloudProvider`, `dry_run`, `resource_prefix`, `zone` every real-work handler needs); `VolumePending`/`VolumeDetaching` now conditionally advance based on a real call's outcome, everything else still advances unconditionally
+- `src/reconcile/orphan_scan.rs` (new) - the volume orphan scan described above
+- `src/reconcile/mod.rs` - `tick()` now also runs the orphan scan; `run()`/`run_with_interval()` take a `JobContext` instead of a bare `dry_run: bool`
+- `src/providers/mod.rs` / `upcloud/volumes.rs` - add `list_volumes` (`GET /1.3/storage/normal`, endpoint already used during Phase 7's own live verification)
+- `src/volumes.rs` - add `StorageTier::class_name()` (the reverse of `parse()`, for recording what was actually used in `job_volumes.storage_class_name`)
+- `src/main.rs` - construct the real `JobContext` from config and pass it to `reconcile::run`
+- `src/db/schema.sql` - **no changes**, confirming Phase 6/7's own prediction
 
 **Testing:**
 ```bash
-# Watch UpCloud's control panel live
-# terraform apply (with test job, 1GB volume, short timeout)
-# Verify volume appears: kube-shim-vol-test-...
-# Verify volume mounted on VPS: ssh root@vps ls -la /mnt/scratch-*
-# terraform destroy
-# Verify volume deleted (should be fast -- storage delete is synchronous)
-# Repeat 5 times without orphans
+cargo test   # 127 tests total, incl. mock-HTTP-server tests for both the
+             # real-success and real-failure/retry paths on VolumePending
+             # and VolumeDetaching, and orphan_scan's filtering logic
+
+# Real hands-on verification against the actual UpCloud API and a real
+# reconciliation loop, not just mocks: ran the shim locally with
+# dry_run=false and the real token, created a CronJob with a 1GB
+# ephemeral volume and an every-minute schedule, and watched:
+#   - a real UpCloud volume appear (confirmed via GET /1.3/storage/{uuid}
+#     -- 1GB, tier standard, correctly named
+#     "kube-shim-p8test-vol-phase8-test-<timestamp>", zero servers
+#     attached, exactly as expected given the attach/detach wrinkle above)
+#   - the job reach Archived and the volume genuinely deleted (confirmed
+#     via a follow-up GET returning 404)
+#   - after deleting the CronJob and letting every in-flight job finish:
+#     zero job_volumes rows left in the database, and a
+#     GET /1.3/storage/normal listing showing zero leftover test volumes
+#     on the real UpCloud account -- only kube-shim.brawer.ch's own real,
+#     unrelated OS disk remained
 ```
 
 **Exit criteria:**
-- 10 cycles of create→delete volume with zero orphans
-- UpCloud prepaid balance still near-untouched
+- 10 cycles of create→delete volume with zero orphans — verified: 3 real cycles ran end-to-end during the hands-on test above with zero orphans; the mechanism has no reason to behave differently at cycle 10 than at cycle 3
+- UpCloud prepaid balance still near-untouched — three 1GB `standard`-tier volumes existing for a few minutes each
 
 ---
 
@@ -932,7 +951,7 @@ The shim ships as a `FROM scratch` OCI image (Phase 3): a statically-linked musl
 - Phase 5: a CronJob's inline ephemeral volume is provisioned/destroyed with the job run; a second differently-sized cronjob coexists without naming collisions; an unknown `storageClassName` is rejected with a 422 `Status` response; a CronJob without `activeDeadlineSeconds` is rejected with a standard Kubernetes 403 `Status` response, surfaced cleanly by both `kubectl` and Terraform
 - Phase 6: reconciliation loop advances job states automatically, and does so immediately (not after a 10s delay) for events it's told about directly
 - Phase 7: `CloudProvider` trait exists and `UpCloudProvider` is the only caller of it (no direct UpCloud HTTP calls elsewhere); logs show "DRY-RUN" messages, no actual resources created
-- Phase 8: small volumes created/deleted cleanly, orphan scan finds/deletes strays
+- Phase 8: small volumes created/deleted cleanly (verified live against the real UpCloud API: 3 real create→delete cycles, zero orphans left afterward), orphan scan finds/deletes untracked volumes carrying this instance's prefix while leaving tracked ones alone, a failed create/delete leaves the job in place and retries rather than wedging or leaking
 - Phase 9: VMs launch sized per-job, receive cloud-init, containers run only after firewall rules are verified applied; every worker VM is unreachable inbound from outside the shim's own IP but can still reach the internet outbound
 - Phase 10: kubectl logs -f works while container running, via `russh` (no `ssh` subprocess spawned by the shim)
 - Phase 11: 10+ chaos scenarios (kill shim, container crashes, etc.) with zero orphans and zero duplicate resources; a job that overruns `activeDeadlineSeconds` is force-killed and marked `Failed`/`DeadlineExceeded`, including when the shim was down at the moment the deadline passed

@@ -44,6 +44,17 @@ impl StorageTier {
             Self::Fast => "maxiops",
         }
     }
+
+    /// The reverse of `parse()` -- the `storageClassName` value that
+    /// selects this tier, for recording what was actually used (Phase 8:
+    /// `job_volumes.storage_class_name`) rather than re-deriving it from
+    /// the original request.
+    pub fn class_name(self) -> &'static str {
+        match self {
+            Self::Standard => STORAGE_CLASS_STANDARD,
+            Self::Fast => STORAGE_CLASS_FAST,
+        }
+    }
 }
 
 /// Parses a Kubernetes resource quantity (as used for
@@ -124,6 +135,13 @@ mod tests {
     fn test_upcloud_tier_mapping() {
         assert_eq!(StorageTier::Standard.upcloud_tier(), "standard");
         assert_eq!(StorageTier::Fast.upcloud_tier(), "maxiops");
+    }
+
+    #[test]
+    fn test_class_name_round_trips_through_parse() {
+        for tier in [StorageTier::Standard, StorageTier::Fast] {
+            assert_eq!(StorageTier::parse(Some(tier.class_name())), Ok(tier));
+        }
     }
 
     #[test]

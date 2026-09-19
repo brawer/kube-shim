@@ -114,6 +114,10 @@ impl CloudProvider for UpCloudProvider {
         volumes::delete_volume(self, volume_id).await
     }
 
+    async fn list_volumes(&self, zone: &str) -> Result<Vec<Volume>, ProviderError> {
+        volumes::list_volumes(self, zone).await
+    }
+
     async fn attach_volume(&self, server_id: &str, volume_id: &str) -> Result<(), ProviderError> {
         volumes::attach_volume(self, server_id, volume_id).await
     }

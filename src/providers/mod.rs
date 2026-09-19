@@ -133,6 +133,12 @@ pub struct PriceEntry {
 pub trait CloudProvider: Send + Sync {
     async fn create_volume(&self, req: CreateVolumeRequest) -> Result<Volume, ProviderError>;
     async fn delete_volume(&self, volume_id: &str) -> Result<(), ProviderError>;
+    /// Every volume that currently exists in `zone` -- not filtered by
+    /// title/prefix; callers do that themselves (Phase 8's orphan scan is
+    /// the first one). Added alongside orphan scanning specifically:
+    /// there's no way to find an *untracked* resource without first being
+    /// able to list what actually exists.
+    async fn list_volumes(&self, zone: &str) -> Result<Vec<Volume>, ProviderError>;
     async fn attach_volume(&self, server_id: &str, volume_id: &str) -> Result<(), ProviderError>;
     async fn detach_volume(&self, server_id: &str, volume_id: &str) -> Result<(), ProviderError>;
 

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use kube_shim::providers::upcloud::UpCloudProvider;
+use kube_shim::reconcile::JobContext;
 use kube_shim::{acme, app, config, db, reconcile, tls};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -44,7 +45,7 @@ async fn main() -> Result<()> {
     // operations don't happen until Phase 8), so a hard failure here would
     // crash-loop that instance on its next auto-update for no operational
     // reason.
-    let upcloud = UpCloudProvider::new(cfg.upcloud.token.clone());
+    let upcloud = Arc::new(UpCloudProvider::new(cfg.upcloud.token.clone()));
     match upcloud.check_connectivity().await {
         Ok(()) => tracing::info!("UpCloud connectivity check succeeded"),
         Err(err) => tracing::warn!("UpCloud connectivity check failed (continuing anyway): {err}"),
@@ -55,11 +56,13 @@ async fn main() -> Result<()> {
     // below so a new CronJob can wake it immediately instead of waiting
     // for the fallback poll.
     let notify = Arc::new(Notify::new());
-    tokio::spawn(reconcile::run(
-        pool.clone(),
-        notify.clone(),
-        cfg.upcloud.dry_run,
-    ));
+    let job_context = JobContext {
+        provider: upcloud,
+        dry_run: cfg.upcloud.dry_run,
+        resource_prefix: cfg.shim.resource_prefix.clone(),
+        zone: cfg.upcloud.zone.clone(),
+    };
+    tokio::spawn(reconcile::run(pool.clone(), notify.clone(), job_context));
 
     // Build router
     let router = app::build_router(pool, Arc::new(cfg.server.api_tokens.clone()), notify);
