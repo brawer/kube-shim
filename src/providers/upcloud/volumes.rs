@@ -67,6 +67,42 @@ pub(super) async fn delete_volume(
         .await
 }
 
+#[derive(Deserialize)]
+struct StorageListEnvelope {
+    storages: StorageList,
+}
+
+#[derive(Deserialize)]
+struct StorageList {
+    storage: Vec<StorageObject>,
+}
+
+/// `/storage/normal` (not the bare `/storage` collection) deliberately --
+/// it excludes templates, backups, and CD-ROM images, none of which
+/// orphan scanning (Phase 8's actual caller) has any business touching.
+pub(super) async fn list_volumes(
+    provider: &UpCloudProvider,
+    zone: &str,
+) -> Result<Vec<Volume>, ProviderError> {
+    let response: StorageListEnvelope = provider
+        .send_json(provider.request(Method::GET, "/storage/normal"))
+        .await?;
+
+    Ok(response
+        .storages
+        .storage
+        .into_iter()
+        .filter(|s| s.zone == zone)
+        .map(|s| Volume {
+            id: s.uuid,
+            size_gb: s.size,
+            tier: s.tier,
+            title: s.title,
+            zone: s.zone,
+        })
+        .collect())
+}
+
 #[derive(Serialize)]
 struct StorageDeviceRefBody {
     storage_device: StorageDeviceRef,
@@ -169,6 +205,25 @@ mod tests {
         let provider = mock_server(app).await;
 
         provider.delete_volume("01abc").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_list_volumes_filters_by_zone() {
+        let app = axum::Router::new().route(
+            "/1.3/storage/normal",
+            axum::routing::get(|| async {
+                Json(json!({"storages": {"storage": [
+                    {"uuid": "a", "size": 10, "tier": "maxiops", "title": "kube-shim-vol-a", "zone": "de-fra1"},
+                    {"uuid": "b", "size": 25, "tier": "standard", "title": "kube-shim-vol-b", "zone": "fi-hel1"}
+                ]}}))
+            }),
+        );
+        let provider = mock_server(app).await;
+
+        let volumes = provider.list_volumes("de-fra1").await.unwrap();
+
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0].id, "a");
     }
 
     #[tokio::test]
