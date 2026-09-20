@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.8](https://github.com/brawer/kube-shim/compare/v0.1.7...v0.1.8) (2026-09-20)
+
+
+### 🆕 Enhancements
+
+* real UpCloud volume operations, orphan scanning (Phase 8) ([#32](https://github.com/brawer/kube-shim/issues/32)) ([137d447](https://github.com/brawer/kube-shim/commit/137d447c62c75b13bfdac8e71c5ff28a0708ca7e))
+
 ## [0.1.7](https://github.com/brawer/kube-shim/compare/v0.1.6...v0.1.7) (2026-09-18)
 
 
