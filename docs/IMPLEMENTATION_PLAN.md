@@ -464,7 +464,7 @@ terraform apply
 - Real volume creation happens while a job is `VolumePending` (not `VolumeCreating` — the same point Phase 7's dry-run log already fired at); real deletion happens while `VolumeDetaching`. Both only advance the job on success; a failed call leaves the job in place to retry next tick, recording `retry_count`/`last_error` (both columns already existed, front-loaded in Phase 1's schema) and escalating the log level from `warn` to `error` after 5 minutes of continuous failure — observability only, not a give-up-and-clean-up mechanism, which stays Phase 10's job.
 - ~~Volume attachment to the worker VM~~ — see the wrinkle above; deferred to Phase 9 in its entirety.
 - Error handling + retry logic with timeouts (5 min for volume creation) — implemented as escalating log levels (see above), not a new terminal state or automatic cleanup.
-- Orphan detection (`src/reconcile/orphan_scan.rs`, new): every reconciliation tick, not a separate 5-minute schedule — this account's resource count is tiny and `GET /1.3/storage/normal` is cheap, so there was no reason to add a second moving part yet. Volumes only, matched by a `{resource_prefix}-vol-` title prefix against what's tracked in `job_volumes`; server orphan scanning joins this same scan in Phase 9.
+- Orphan detection (`src/reconcile/orphan_scan.rs`, new): runs on its own independent 5-minute cadence (`reconcile::run_orphan_scan_loop`/`ORPHAN_SCAN_INTERVAL`), deliberately decoupled from the job-tick loop's own `Notify`-driven wake-ups — a job-creating API call can wake that loop far more often than every 10s, and there's no reason to re-list the whole account's volumes at that rate just to look for a leak. Volumes only, matched by a `{resource_prefix}-vol-` title prefix against what's tracked in `job_volumes`; server orphan scanning joins this same scan in Phase 9.
 - `CloudProvider` gained `list_volumes()` (not in Phase 7's original trait) — orphan scanning can't find an *untracked* resource without first being able to list what actually exists.
 - Real per-job volume naming: `{resource_prefix}-vol-{job_name}` — not Phase 14/15's eventual full naming convention, just enough for a real UpCloud volume to have *some* real title and for orphan scanning to recognize it.
 - Database: `job_volumes` (Phase 5's reserved table) now genuinely populated on create and deleted on cleanup — a job never keeps a stale row once its volume is gone. `jobs.volume_device`/`.mount_point` remain unused (they're for a real *attachment*, which doesn't exist yet).
@@ -472,7 +472,7 @@ terraform apply
 **Files created/modified:**
 - `src/reconcile/job.rs` - `JobContext` (bundles the `CloudProvider`, `dry_run`, `resource_prefix`, `zone` every real-work handler needs); `VolumePending`/`VolumeDetaching` now conditionally advance based on a real call's outcome, everything else still advances unconditionally
 - `src/reconcile/orphan_scan.rs` (new) - the volume orphan scan described above
-- `src/reconcile/mod.rs` - `tick()` now also runs the orphan scan; `run()`/`run_with_interval()` take a `JobContext` instead of a bare `dry_run: bool`
+- `src/reconcile/mod.rs` - new `run_orphan_scan_loop()`, spawned by `run()` as a second background task on its own `ORPHAN_SCAN_INTERVAL` (5 min) cadence, independent of the job-tick loop's fallback/`Notify` timing; `run()`/`run_with_interval()` take a `JobContext` instead of a bare `dry_run: bool`
 - `src/providers/mod.rs` / `upcloud/volumes.rs` - add `list_volumes` (`GET /1.3/storage/normal`, endpoint already used during Phase 7's own live verification)
 - `src/volumes.rs` - add `StorageTier::class_name()` (the reverse of `parse()`, for recording what was actually used in `job_volumes.storage_class_name`)
 - `src/main.rs` - construct the real `JobContext` from config and pass it to `reconcile::run`
@@ -480,9 +480,11 @@ terraform apply
 
 **Testing:**
 ```bash
-cargo test   # 127 tests total, incl. mock-HTTP-server tests for both the
+cargo test   # 128 tests total, incl. mock-HTTP-server tests for both the
              # real-success and real-failure/retry paths on VolumePending
-             # and VolumeDetaching, and orphan_scan's filtering logic
+             # and VolumeDetaching, orphan_scan's filtering logic, and a
+             # dedicated test proving the orphan scan loop's cadence is
+             # genuinely periodic and independent of the job-tick loop
 
 # Real hands-on verification against the actual UpCloud API and a real
 # reconciliation loop, not just mocks: ran the shim locally with
@@ -765,7 +767,7 @@ curl -k https://kube-shim.brawer.ch/api/v1
 - Naming convention: `{resource_prefix}-{type}-{job-name}-{timestamp}-{random}`, using the `resource_prefix` config field reserved back in Phase 5 (default `"kube-shim"`) instead of a hardcoded literal — this is what lets multiple independent kube-shim instances (e.g. a personal one and a work one) run concurrently against the same cloud account without naming collisions or, more importantly, without one instance's orphan scan mistaking another instance's live resources for orphans and deleting them.
 - Orphan scan (Phase 8) updated to match on `resource_prefix` from config, not a hardcoded string, everywhere it currently does so.
 - Manual cleanup script: deletes orphaned resources matching this instance's `resource_prefix`, older than 7 days
-- Orphan scan runs periodically (every 5 min in reconcile loop)
+- Orphan scan already runs periodically on its own 5-minute cadence, decoupled from the job-tick loop — done in Phase 8 (`reconcile::run_orphan_scan_loop`/`ORPHAN_SCAN_INTERVAL`), ahead of schedule
 - Database tracks resource names for easy lookup
 
 **Files to create/modify:**

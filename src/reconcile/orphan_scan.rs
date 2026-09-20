@@ -4,12 +4,12 @@
 //! scanning joins this scan in Phase 9, once real worker VMs exist to
 //! leak in the first place.
 //!
-//! Runs on every reconciliation tick (`reconcile::tick`) rather than on
-//! its own separate cadence -- this account's resource count is tiny and
-//! `GET /1.3/storage/normal` is cheap, so there's no real cost to keeping
-//! this simple for now. A dedicated "every 5 min" schedule, if one ever
-//! turns out to be worth the extra moving part, is Phase 14/15's call to
-//! make once real per-job resource counts exist to judge that against.
+//! Driven by `reconcile::run_orphan_scan_loop` on its own
+//! `ORPHAN_SCAN_INTERVAL` cadence (five minutes), deliberately separate
+//! from the job-tick loop's own `Notify`-driven wake-ups -- see that
+//! constant's doc comment for why tying this to every job tick would mean
+//! listing the whole account's volumes far more often than any real leak
+//! could occur.
 
 use crate::reconcile::JobContext;
 use anyhow::Result;
