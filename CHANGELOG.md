@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.9](https://github.com/brawer/kube-shim/compare/v0.1.8...v0.1.9) (2026-09-25)
+
+
+### 🐞 Bug Fixes
+
+* cd to / before the podman-unshare chown step in provision.sh ([ba49500](https://github.com/brawer/kube-shim/commit/ba49500f998b7e8b7769b2b52a842b0a11a281e1))
+* provision.sh chdir failure when run from /root ([#34](https://github.com/brawer/kube-shim/issues/34)) ([ba49500](https://github.com/brawer/kube-shim/commit/ba49500f998b7e8b7769b2b52a842b0a11a281e1))
+
 ## [0.1.8](https://github.com/brawer/kube-shim/compare/v0.1.7...v0.1.8) (2026-09-20)
 
 
