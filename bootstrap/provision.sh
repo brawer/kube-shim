@@ -171,6 +171,12 @@ chown -R "${SERVICE_USER}:${SERVICE_USER}" "$USER_HOME/kube-shim-data" "$USER_HO
 # exists (it does, at this point in the script).
 echo "Fixing data directory ownership for the container's own UID 1000..."
 SERVICE_UID=$(id -u "$SERVICE_USER")
+# `sudo -u` doesn't change the working directory on its own, and this
+# script is typically run as root from $HOME (/root) -- verified hands-on
+# that sudo then fails with "cannot chdir to /root: Permission denied"
+# once it drops into $SERVICE_USER, which has no traversal access to
+# /root. `/` is readable/traversable by everyone, so cd there first.
+cd /
 sudo -u "$SERVICE_USER" -H env XDG_RUNTIME_DIR="/run/user/${SERVICE_UID}" \
     podman unshare chown -R 1000:1000 "$DATA_DIR"
 
