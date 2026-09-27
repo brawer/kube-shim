@@ -509,53 +509,86 @@ cargo test   # 128 tests total, incl. mock-HTTP-server tests for both the
 
 ---
 
-### Phase 9: VM Provisioning + Cloud-Init (Days 9-10)
+### Phase 9: VM Provisioning + Cloud-Init (Days 9-10) — ✅ Complete
 **Goal:** Launch actual UpCloud Cloud Server instances with containers inside.
 
-**Deliverables:**
-- Cloud-init script generation (bash, templated with proper escaping — job-supplied values such as image name/args/env must never be interpolated into shell unescaped; pass them as a base64-encoded blob decoded inside the VM instead)
-- Real VM creation, sized per-job using the resource-request lookup table from Phase 5 — and, per Phase 7's finding, treated as **asynchronous**: a distinct `VMCreating` (waiting for UpCloud to report the server actually running) state before `VMRunning`, not an assumption that the create call itself returns a ready server.
-- **Every worker VM gets UpCloud firewall rules attached at creation time**: all inbound denied except SSH (22) from the shim's own VPS IP; all outbound allowed. Because rule application lags the API call by roughly 1-2 minutes (Phase 7), the VM passes through an explicit `FirewallApplying` → `FirewallVerified` step (polling the rule's actual status, not just assuming success) before the reconciliation loop treats "unreachable from the internet" as true and lets the job proceed to running the container. This is what makes "unreachable from the internet, but can still reach it" true (Key Constraints) — no private networking, no NAT gateway, no extra routing needed; the VM keeps a normal public IP for outbound connectivity, it's just unreachable inbound from anyone but the shim, and the shim never trusts that before it's actually verified.
-- VM waits for volume attachment, mounts it
-- VM pulls container image, runs podman
-- Container write to /scratch
-- Status file: `/tmp/job-status.txt` (written by cloud-init on completion)
-- Container ID saved: `/tmp/container-id.txt`
-- Database: track worker_vm_id, worker_vm_name, worker_ssh_ip
+**Deliverables (as actually built — several real findings changed the shape of this from the original plan below):**
+- Cloud-init (`user_data`) script generation (`src/cloud_init.rs` + `bootstrap/cloud-init-template.sh`): job-supplied values (image, command, args, env) are base64-encoded and substituted into the template's `__KUBESHIM_..._B64__` placeholders (deliberately not `{{...}}`, which collides with `podman inspect --format`'s own Go-template syntax inside the same script) — never interpolated as raw shell text. Verified this isn't just theoretical: a test image name containing `'; rm -rf / #` round-trips as an inert literal string, never breaking out of the script.
+- **A real state-ordering bug found while implementing this, corrected before it ever shipped**: the original plan (and this doc's own "Reconciliation Loop State Machine" diagram, now fixed) had `VolumeAttaching`/`VolumeAttached` *before* any VM states — impossible for real, since `attach_volume` needs a server UUID that doesn't exist yet at that point. The real `STATE_SEQUENCE` creates the VM first, attaches the volume once it's running.
+- **A second real finding: firewall rules are requested immediately after server creation (`VMPending` → `FirewallApplying`), not after the VM is confirmed running.** Cloud-init starts executing the instant the VM boots, entirely outside the reconciliation loop's control — if firewall application waited for `VMCreating` to confirm `"started"`, the worker would sit fully open to the internet for its whole boot + `apt-get install podman` window. Applying the rules as early as the server UUID exists minimizes (doesn't eliminate — propagation still lags ~1-2 min, Phase 7) that exposure window. Verified hands-on that `create_firewall_rules` can be called on a server still in UpCloud's `maintenance` state — it's rejected with `SERVER_STATE_ILLEGAL` (a 409) until the server leaves that state, which the existing one-shot retry/backoff (`record_failed_attempt`) absorbs correctly with no special-casing needed; it just takes a few retries (~1 minute) in practice.
+- **A third real finding: UpCloud's cloud firewall (the server-level `firewall` attribute) defaults to `"off"` on creation** (their own docs describe `"on"` as the *modify*-endpoint's default, which only applies when a PUT omits the field — not to creation) — `create_server` now explicitly sets `firewall: "on"`, or `create_firewall_rules` would have had nothing to enforce.
+- **A fourth real finding: the shim's own public IP (used for the inbound-SSH-allow rule) is queried dynamically from UpCloud's own metadata service (`http://169.254.169.254/metadata/v1.json`, `src/metadata.rs`) at startup, not a static config value.** Motivated directly by this project's own history: `kube-shim.brawer.ch`'s public IPv4 already changed once mid-project (the server-migration work earlier in this log) — a hardcoded IP would have silently gone stale at exactly that moment. Fails safe: if the metadata service is unreachable (not running on UpCloud, e.g. local dev/CI) or returns no public IPv4, the worker gets no inbound-SSH-allow rule at all — fully closed, not a crash.
+- **Completion detection without SSH**: with no SSH client until Phase 10, the shim can't read `/tmp/job-status.txt` directly. Instead, cloud-init's own last action is `poweroff` once the container exits; `ContainerRunning`'s handler polls `get_server` and treats the transition away from `"started"` as "the job is done" — a real, SSH-free signal built entirely from primitives Phase 7 already had. Real exit-code retrieval (reading the status file over SSH) stays Phase 10's job, matching this module's own long-standing "mock what isn't buildable yet, document it" discipline.
+- **A fifth real finding, a genuine resource leak caught before it shipped**: `delete_server`'s original `storages=0` (a Phase 7 guess, never previously exercised for real) meant a worker's own boot disk — created together with the server, never referenced anywhere else — would never actually be cleaned up. Changed to `storages=1`; safe for the job's separate ephemeral scratch volume too, since `VolumeDetaching` (which detaches *and deletes* that volume) always runs before `VMTerminating` calls this.
+- **Orphan scanning (Phase 8) extended to servers**, exactly as that phase's own module doc promised: `CloudProvider::list_servers()` (new) + a `{resource_prefix}-worker-` title-prefix match against `jobs.worker_vm_id`, same shape as the existing volume scan.
+- Real VM creation, sized per-job using `workload::smallest_fitting_server_plan` (Phase 5) — defaults to the smallest known plan if the pod template sets no resource requests, matching that real Kubernetes treats them as optional too. Treated as **asynchronous** per Phase 7's finding: a distinct `VMCreating` state polls `get_server` until UpCloud actually reports it `started` (also where `jobs.worker_ssh_ip` gets recorded, from the response's public IPv4).
+- Refuses to create a worker VM at all (a normal failed-attempt retry, not a crash) if `upcloud.worker_ssh_public_keys` is empty — UpCloud's cloud-init templates don't support the `create_password` fallback, so an empty list would otherwise produce a VM with no way to log in at all (see "Errors and Fixes" in this log for exactly this happening the hard way during the server-migration work).
+- VM waits for volume attachment (`VolumeAttaching`, real `attach_volume`), the cloud-init script itself polls for the attached device (`/dev/vdb` or `/dev/sdb` — checks both rather than assuming one, verified hands-on it's the former on this account/template) and `mkfs.ext4`+mounts it at `/scratch` before starting the container.
+- VM installs podman (`apt-get install`, not preinstalled on the base template) and runs the container via `podman run -d`, writable at `/scratch`.
+- Status file: `/tmp/job-status.txt` (written by cloud-init at each step and on completion); container ID saved to `/tmp/container-id.txt` — both real, though not yet fetchable by the shim (Phase 10).
+- Database: `jobs.worker_vm_id`/`.worker_vm_name`/`.worker_ssh_ip` genuinely populated now; `.exit_code` stays unpopulated (needs the SSH-fetched status file, Phase 10).
 
-**Files to create/modify:**
-- **`src/providers/upcloud/servers.rs` and `firewall.rs` already have real, tested `create_server`/`get_server`/`delete_server`/`create_firewall_rules`/`list_firewall_rules` methods — built in Phase 7, ahead of schedule, same reasoning as Phase 8's volume methods.** This phase's actual remaining work is the create→poll-until-running loop and the apply→list-and-verify loop *using* those methods, both living in `src/reconcile/job.rs`, not in the provider client itself.
-- `src/cloud_init.rs` (new) - generate cloud-init script with proper escaping
-- `src/reconcile/job.rs` - add VM state steps (VMCreating, VMRunning, FirewallApplying, FirewallVerified, etc.), each calling the already-real `CloudProvider` methods
-- `bootstrap/cloud-init-template.sh` (new) - bash template for VM startup
-- `src/db/schema.sql` - **no changes expected** — `jobs.worker_vm_id`/`.worker_ssh_ip`/`.worker_vm_name`/`.exit_code` already exist, front-loaded in Phase 1's original schema (see Phase 6/7/8's own notes on this same pattern); verify against the current schema before assuming otherwise
+**Files created/modified:**
+- `src/cloud_init.rs` (new) — generates the real `user_data` script from a job's `containers[0]` (image/command/args/env), base64-encoding every job-supplied value
+- `bootstrap/cloud-init-template.sh` (new) — the actual bash template `cloud_init.rs` embeds via `include_str!` (this ships as a `FROM scratch` single-binary image — no filesystem access to `bootstrap/` at runtime, so the template must be compiled in, not read from disk)
+- `src/metadata.rs` (new) — `own_public_ipv4()`, queries UpCloud's per-server metadata service; see the fourth finding above
+- `src/reconcile/job.rs` — reordered `STATE_SEQUENCE` (`VMPending → FirewallApplying → FirewallVerified → VMCreating → VMRunning → VolumeAttaching → VolumeAttached → ContainerRunning`, then the existing cleanup states plus new `VMTerminating`); new handlers for every state above, each calling the already-real `CloudProvider` methods; `JobContext` gained `worker_template_uuid`, `worker_ssh_public_keys`, `own_public_ip`
+- `src/reconcile/orphan_scan.rs` — extended to also scan/clean untracked worker VMs (see finding above)
+- `src/providers/mod.rs` / `upcloud/servers.rs` — `CreateServerRequest.user_data`; `create_server` sets `firewall: "on"`; `delete_server` uses `storages=1` (see findings above); new `list_servers()` (`GET /server`, filtered by zone, mirroring `list_volumes`)
+- `src/config.rs` — new `[upcloud] worker_template_uuid` (defaults to the same Ubuntu 24.04 template this project's own shim instance boots from) and `worker_ssh_public_keys` (`#[serde(default)]` empty, so an already-deployed config keeps parsing — see "refuses to create" bullet above for what an empty list actually does at runtime)
+- `src/main.rs` — queries `metadata::own_public_ipv4()` once at startup (best-effort, like the UpCloud connectivity check), threads it plus the two new config fields into `JobContext`
+- `src/db/schema.sql` — **no changes**, confirming Phase 6/7/8's own repeated prediction one more time
+- `bootstrap/provision.sh` — unrelated one-line fix landed alongside this work (`cd /` before the `podman unshare chown` step; see this log's own entry on the server-migration troubleshooting)
 
-**Test scenario:**
+**Testing:**
 ```bash
-# Use busybox test image: writes 100MB to /scratch, exits 0
-# terraform apply (test job with busybox)
-# Watch:
-#   1. Volume created + mounted
-#   2. VM launched (watch UpCloud control panel)
-#   3. VM IP becomes available (wait ~1 min for boot)
-#   4. Firewall rules applied and verified (watch for the FirewallVerified
-#      transition specifically -- confirm the shim does NOT start the
-#      container before this)
-#   5. Container starts
-#   6. Writes to /scratch
-#   7. Container exits
-# Verify logs fetchable: ssh root@{ip} podman logs {container-id}
-# terraform destroy
-# Verify VM + volume deleted
+cargo test   # 143 lib tests + 19 integration tests, incl. mock-HTTP-server
+             # tests for every new real state (VMPending, FirewallApplying,
+             # FirewallVerified, VMCreating, VolumeAttaching, ContainerRunning,
+             # VMTerminating), the corrected state ordering, and the
+             # detach-failure-is-non-fatal retry-safety fix
 
-# Firewall:
-# From a machine that is NOT the shim's VPS, confirm every port on the
-# worker VM's public IP is unreachable (e.g. `nc -zv {worker-ip} 22` times out)
-# -- test this both immediately after FirewallVerified and again a few
-# minutes later, to catch a false-verified state
-# From inside the worker VM (via the shim's own SSH access), confirm outbound
-# still works, e.g. `curl -sI https://example.com` succeeds
+# Real hands-on verification against the actual UpCloud API, not just
+# mocks: ran the release binary locally (dry_run=false, real token) with a
+# CronJob (busybox, 1GB ephemeral volume, sh -c "sleep 45; echo ... >
+# /scratch/out.txt"). Six full job runs completed the entire real
+# pipeline end-to-end (volume create -> VM create -> firewall apply+verify
+# -> VM boot confirmed -> volume attach -> container run -> self-poweroff
+# detected -> volume detach+delete -> VM+bootdisk delete -> Archived),
+# confirmed via the real UpCloud API at each step, not just the shim's own
+# logs. Live external unreachability confirmed against an actively-running
+# worker: `nc -zv <worker-ip> 22` timed out from a machine that is not the
+# shim (own_public_ip was unknown in this local-dev environment, so *no*
+# inbound rule existed at all -- an even stronger check than "only the
+# shim can reach it"). Final account state after all six runs: zero
+# orphaned volumes, zero orphaned servers, zero orphaned boot disks --
+# only kube-shim.brawer.ch's own real production server and its own OS
+# disk remained.
+#
+# Two more real things this run surfaced, both benign and left
+# undocumented-as-bugs deliberately:
+#  - This UpCloud account's Developer plan caps DEV-1xCPU-1GB-10GB
+#    servers at 2 concurrent (kube-shim.brawer.ch's own production
+#    instance counts as one) -- scheduling several job runs close
+#    together (an artifact of this test's own every-minute CronJob
+#    schedule, not a realistic production cadence) queued the rest behind
+#    that quota, exactly as the existing one-shot retry logic is designed
+#    to handle; nothing was lost, everything eventually ran. Real
+#    concurrency/budget control is Phase 13's job.
+#  - The orphan scanner's 5-minute tick can race a job's own
+#    create-volume-then-record-it-locally window, seeing a legitimately
+#    in-progress volume as "untracked" before its `job_volumes` row
+#    commits. Observed exactly once, self-protected by UpCloud itself
+#    (the delete attempt failed with STORAGE_STATE_ILLEGAL, since a
+#    freshly-created volume is briefly not deletable) -- a real, narrow
+#    race worth knowing about, but Phase 11's ("Reconciliation Hardening")
+#    job to actually close, not this phase's.
 ```
+
+**Exit criteria:**
+- VMs launch sized per-job, receive real cloud-init, containers run only after firewall rules are verified applied — all verified live (see Testing above)
+- Every worker VM unreachable inbound from outside the shim's own IP but can still reach the internet outbound — verified live (external `nc` timeout; outbound proven implicitly by `apt-get install podman` and the container's own image pull succeeding inside every one of the six real runs)
+- VM + volume + boot disk all genuinely deleted, zero orphans — verified live across all six runs
 
 ---
 
@@ -567,6 +600,7 @@ cargo test   # 128 tests total, incl. mock-HTTP-server tests for both the
 - SSH to the worker VM using the `russh` client library (Phase 3) — never a subprocess — run `podman logs -f {container-id}` there, stream output back to the HTTP client
 - Fallback: return cached logs if job is not running
 - Handle SSH disconnects gracefully
+- **Also closes two gaps Phase 9 explicitly left open pending SSH access**: read `/tmp/job-status.txt`'s real exit code once `ContainerRunning` detects the worker VM has stopped (populating `jobs.exit_code`, unpopulated since Phase 1's original schema reserved it), and use that real exit code to finally split the `Succeeded`/`Failed` fork the job state machine has collapsed to always-`Succeeded` since Phase 6 (see `src/reconcile/job.rs`'s own module docs).
 
 **Files to create/modify:**
 - `src/api/logs.rs` (new) - log streaming handler
@@ -850,9 +884,11 @@ curl -k https://localhost:443/debug/status | jq '.total_cost, .budget_balance'
 | `src/ssh.rs` | SSH client built on `russh` | Create (Phase 10) |
 | `src/status_page.rs` | Public status page + `/healthz`/`/livez`/`/readyz`, served on `:443` | Create (Phase 14) |
 | `src/naming.rs` | `resource_prefix`-aware resource name generation | Create (Phase 15) |
-| `src/config.rs` | Configuration parsing | Phases 1-2, 4-5, 7 |
+| `src/config.rs` | Configuration parsing | Phases 1-2, 4-5, 7, 9 |
+| `src/cloud_init.rs` | Worker VM `user_data` generation (base64-escaped job values) | Create (Phase 9) |
+| `src/metadata.rs` | Shim's own public IPv4, via UpCloud's metadata service | Create (Phase 9) |
 | `config.toml` | Runtime config template | Create (Phase 1) |
-| `bootstrap/provision.sh` | One-time VPS setup | Phases 1-4 |
+| `bootstrap/provision.sh` | One-time VPS setup | Phases 1-4, 9 (small `cd /` fix) |
 | `bootstrap/cloud-init-template.sh` | VM startup script | Create (Phase 9) |
 | `bootstrap/cleanup-orphans.sh` | Manual cleanup script | Create (Phase 15) |
 
@@ -888,10 +924,12 @@ No dedicated cloud-provider crate: UpCloud has no official Rust SDK, so `src/pro
 ### Reconciliation Loop State Machine
 ```
 Created → BudgetWait (if needed) → VolumePending → VolumeCreating → VolumeCreated
-  → VolumeAttaching → VolumeAttached → VMPending → VMCreating → VMRunning
-  → FirewallApplying → FirewallVerified → ContainerRunning → Succeeded/Failed
-  → VolumeDetaching → VolumeDeleted → Archived
+  → VMPending → FirewallApplying → FirewallVerified → VMCreating → VMRunning
+  → VolumeAttaching → VolumeAttached → ContainerRunning → Succeeded/Failed
+  → VolumeDetaching → VolumeDeleted → VMTerminating → Archived
 ```
+
+**This order is corrected from an earlier draft of this diagram, which had `VolumeAttaching`/`VolumeAttached` before any VM states — impossible for real: `attach_volume` needs a server UUID that doesn't exist until a VM does (Phase 9's own real finding, building this).** `FirewallApplying` also runs immediately after `VMPending` (server creation), not after the VM is confirmed running — cloud-init starts executing the instant the VM boots, outside this loop's control, so requesting firewall rules as early as the server UUID exists minimizes the window a fresh worker sits open to the internet (Phase 9).
 
 Each state has:
 - Entry conditions (can we transition?)
@@ -902,7 +940,7 @@ Each state has:
 
 A job passes through `BudgetWait` before `VolumePending` if its estimated cost exceeds the current rolling budget balance (Phase 13); it's woken immediately when the balance changes (Phase 6's `Notify`), or retried on the fallback tick otherwise, rather than failed.
 
-`VMCreating → VMRunning` and `FirewallApplying → FirewallVerified` are both explicit poll-until-true steps, not assumed-synchronous transitions — UpCloud's server-create and firewall-rule-apply calls both return before the underlying state is actually true (Phase 7). The reconciliation loop never lets a container start before `FirewallVerified`, since that's the transition that actually makes "unreachable from the internet" true.
+`FirewallApplying → FirewallVerified` and `VMCreating → VMRunning` are both explicit poll-until-true steps, not assumed-synchronous transitions — UpCloud's firewall-rule-apply and server-create calls both return before the underlying state is actually true (Phase 7). `ContainerRunning → Succeeded` is a third: with no SSH client until Phase 10, the shim can't read the container's real exit status, so it instead polls `get_server` and treats the worker VM powering itself off (cloud-init's own last action, once the container exits) as the real, SSH-free completion signal (Phase 9). None of these three polling states currently time out — a resource that never reaches its target state polls forever, logged at `debug` only; closing that gap is explicitly Phase 11's job ("Reconciliation Hardening" already lists volume/VM/firewall timeouts as its own deliverable), matching the same gap Phase 8 already left for one-shot actions like `VolumePending`.
 
 A running job that exceeds its `activeDeadlineSeconds` (Phase 11) is force-killed and transitions to `Failed` with reason `DeadlineExceeded` — the same terminology real Kubernetes Jobs use for this exact situation.
 
@@ -954,7 +992,7 @@ The shim ships as a `FROM scratch` OCI image (Phase 3): a statically-linked musl
 - Phase 6: reconciliation loop advances job states automatically, and does so immediately (not after a 10s delay) for events it's told about directly
 - Phase 7: `CloudProvider` trait exists and `UpCloudProvider` is the only caller of it (no direct UpCloud HTTP calls elsewhere); logs show "DRY-RUN" messages, no actual resources created
 - Phase 8: small volumes created/deleted cleanly (verified live against the real UpCloud API: 3 real create→delete cycles, zero orphans left afterward), orphan scan finds/deletes untracked volumes carrying this instance's prefix while leaving tracked ones alone, a failed create/delete leaves the job in place and retries rather than wedging or leaking
-- Phase 9: VMs launch sized per-job, receive cloud-init, containers run only after firewall rules are verified applied; every worker VM is unreachable inbound from outside the shim's own IP but can still reach the internet outbound
+- Phase 9: VMs launch sized per-job, receive real cloud-init, containers run only after firewall rules are verified applied; every worker VM unreachable inbound from anywhere but the shim's own IP while still reaching the internet outbound — verified live across 6 full real job runs (volume+VM create → firewall apply/verify → container run → self-poweroff detected → full cleanup incl. boot disk), zero orphans left, external `nc` timeout confirmed against a live worker
 - Phase 10: kubectl logs -f works while container running, via `russh` (no `ssh` subprocess spawned by the shim)
 - Phase 11: 10+ chaos scenarios (kill shim, container crashes, etc.) with zero orphans and zero duplicate resources; a job that overruns `activeDeadlineSeconds` is force-killed and marked `Failed`/`DeadlineExceeded`, including when the shim was down at the moment the deadline passed
 - Phase 12: kubectl describe shows events, kubectl top shows metrics across all running jobs

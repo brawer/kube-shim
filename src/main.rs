@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use kube_shim::providers::upcloud::UpCloudProvider;
 use kube_shim::reconcile::JobContext;
-use kube_shim::{acme, app, config, db, reconcile, tls};
+use kube_shim::{acme, app, config, db, metadata, reconcile, tls};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -51,6 +51,21 @@ async fn main() -> Result<()> {
         Err(err) => tracing::warn!("UpCloud connectivity check failed (continuing anyway): {err}"),
     }
 
+    // The shim's own current public IPv4 (Phase 9), used to build worker
+    // VMs' inbound-SSH-allow firewall rule -- queried once here rather
+    // than per-tick, since it can't change while this process is running.
+    // Best-effort like the connectivity check above: `None` just means a
+    // freshly created worker VM gets no inbound SSH access at all (see
+    // src/metadata.rs's own docs), never a startup failure.
+    let own_public_ip = metadata::own_public_ipv4().await;
+    match &own_public_ip {
+        Some(ip) => tracing::info!("shim's own public IPv4: {ip}"),
+        None => tracing::warn!(
+            "could not determine the shim's own public IPv4 -- worker VMs will have no inbound \
+             SSH access until this is resolved"
+        ),
+    }
+
     // Reconciliation loop (Phase 6), running in the background for the
     // lifetime of the process. `notify` is also handed to the API router
     // below so a new CronJob can wake it immediately instead of waiting
@@ -61,6 +76,9 @@ async fn main() -> Result<()> {
         dry_run: cfg.upcloud.dry_run,
         resource_prefix: cfg.shim.resource_prefix.clone(),
         zone: cfg.upcloud.zone.clone(),
+        worker_template_uuid: cfg.upcloud.worker_template_uuid.clone(),
+        worker_ssh_public_keys: cfg.upcloud.worker_ssh_public_keys.clone(),
+        own_public_ip,
     };
     tokio::spawn(reconcile::run(pool.clone(), notify.clone(), job_context));
 
