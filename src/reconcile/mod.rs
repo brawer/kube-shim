@@ -129,6 +129,9 @@ mod tests {
             dry_run: true,
             resource_prefix: "kube-shim-test".to_string(),
             zone: "de-fra1".to_string(),
+            worker_template_uuid: "01000000-0000-4000-8000-000030240200".to_string(),
+            worker_ssh_public_keys: vec![],
+            own_public_ip: None,
         }
     }
 
@@ -242,6 +245,9 @@ mod tests {
             dry_run: false,
             resource_prefix: "kube-shim-test".to_string(),
             zone: "de-fra1".to_string(),
+            worker_template_uuid: "01000000-0000-4000-8000-000030240200".to_string(),
+            worker_ssh_public_keys: vec![],
+            own_public_ip: None,
         };
 
         // A short interval stands in for ORPHAN_SCAN_INTERVAL here --

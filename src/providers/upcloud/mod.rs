@@ -138,6 +138,10 @@ impl CloudProvider for UpCloudProvider {
         servers::delete_server(self, server_id).await
     }
 
+    async fn list_servers(&self, zone: &str) -> Result<Vec<Server>, ProviderError> {
+        servers::list_servers(self, zone).await
+    }
+
     async fn create_firewall_rules(
         &self,
         server_id: &str,

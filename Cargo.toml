@@ -52,6 +52,10 @@ async-trait = "0.1"
 # directory's own outbound HTTPS calls), so they're re-added explicitly.
 rustls-acme = { version = "0.15", default-features = false, features = ["ring", "tls12", "webpki-roots", "axum", "tower"] }
 tokio-stream = "0.1"
+# Phase 9: cloud-init user_data embeds job-supplied values (image/command/
+# args/env) as base64 blobs rather than interpolating them into shell text
+# directly -- see src/cloud_init.rs's own module docs for why.
+base64 = "0.22"
 
 [dev-dependencies]
 rcgen = "0.13"

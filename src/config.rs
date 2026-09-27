@@ -118,10 +118,34 @@ pub struct UpCloudConfig {
     /// -- so this is a single, shim-wide default for now, not per-job.
     #[serde(default = "default_upcloud_zone")]
     pub zone: String,
+    /// OS template UUID worker VMs' boot disks are cloned from (Phase 9).
+    /// UpCloud's public OS templates use fixed UUIDs shared across every
+    /// account (confirmed hands-on: this is the same UUID this project's
+    /// own shim instance boots from) -- not account-specific, so a stable
+    /// default covers the common case; only worth overriding for a
+    /// different OS/zone combination.
+    #[serde(default = "default_worker_template_uuid")]
+    pub worker_template_uuid: String,
+    /// SSH public keys installed on every worker VM's `root` user (Phase
+    /// 9). Required in practice: UpCloud's cloud-init-based templates
+    /// (which this project always uses) don't support the `create_password`
+    /// fallback at all, so an empty list here means a freshly created
+    /// worker VM has no working login whatsoever -- `VMPending`'s real
+    /// handler refuses to create a server at all rather than produce one
+    /// (see `src/reconcile/job.rs`). `#[serde(default)]` (empty) purely so
+    /// an already-deployed config.toml that predates this field keeps
+    /// parsing; a real deployment must set at least one key before any
+    /// CronJob can actually run for real (`dry_run = false`).
+    #[serde(default)]
+    pub worker_ssh_public_keys: Vec<String>,
 }
 
 fn default_upcloud_zone() -> String {
     "de-fra1".to_string()
+}
+
+fn default_worker_template_uuid() -> String {
+    "01000000-0000-4000-8000-000030240200".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -359,6 +383,36 @@ interval_secs = 10
         assert!(config.server.acme_contact_email.is_none());
         assert_eq!(config.server.acme_challenge_port, 8080);
         assert_eq!(config.server.acme_cache_dir, "acme-cache");
+    }
+
+    #[test]
+    fn test_worker_fields_default_when_absent() {
+        // Same backward-compatibility requirement as every other field
+        // added after the already-deployed kube-shim.brawer.ch config.toml
+        // was first written.
+        let config: Config = toml::from_str(&base_toml()).expect("Failed to parse config");
+        assert_eq!(
+            config.upcloud.worker_template_uuid,
+            "01000000-0000-4000-8000-000030240200"
+        );
+        assert!(config.upcloud.worker_ssh_public_keys.is_empty());
+    }
+
+    #[test]
+    fn test_worker_fields_explicit() {
+        let toml_str = base_toml().replace(
+            "dry_run = true",
+            "dry_run = true\nworker_template_uuid = \"01000000-0000-4000-8000-000030200100\"\nworker_ssh_public_keys = [\"ssh-ed25519 AAAA test\"]",
+        );
+        let config: Config = toml::from_str(&toml_str).expect("Failed to parse config");
+        assert_eq!(
+            config.upcloud.worker_template_uuid,
+            "01000000-0000-4000-8000-000030200100"
+        );
+        assert_eq!(
+            config.upcloud.worker_ssh_public_keys,
+            vec!["ssh-ed25519 AAAA test".to_string()]
+        );
     }
 
     #[test]

@@ -21,8 +21,19 @@ struct ServerParams {
     hostname: String,
     plan: String,
     metadata: String,
+    /// Hardcoded "on", not configurable: every worker VM must have
+    /// UpCloud's own cloud firewall active from the moment it exists, or
+    /// `create_firewall_rules` (Phase 9) has nothing to enforce -- verified
+    /// hands-on that a freshly created server otherwise comes back with
+    /// `"firewall": "off"` despite UpCloud's own docs describing "on" as
+    /// the *modify*-endpoint's default (that default only applies to a
+    /// PUT that omits the field, not to server creation).
+    firewall: &'static str,
     login_user: LoginUser,
     storage_devices: StorageDevices,
+    /// UpCloud's own "server setup script" -- see `CreateServerRequest`'s
+    /// own docs on why this is plain text, not base64/a URL.
+    user_data: String,
 }
 
 #[derive(Serialize)]
@@ -116,6 +127,7 @@ pub(super) async fn create_server(
             hostname: req.hostname,
             plan: req.plan,
             metadata: "yes".to_string(),
+            firewall: "on",
             login_user: LoginUser {
                 username: "root".to_string(),
                 ssh_keys: SshKeys {
@@ -131,6 +143,7 @@ pub(super) async fn create_server(
                     tier: "standard",
                 }],
             },
+            user_data: req.user_data,
         },
     };
     let response: ServerEnvelope = provider
@@ -153,15 +166,68 @@ pub(super) async fn delete_server(
     provider: &UpCloudProvider,
     server_id: &str,
 ) -> Result<(), ProviderError> {
-    // storages=0: this project always deletes ephemeral volumes through
-    // its own separate delete_volume() call, not implicitly here -- see
-    // CloudProvider's own docs on why volume and server lifecycle stay
-    // independent operations.
+    // storages=1: deletes the server's *own* boot disk along with it --
+    // real finding from Phase 9, correcting Phase 7's original guess of
+    // storages=0. The boot disk is created together with the server
+    // (`create_server`'s own `storage_devices`) and never referenced by
+    // anything else, so nothing would ever clean it up otherwise. This is
+    // safe for the job's separate *ephemeral* scratch volume too: that one
+    // is a genuinely independent resource with its own tracked lifecycle
+    // (`job_volumes`, `delete_volume`), but the reconciliation pipeline
+    // (`reconcile::job`) always runs `VolumeDetaching` -- which detaches
+    // *and deletes* that volume -- before `VMTerminating` calls this, so
+    // by the time a real delete_server call happens, nothing but the boot
+    // disk is left attached for storages=1 to catch.
     provider
         .send_no_content(
-            provider.request(Method::DELETE, &format!("/server/{server_id}?storages=0")),
+            provider.request(Method::DELETE, &format!("/server/{server_id}?storages=1")),
         )
         .await
+}
+
+#[derive(Deserialize)]
+struct ServerListEnvelope {
+    servers: ServerList,
+}
+
+#[derive(Deserialize)]
+struct ServerList {
+    server: Vec<ServerListEntry>,
+}
+
+/// `GET /server`'s list entries are a different (smaller) shape than a
+/// single server's own representation -- no `ip_addresses` at all, so
+/// orphan scanning (Phase 9's actual caller) only gets id/title/state/zone
+/// out of this, which is all it needs to decide what's untracked.
+#[derive(Deserialize)]
+struct ServerListEntry {
+    uuid: String,
+    title: String,
+    state: String,
+    zone: String,
+}
+
+pub(super) async fn list_servers(
+    provider: &UpCloudProvider,
+    zone: &str,
+) -> Result<Vec<Server>, ProviderError> {
+    let response: ServerListEnvelope = provider
+        .send_json(provider.request(Method::GET, "/server"))
+        .await?;
+
+    Ok(response
+        .servers
+        .server
+        .into_iter()
+        .filter(|s| s.zone == zone)
+        .map(|s| Server {
+            id: s.uuid,
+            title: s.title,
+            state: s.state,
+            public_ipv4: None,
+            public_ipv6: None,
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -180,6 +246,7 @@ mod tests {
             template_uuid: "01000000-0000-4000-8000-000030240200".to_string(),
             boot_disk_size_gb: 10,
             ssh_public_keys: vec!["ssh-ed25519 AAAA... test".to_string()],
+            user_data: "#!/bin/bash\necho hi\n".to_string(),
         }
     }
 
@@ -252,5 +319,39 @@ mod tests {
             err,
             crate::providers::ProviderError::AuthenticationFailed(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_create_server_request_sets_firewall_on_and_user_data() {
+        let app = axum::Router::new().route(
+            "/1.3/server",
+            axum::routing::post(|body: String| async move {
+                assert!(body.contains("\"firewall\":\"on\""));
+                assert!(body.contains("echo hi"));
+                Json(json!({"server": {"uuid": "003a02c7", "title": "t", "state": "maintenance"}}))
+            }),
+        );
+        let provider = mock_server(app).await;
+
+        provider.create_server(sample_request()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_list_servers_filters_by_zone() {
+        let app = axum::Router::new().route(
+            "/1.3/server",
+            get(|| async {
+                Json(json!({"servers": {"server": [
+                    {"uuid": "a", "title": "kube-shim-worker-a", "state": "started", "zone": "de-fra1"},
+                    {"uuid": "b", "title": "kube-shim-worker-b", "state": "started", "zone": "fi-hel1"}
+                ]}}))
+            }),
+        );
+        let provider = mock_server(app).await;
+
+        let servers = provider.list_servers("de-fra1").await.unwrap();
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].id, "a");
     }
 }

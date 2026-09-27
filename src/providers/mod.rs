@@ -64,6 +64,13 @@ pub struct CreateServerRequest {
     /// attached later via `attach_volume`.
     pub boot_disk_size_gb: u32,
     pub ssh_public_keys: Vec<String>,
+    /// UpCloud's own "server setup script" mechanism (their `user_data`
+    /// field): a plain-text shell script (not base64, not a URL -- just
+    /// the literal script body) executed as root on first boot. Phase 9's
+    /// `src/cloud_init.rs` builds this; see its own docs for why
+    /// job-supplied values inside it are never interpolated as raw shell
+    /// text.
+    pub user_data: String,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +157,12 @@ pub trait CloudProvider: Send + Sync {
     /// builds the poll loop; this method is the primitive it polls with.
     async fn get_server(&self, server_id: &str) -> Result<Server, ProviderError>;
     async fn delete_server(&self, server_id: &str) -> Result<(), ProviderError>;
+    /// Every server that currently exists in `zone` -- not filtered by
+    /// title/prefix, same convention as `list_volumes`. Added in Phase 9
+    /// specifically so orphan scanning (Phase 8) can find an *untracked*
+    /// worker VM, now that real worker VMs exist to leak in the first
+    /// place.
+    async fn list_servers(&self, zone: &str) -> Result<Vec<Server>, ProviderError>;
 
     /// Replaces every firewall rule on the server with `rules`. UpCloud's
     /// own rule application is asynchronous *in effect*: this call
