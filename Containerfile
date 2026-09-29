@@ -41,6 +41,11 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock .
 COPY src src
 COPY tests tests
+# Only the one file src/cloud_init.rs actually embeds via include_str! at
+# compile time (Phase 9) -- not the rest of bootstrap/ (provision.sh etc.),
+# which the compiled binary has no use for, matching this file's own
+# explicit-allowlist-over-COPY-. rationale above.
+COPY bootstrap/cloud-init-template.sh bootstrap/cloud-init-template.sh
 
 RUN cargo build --release --locked
 RUN cargo test --release --locked
