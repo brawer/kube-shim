@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.11](https://github.com/brawer/kube-shim/compare/v0.1.10...v0.1.11) (2026-09-29)
+
+
+### 🆕 Enhancements
+
+* real SSH-based log streaming and exit-code capture (Phase 10) ([#39](https://github.com/brawer/kube-shim/issues/39)) ([42b9b22](https://github.com/brawer/kube-shim/commit/42b9b221d9cbcd851ca9528006661587a172d6e7))
+
 ## [0.1.10](https://github.com/brawer/kube-shim/compare/v0.1.9...v0.1.10) (2026-09-29)
 
 
