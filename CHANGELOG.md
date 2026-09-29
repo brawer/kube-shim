@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.10](https://github.com/brawer/kube-shim/compare/v0.1.9...v0.1.10) (2026-09-29)
+
+
+### 🐞 Bug Fixes
+
+* Containerfile missing bootstrap/cloud-init-template.sh ([#37](https://github.com/brawer/kube-shim/issues/37)) ([2ad092b](https://github.com/brawer/kube-shim/commit/2ad092b63ab54b15021198af775a12e6fddc8681))
+* Containerfile release build missing bootstrap/cloud-init-template.sh ([2ad092b](https://github.com/brawer/kube-shim/commit/2ad092b63ab54b15021198af775a12e6fddc8681))
+
 ## [0.1.9](https://github.com/brawer/kube-shim/compare/v0.1.8...v0.1.9) (2026-09-27)
 
 
