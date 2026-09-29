@@ -21,6 +21,10 @@ async fn test_router() -> axum::Router {
             expires_at: None,
         }]),
         Arc::new(tokio::sync::Notify::new()),
+        Arc::new(kube_shim::ssh::WorkerSshConfig {
+            private_key: String::new(),
+            port: kube_shim::ssh::SSH_PORT,
+        }),
     )
 }
 

@@ -126,6 +126,8 @@ mod tests {
             worker_template_uuid: "01000000-0000-4000-8000-000030240200".to_string(),
             worker_ssh_public_keys: vec![],
             own_public_ip: None,
+            worker_ssh_private_key: String::new(),
+            worker_ssh_port: crate::ssh::SSH_PORT,
         }
     }
 

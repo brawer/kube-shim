@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use kube_shim::providers::upcloud::UpCloudProvider;
 use kube_shim::reconcile::JobContext;
-use kube_shim::{acme, app, config, db, metadata, reconcile, tls};
+use kube_shim::{acme, app, config, db, metadata, reconcile, ssh, tls};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -79,11 +79,25 @@ async fn main() -> Result<()> {
         worker_template_uuid: cfg.upcloud.worker_template_uuid.clone(),
         worker_ssh_public_keys: cfg.upcloud.worker_ssh_public_keys.clone(),
         own_public_ip,
+        worker_ssh_private_key: cfg.upcloud.worker_ssh_private_key.clone(),
+        worker_ssh_port: ssh::SSH_PORT,
     };
     tokio::spawn(reconcile::run(pool.clone(), notify.clone(), job_context));
 
-    // Build router
-    let router = app::build_router(pool, Arc::new(cfg.server.api_tokens.clone()), notify);
+    // Build router. The worker SSH private key is handed in separately
+    // (not via JobContext, which is reconcile-loop-only) -- `api::logs`
+    // (Phase 10) needs it too, for live log streaming/one-shot fetches
+    // while a job is still running.
+    let worker_ssh = Arc::new(ssh::WorkerSshConfig {
+        private_key: cfg.upcloud.worker_ssh_private_key.clone(),
+        port: ssh::SSH_PORT,
+    });
+    let router = app::build_router(
+        pool,
+        Arc::new(cfg.server.api_tokens.clone()),
+        notify,
+        worker_ssh,
+    );
 
     let addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port)
         .parse()

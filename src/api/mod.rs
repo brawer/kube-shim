@@ -1,4 +1,5 @@
 pub mod cronjob;
+pub mod logs;
 pub mod secret;
 
 #[cfg(test)]

@@ -31,6 +31,10 @@ async fn start_server(api_tokens: Vec<ApiToken>) -> String {
         pool,
         Arc::new(api_tokens),
         Arc::new(tokio::sync::Notify::new()),
+        Arc::new(kube_shim::ssh::WorkerSshConfig {
+            private_key: String::new(),
+            port: kube_shim::ssh::SSH_PORT,
+        }),
     );
 
     let std_listener = StdTcpListener::bind("127.0.0.1:0").unwrap();

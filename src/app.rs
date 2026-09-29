@@ -2,7 +2,7 @@
 //! only in `main.rs`) so integration tests exercise the exact same router
 //! construction the real binary uses, instead of a hand-rolled duplicate.
 
-use crate::{api, auth, config};
+use crate::{api, auth, config, ssh};
 use axum::{
     http::{HeaderName, HeaderValue},
     middleware,
@@ -32,11 +32,14 @@ pub fn server_header_layer() -> SetResponseHeaderLayer<HeaderValue> {
 /// wake the loop immediately on a new `CronJob` instead of waiting up to
 /// `reconcile::FALLBACK_INTERVAL`), and `Extension` lets it reach just
 /// that one handler without changing every other handler's `State<...>`
-/// extractor.
+/// extractor. `worker_ssh` (Phase 10) is the same pattern, for
+/// `api::logs`'s own need to SSH into a worker VM directly, independent
+/// of the reconciliation loop's own `JobContext`.
 pub fn build_router(
     pool: sqlx::SqlitePool,
     api_tokens: Arc<Vec<config::ApiToken>>,
     notify: Arc<Notify>,
+    worker_ssh: Arc<ssh::WorkerSshConfig>,
 ) -> Router {
     Router::new()
         // Discovery endpoints
@@ -53,6 +56,12 @@ pub fn build_router(
             "/api/v1/namespaces/:namespace/secrets/:name",
             get(api::secret::get_secret).delete(api::secret::delete_secret),
         )
+        // Pod logs (Phase 10) -- one pod per job run, so "pod name" is a
+        // job's own `name` directly.
+        .route(
+            "/api/v1/namespaces/:namespace/pods/:name/log",
+            get(api::logs::get_pod_log),
+        )
         // CronJobs API
         .route(
             "/apis/batch/v1/namespaces/:namespace/cronjobs",
@@ -63,6 +72,7 @@ pub fn build_router(
             get(api::cronjob::get_cronjob).delete(api::cronjob::delete_cronjob),
         )
         .layer(Extension(notify))
+        .layer(Extension(worker_ssh))
         .layer(CorsLayer::permissive())
         // Runs before CORS and before any handler, so an unauthenticated
         // request never reaches application logic at all.

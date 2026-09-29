@@ -138,6 +138,18 @@ pub struct UpCloudConfig {
     /// CronJob can actually run for real (`dry_run = false`).
     #[serde(default)]
     pub worker_ssh_public_keys: Vec<String>,
+    /// The private half of (one of) `worker_ssh_public_keys`, PEM-encoded,
+    /// inline in `config.toml` -- same plaintext-at-rest convention as
+    /// `upcloud.token` and `server.api_tokens` (see this plan's own
+    /// "Authentication" section for why that's a deliberate choice, not an
+    /// oversight). Used by the shim itself to SSH into a worker VM for real
+    /// log streaming and exit-code capture (Phase 10). `#[serde(default)]`
+    /// (empty) so an already-deployed config.toml keeps parsing; with it
+    /// empty, `ContainerRunning` can't detect real completion and degrades
+    /// to marking the job `Succeeded` with no exit code/logs (see
+    /// `src/reconcile/job.rs`).
+    #[serde(default)]
+    pub worker_ssh_private_key: String,
 }
 
 fn default_upcloud_zone() -> String {
@@ -396,13 +408,14 @@ interval_secs = 10
             "01000000-0000-4000-8000-000030240200"
         );
         assert!(config.upcloud.worker_ssh_public_keys.is_empty());
+        assert!(config.upcloud.worker_ssh_private_key.is_empty());
     }
 
     #[test]
     fn test_worker_fields_explicit() {
         let toml_str = base_toml().replace(
             "dry_run = true",
-            "dry_run = true\nworker_template_uuid = \"01000000-0000-4000-8000-000030200100\"\nworker_ssh_public_keys = [\"ssh-ed25519 AAAA test\"]",
+            "dry_run = true\nworker_template_uuid = \"01000000-0000-4000-8000-000030200100\"\nworker_ssh_public_keys = [\"ssh-ed25519 AAAA test\"]\nworker_ssh_private_key = \"-----BEGIN OPENSSH PRIVATE KEY-----\\ntest\\n-----END OPENSSH PRIVATE KEY-----\"",
         );
         let config: Config = toml::from_str(&toml_str).expect("Failed to parse config");
         assert_eq!(
@@ -413,6 +426,10 @@ interval_secs = 10
             config.upcloud.worker_ssh_public_keys,
             vec!["ssh-ed25519 AAAA test".to_string()]
         );
+        assert!(config
+            .upcloud
+            .worker_ssh_private_key
+            .contains("BEGIN OPENSSH PRIVATE KEY"));
     }
 
     #[test]

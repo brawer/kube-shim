@@ -76,6 +76,17 @@ pub fn unauthorized(message: impl Into<String>) -> axum::response::Response {
     status_error(StatusCode::UNAUTHORIZED, "Unauthorized", message)
 }
 
+/// 404 Not Found, `reason: NotFound`: no object of this kind exists with
+/// this name/namespace -- the same shape a real cluster returns for
+/// `kubectl get`/`kubectl logs` against a resource that doesn't exist.
+pub fn not_found(kind: &str, name: &str) -> axum::response::Response {
+    status_error(
+        StatusCode::NOT_FOUND,
+        "NotFound",
+        format!("{kind} \"{name}\" not found"),
+    )
+}
+
 /// 422 Unprocessable Entity, `reason: Invalid`: a field's value isn't one
 /// of the values this API supports for it -- the same shape a real cluster
 /// uses for an unsupported enum-style field value (e.g. an unknown
@@ -122,6 +133,22 @@ mod tests {
         assert_eq!(json["code"], 401);
         assert_eq!(json["message"], "authentication required");
         assert!(json["metadata"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_not_found_shape() {
+        let response = not_found("Pod", "osmdiffs-weekly-123");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["reason"], "NotFound");
+        assert_eq!(json["code"], 404);
+        assert!(json["message"]
+            .as_str()
+            .unwrap()
+            .contains("osmdiffs-weekly-123"));
     }
 
     #[tokio::test]
