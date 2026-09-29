@@ -11,6 +11,7 @@ pub mod k8s_status;
 pub mod metadata;
 pub mod providers;
 pub mod reconcile;
+pub mod ssh;
 pub mod tls;
 pub mod volumes;
 pub mod workload;

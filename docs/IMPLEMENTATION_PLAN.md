@@ -592,35 +592,72 @@ cargo test   # 143 lib tests + 19 integration tests, incl. mock-HTTP-server
 
 ---
 
-### Phase 10: Log Streaming (Days 10-11)
+### Phase 10: Log Streaming (Days 10-11) — ✅ Complete
 **Goal:** Support `kubectl logs -f` for live monitoring.
 
-**Deliverables:**
-- HTTP endpoint: `GET /api/v1/namespaces/default/pods/{name}/log?follow=true`
-- SSH to the worker VM using the `russh` client library (Phase 3) — never a subprocess — run `podman logs -f {container-id}` there, stream output back to the HTTP client
-- Fallback: return cached logs if job is not running
-- Handle SSH disconnects gracefully
-- **Also closes two gaps Phase 9 explicitly left open pending SSH access**: read `/tmp/job-status.txt`'s real exit code once `ContainerRunning` detects the worker VM has stopped (populating `jobs.exit_code`, unpopulated since Phase 1's original schema reserved it), and use that real exit code to finally split the `Succeeded`/`Failed` fork the job state machine has collapsed to always-`Succeeded` since Phase 6 (see `src/reconcile/job.rs`'s own module docs).
+**Deliverables (as actually built):**
+- Real SSH client (`src/ssh.rs`, on `russh` 0.63 — never a subprocess, matching the `FROM scratch` image having no `ssh` binary to shell out to even if that were wanted): `exec_once` (buffered, for quick checks/one-shot fetches) and `exec_stream` (forwards each chunk of stdout as it arrives, for live following). **Host key verification is deliberately skipped** — a worker VM is created by this same process moments earlier with no prior channel to have received its real host key through, so there's no TOFU-meaningful "first contact"; see `src/ssh.rs`'s own module docs for the full reasoning (same "plaintext secrets, deliberately" spirit as this plan's own "Authentication" section).
+- **`russh`'s default crypto backend (`aws-lc-rs`) needs cmake — swapped for `ring`, the same substitution `rustls-acme` already makes (Phase 3/4) for the exact same musl/Alpine reason.**
+- **A real architectural conflict found while building this, resolved by reworking Phase 9's own completion mechanism, not extending it:** Phase 9's `ContainerRunning` detected completion by watching the worker VM power itself off (cloud-init's last action) — but an SSH connection is obviously impossible once the VM is off! `bootstrap/cloud-init-template.sh` no longer runs `poweroff` at all; it writes `/tmp/exit-code` as its last action and leaves the VM running (and billing). `ContainerRunning` now SSHes in, polls for that file, and once found, fetches the real exit code *and* the full container logs (`podman logs {id}`) before choosing `"Succeeded"` (exit 0) or `"Failed"` (anything else) for real — the fork `src/reconcile/job.rs` has collapsed to always-`"Succeeded"` since Phase 6. This is a deliberate trade, documented rather than silently accepted: a shim that crashes between the container finishing and noticing it now leaves the worker running indefinitely, where Phase 9's mechanism would have self-terminated on a timer. Closing that gap for real is Phase 11's job (already scoped to add volume/VM/firewall timeouts) rather than a second, cruder timeout grown here just for this transition.
+- `jobs.cached_logs` (new column, via the real migration mechanism Phase 6 built — its first actual use): the full container log, captured once over SSH right before the worker is torn down, so `kubectl logs` still works once the VM is gone the same way a real Kubernetes pod's logs outlive the pod itself for a while. `jobs.exit_code` (already reserved since Phase 1) is finally populated for real too.
+- HTTP endpoint `GET /api/v1/namespaces/:namespace/pods/:name/log?follow={bool}` — one pod per job run, so "pod name" is a job's own `name` directly; no separate `Job`/`Pod` resource hierarchy exists to resolve through.
+- **Live SSH is only ever attempted while `status == "ContainerRunning"`, a real safety finding, not just an optimization.** `jobs.worker_ssh_ip` is never cleared once a job moves on, but the worker it pointed at is deleted a few states later — and since host-key verification accepts *any* key, blindly SSHing to a stale IP could silently succeed against a completely unrelated machine that's since been handed the same address, rather than erroring. Every other case (including a live SSH attempt that itself fails) falls back to `jobs.cached_logs`; no cache and not running is a real 404.
+- Handles SSH disconnects gracefully: the live-follow stream just ends (no panic, no hang) when the remote command exits or the connection drops.
 
-**Files to create/modify:**
-- `src/api/logs.rs` (new) - log streaming handler
-- `src/api/mod.rs` - register logs endpoint
-- `src/ssh.rs` (new) - SSH client built on `russh`, no subprocess
+**Files created/modified:**
+- `src/ssh.rs` (new) — `exec_once`/`exec_stream`, `WorkerSshConfig` (the HTTP layer's own SSH credentials, separate from `reconcile::job::JobContext`)
+- `src/api/logs.rs` (new) — the log handler described above, plus its own tests (in-crate, not `tests/*.rs` — see the file's own note on why: a `#[cfg(test)]` mock SSH server is invisible to an external integration-test binary)
+- `src/api/mod.rs` / `src/app.rs` — register the route; `worker_ssh` threaded through as an `Extension`, same pattern `notify` already uses
+- `src/reconcile/job.rs` — `ContainerRunning` rewritten around real SSH polling (see above); `JobContext` gained `worker_ssh_private_key`/`worker_ssh_port`; `next_state` gained the `"Failed"` lateral branch
+- `bootstrap/cloud-init-template.sh` — no more `poweroff`; writes `/tmp/exit-code` instead
+- `src/config.rs` — new `[upcloud] worker_ssh_private_key` (`#[serde(default)]` empty, same backward-compat discipline as every prior config addition)
+- `src/db/migrations.rs` — `ADDED_COLUMNS` gets its first real, non-empty entry: `("jobs", "cached_logs", "TEXT")`
+- `src/k8s_status.rs` — new `not_found()` builder
 
 **Testing:**
 ```bash
-# Start a job
-terraform apply
-# In another terminal
-kubectl logs -f osmdiffs-weekly-test
-# Should see:
-# "Waiting for volume..."
-# "Found device: /dev/sdc"
-# "Mounting volume..."
-# "Starting container..."
-# ... container output ...
-# "Exit code: 0"
+cargo test   # 157 lib tests + 19 integration tests, including a real
+             # local SSH server (russh's own server API, not a mocked
+             # transport -- same "real local server" pattern every other
+             # phase's own tests already use) exercising exec_once/
+             # exec_stream, ContainerRunning's real completion detection,
+             # and every api::logs branch (404, cached fallback, live
+             # one-shot, live follow, stale-IP-after-completion safety)
+
+# Real hands-on verification, not just mocks:
+#  - A real musl/Alpine container build (`podman build -f Containerfile .`,
+#    the exact CI build) succeeded, including `cargo test --release`
+#    *inside* the container -- confirms the whole suite, ring-backed
+#    russh included, passes in the real release environment too, not
+#    just the host toolchain.
+#  - The SSH client itself, against a real OpenSSH server (not just
+#    russh's own, already covered by the unit tests above): a throwaway
+#    example connected kube_shim::ssh directly to kube-shim.brawer.ch's
+#    real sshd using the real deploy key. exec_once correctly captured
+#    multi-command stdout and both a zero and a deliberately-nonzero
+#    (`exit 7`) exit status; exec_stream correctly forwarded three
+#    separate chunks as they arrived (`sleep 1` between each on the
+#    remote side), not just once buffered at the end.
+#  - own_public_ip is only ever known when actually running on UpCloud
+#    (src/metadata.rs) -- attempting the *full* pipeline (real worker +
+#    real firewall + real SSH completion detection together) from a
+#    local laptop run therefore gets no inbound-SSH-allow rule at all
+#    (a real, safe-default finding in its own right -- confirmed
+#    behaving exactly as designed, not a bug), which also means the shim
+#    itself can't reach the worker either. Getting a genuine end-to-end
+#    run of the *combination* would need either a real production
+#    deployment or a cross-compiled binary running on a second UpCloud
+#    box, neither pursued in this pass -- each of the pipeline's real
+#    pieces (SSH-to-real-sshd above; firewall and cloud-init mechanics
+#    already proven hands-on in Phase 9) is independently verified for
+#    real, but not yet re-confirmed together in one live run. Worth
+#    confirming on the very first real production job after this ships.
 ```
+
+**Exit criteria:**
+- `kubectl logs -f` works while a container is genuinely running, via real `russh` (no `ssh` subprocess anywhere in the image) — verified against a real OpenSSH server
+- A completed job's logs remain fetchable after its worker VM is deleted (`jobs.cached_logs`)
+- Real exit code drives a real `Succeeded`/`Failed` outcome — logic verified extensively (real local SSH server); full live pipeline confirmation deferred to the first real production run (see Testing above)
 
 ---
 
@@ -870,18 +907,20 @@ curl -k https://localhost:443/debug/status | jq '.total_cost, .budget_balance'
 | `deploy/kube-shim.container` | Podman quadlet unit (image ref, bind mounts, ports) | Phases 3, 4, 14 |
 | `src/tls.rs` | TLS config: self-signed bootstrap/fallback (Phase 1, unchanged since) | Phase 1 |
 | `src/acme.rs` | ACME (Let's Encrypt) issuance/renewal + `:80` HTTP-01 challenge router | Create (Phase 4) |
-| `src/api/*.rs` | Kubernetes API handlers | Phases 1, 5, 12 |
+| `src/api/*.rs` | Kubernetes API handlers | Phases 1, 5, 10, 12 |
 | `src/volumes.rs` | `storageClassName` → provider storage-tier lookup | Create (Phase 5) |
 | `src/workload.rs` | `WorkloadKind` abstraction (CronJob now, Deployment later) | Create (Phase 5) |
 | `src/admission.rs` | `activeDeadlineSeconds`-required policy check | Create (Phase 5) |
 | `src/db/schema.sql` | SQLite schema | Phases 1, 5-6, 8-9, 11-13 |
-| `src/reconcile/*.rs` | State machine loop, `Notify`-based wake-up, `activeDeadlineSeconds` enforcement | Create (Phases 6, 8-9, 11, 13) |
+| `src/db/migrations.rs` | `ALTER TABLE`-based column migrations for already-existing tables | Create (Phase 6); first real use (Phase 10) |
+| `src/reconcile/*.rs` | State machine loop, `Notify`-based wake-up, `activeDeadlineSeconds` enforcement | Create (Phases 6, 8-10, 11, 13) |
 | `src/providers/*.rs` | `CloudProvider` trait + UpCloud implementation | Create (Phases 7-9, 13) |
 | `src/providers/upcloud/firewall.rs` | Firewall rules for worker VMs (create + list, both real since Phase 7; poll-until-applied logic itself is Phase 9) | Create (Phase 7) |
 | `src/currency.rs` | ECB daily exchange-rate sync + conversion to `main_currency` | Create (Phase 13) |
 | `src/pricing/*.rs` | Cost tracking + rolling budget guard, in `main_currency` | Create (Phase 13) |
 | `src/api/cost_report.rs` | CSV cost report, grouped by job label | Create (Phase 13) |
-| `src/ssh.rs` | SSH client built on `russh` | Create (Phase 10) |
+| `src/ssh.rs` | SSH client built on `russh` (`exec_once`/`exec_stream`), no host-key verification (by design) | Create (Phase 10) |
+| `src/api/logs.rs` | `kubectl logs`/`-f`: live SSH while `ContainerRunning`, `jobs.cached_logs` fallback otherwise | Create (Phase 10) |
 | `src/status_page.rs` | Public status page + `/healthz`/`/livez`/`/readyz`, served on `:443` | Create (Phase 14) |
 | `src/naming.rs` | `resource_prefix`-aware resource name generation | Create (Phase 15) |
 | `src/config.rs` | Configuration parsing | Phases 1-2, 4-5, 7, 9 |
@@ -925,11 +964,13 @@ No dedicated cloud-provider crate: UpCloud has no official Rust SDK, so `src/pro
 ```
 Created → BudgetWait (if needed) → VolumePending → VolumeCreating → VolumeCreated
   → VMPending → FirewallApplying → FirewallVerified → VMCreating → VMRunning
-  → VolumeAttaching → VolumeAttached → ContainerRunning → Succeeded/Failed
-  → VolumeDetaching → VolumeDeleted → VMTerminating → Archived
+  → VolumeAttaching → VolumeAttached → ContainerRunning → Succeeded ─┐
+                                                        └→ Failed ───┤
+                                          VolumeDetaching ←──────────┘
+  → VolumeDeleted → VMTerminating → Archived
 ```
 
-**This order is corrected from an earlier draft of this diagram, which had `VolumeAttaching`/`VolumeAttached` before any VM states — impossible for real: `attach_volume` needs a server UUID that doesn't exist until a VM does (Phase 9's own real finding, building this).** `FirewallApplying` also runs immediately after `VMPending` (server creation), not after the VM is confirmed running — cloud-init starts executing the instant the VM boots, outside this loop's control, so requesting firewall rules as early as the server UUID exists minimizes the window a fresh worker sits open to the internet (Phase 9).
+**This order is corrected from an earlier draft of this diagram, which had `VolumeAttaching`/`VolumeAttached` before any VM states — impossible for real: `attach_volume` needs a server UUID that doesn't exist until a VM does (Phase 9's own real finding, building this).** `FirewallApplying` also runs immediately after `VMPending` (server creation), not after the VM is confirmed running — cloud-init starts executing the instant the VM boots, outside this loop's control, so requesting firewall rules as early as the server UUID exists minimizes the window a fresh worker sits open to the internet (Phase 9). `Succeeded`/`Failed` is a real fork since Phase 10 (both rejoin the same `VolumeDetaching` cleanup path) — see that phase's own notes for how completion detection itself worked before SSH existed to do it for real, and why that mechanism was reworked rather than kept alongside the new one.
 
 Each state has:
 - Entry conditions (can we transition?)
@@ -940,7 +981,7 @@ Each state has:
 
 A job passes through `BudgetWait` before `VolumePending` if its estimated cost exceeds the current rolling budget balance (Phase 13); it's woken immediately when the balance changes (Phase 6's `Notify`), or retried on the fallback tick otherwise, rather than failed.
 
-`FirewallApplying → FirewallVerified` and `VMCreating → VMRunning` are both explicit poll-until-true steps, not assumed-synchronous transitions — UpCloud's firewall-rule-apply and server-create calls both return before the underlying state is actually true (Phase 7). `ContainerRunning → Succeeded` is a third: with no SSH client until Phase 10, the shim can't read the container's real exit status, so it instead polls `get_server` and treats the worker VM powering itself off (cloud-init's own last action, once the container exits) as the real, SSH-free completion signal (Phase 9). None of these three polling states currently time out — a resource that never reaches its target state polls forever, logged at `debug` only; closing that gap is explicitly Phase 11's job ("Reconciliation Hardening" already lists volume/VM/firewall timeouts as its own deliverable), matching the same gap Phase 8 already left for one-shot actions like `VolumePending`.
+`FirewallApplying → FirewallVerified`, `VMCreating → VMRunning`, and `ContainerRunning → Succeeded`/`Failed` are all explicit poll-until-true steps, not assumed-synchronous transitions. The first two poll UpCloud's own API (Phase 7: firewall-rule-apply and server-create calls both return before the underlying state is actually true). The third polls the worker over SSH for `/tmp/exit-code` (Phase 10) — cloud-init writes it as the very last thing it does, and the shim fetches the real exit code plus the full container logs (cached to `jobs.cached_logs`, since the worker is deleted a few states later) the moment it appears. None of these three polling states currently time out — a resource that never reaches its target state polls forever, logged at `debug` only; closing that gap is explicitly Phase 11's job ("Reconciliation Hardening" already lists volume/VM/firewall timeouts as its own deliverable), matching the same gap Phase 8 already left for one-shot actions like `VolumePending`.
 
 A running job that exceeds its `activeDeadlineSeconds` (Phase 11) is force-killed and transitions to `Failed` with reason `DeadlineExceeded` — the same terminology real Kubernetes Jobs use for this exact situation.
 
@@ -993,7 +1034,7 @@ The shim ships as a `FROM scratch` OCI image (Phase 3): a statically-linked musl
 - Phase 7: `CloudProvider` trait exists and `UpCloudProvider` is the only caller of it (no direct UpCloud HTTP calls elsewhere); logs show "DRY-RUN" messages, no actual resources created
 - Phase 8: small volumes created/deleted cleanly (verified live against the real UpCloud API: 3 real create→delete cycles, zero orphans left afterward), orphan scan finds/deletes untracked volumes carrying this instance's prefix while leaving tracked ones alone, a failed create/delete leaves the job in place and retries rather than wedging or leaking
 - Phase 9: VMs launch sized per-job, receive real cloud-init, containers run only after firewall rules are verified applied; every worker VM unreachable inbound from anywhere but the shim's own IP while still reaching the internet outbound — verified live across 6 full real job runs (volume+VM create → firewall apply/verify → container run → self-poweroff detected → full cleanup incl. boot disk), zero orphans left, external `nc` timeout confirmed against a live worker
-- Phase 10: kubectl logs -f works while container running, via `russh` (no `ssh` subprocess spawned by the shim)
+- Phase 10: kubectl logs -f works while container running, via `russh` (no `ssh` subprocess spawned by the shim) — verified against a real OpenSSH server (kube-shim.brawer.ch's own sshd); real exit code populates `jobs.exit_code` and splits `Succeeded`/`Failed`; logs remain fetchable via `jobs.cached_logs` after the worker VM is gone
 - Phase 11: 10+ chaos scenarios (kill shim, container crashes, etc.) with zero orphans and zero duplicate resources; a job that overruns `activeDeadlineSeconds` is force-killed and marked `Failed`/`DeadlineExceeded`, including when the shim was down at the moment the deadline passed
 - Phase 12: kubectl describe shows events, kubectl top shows metrics across all running jobs
 - Phase 13: costs calculated per job and per family in `main_currency`; a job whose estimate exceeds the budget balance waits in `BudgetWait` and launches once enough has accrued; a job that finishes early returns its unused margin to the balance; the CSV cost report groups correctly by label

@@ -1,13 +1,31 @@
 //! Job state machine. Phase 6 built it fully mocked; Phase 8 made volume
-//! create/delete real; Phase 9 makes the rest of the pipeline real too --
-//! real worker VMs, real firewall rules, real volume attachment. Only
-//! `Succeeded` staying unconditional (never a real `Failed`) and
-//! `exit_code` staying unpopulated remain honestly mocked: both need the
-//! job's real exit status, which lives in `/tmp/job-status.txt` inside the
-//! worker VM and isn't fetchable until `src/ssh.rs` exists (Phase 10).
+//! create/delete real; Phase 9 made the rest of the pipeline real too --
+//! real worker VMs, real firewall rules, real volume attachment. Phase 10
+//! closes the very last gap: `ContainerRunning` now genuinely detects
+//! completion over SSH (`src/ssh.rs`), fetches the real exit code and full
+//! container logs, and splits the `Succeeded`/`Failed` fork for real --
+//! nothing in this pipeline is mocked or simulated anymore.
 //!
-//! **Three real findings from building this, all changing the pipeline's
-//! shape from what earlier phases assumed:**
+//! **This replaces, not extends, Phase 9's own completion mechanism.**
+//! Phase 9's `ContainerRunning` polled `get_server` and treated the worker
+//! powering itself off (cloud-init's last action) as "done", specifically
+//! because no SSH client existed yet to do better. Now that one does,
+//! `bootstrap/cloud-init-template.sh` no longer powers the VM off at all --
+//! it stays running (and billing) until the shim itself notices completion
+//! over SSH and moves on to real cleanup (`VolumeDetaching`/`VMTerminating`
+//! delete it shortly after, whether it's still running or not; UpCloud's
+//! `delete_server` doesn't require a server to be stopped first). This is
+//! a deliberate trade, not an oversight: a shim that crashes between the
+//! container finishing and noticing it now leaves the worker running
+//! (and billing) indefinitely, with nothing to stop it, where Phase 9's
+//! mechanism would have self-terminated on a timer regardless. Closing
+//! that gap for real means giving every state a timeout -- already
+//! Phase 11's own stated job ("Reconciliation Hardening" lists volume/
+//! VM/firewall timeouts as its own deliverable) -- rather than growing a
+//! second, cruder timeout mechanism here just for this one transition.
+//!
+//! **Two real findings from Phase 9, still true, changing the pipeline's
+//! shape from what was originally planned:**
 //!
 //! 1. **State order.** The original state list (see this project's own
 //!    history) had `VolumeAttaching`/`VolumeAttached` *before* any VM
@@ -24,15 +42,8 @@
 //!    (server creation), not after `VMCreating` -- as early as physically
 //!    possible, minimizing (not eliminating -- the propagation lag is
 //!    real) that exposure window.
-//! 3. **Completion detection without SSH.** With no SSH client until
-//!    Phase 10, the shim can't read the worker's status file. Instead,
-//!    the cloud-init script's own last action is `poweroff` once the
-//!    container exits (see `bootstrap/cloud-init-template.sh`) --
-//!    `ContainerRunning`'s handler polls `get_server` and treats the
-//!    transition away from `"started"` as "the job is done". Real,
-//!    SSH-free, and it's a primitive the shim already had (Phase 7).
 //!
-//! **A fourth, smaller finding:** `VolumeDetaching`'s real handler now
+//! **A third, smaller finding:** `VolumeDetaching`'s real handler now
 //! calls `detach_volume` before `delete_volume` (there wasn't a VM to
 //! detach from in Phase 8). A retry of this same state after a failed
 //! `delete_volume` would call `detach_volume` again on an
@@ -61,7 +72,7 @@ use crate::providers::{
     CloudProvider, CreateServerRequest, CreateVolumeRequest, FirewallAction, FirewallDirection,
     FirewallFamily, FirewallRule,
 };
-use crate::{cloud_init, volumes, workload};
+use crate::{cloud_init, ssh, volumes, workload};
 use anyhow::Result;
 use chrono::Utc;
 use serde_json::Value as JsonValue;
@@ -150,13 +161,35 @@ pub struct JobContext {
     /// to fail in, not a crash. See `src/metadata.rs`'s own docs for why
     /// this is queried dynamically rather than a static config value.
     pub own_public_ip: Option<String>,
+    /// From `config.toml`'s `[upcloud] worker_ssh_private_key` (Phase 10).
+    /// Empty means the shim can't SSH into any worker at all --
+    /// `ContainerRunning` degrades to marking the job `Succeeded` with no
+    /// real exit code or logs rather than polling forever (see
+    /// `handle_container_running`).
+    pub worker_ssh_private_key: String,
+    /// Always `ssh::SSH_PORT` (22) in production -- a real worker VM's
+    /// sshd never listens anywhere else. Exists as its own field only so
+    /// tests can point `handle_container_running` at a local mock SSH
+    /// server bound to an OS-assigned port, the same seam
+    /// `UpCloudProvider::with_base_url` already gives UpCloud API tests
+    /// (Phase 7).
+    pub worker_ssh_port: u16,
 }
 
 /// The state one tick after `current`, or `None` if `current` is
 /// `TERMINAL_STATE` or not a state this pipeline recognizes at all (e.g.
 /// leftover data from a different schema version -- callers should leave
 /// such a job alone and log a warning rather than guess).
+///
+/// `"Failed"` is deliberately *not* in `STATE_SEQUENCE` itself -- it's a
+/// lateral branch `handle_container_running` (Phase 10) chooses instead
+/// of `"Succeeded"` when the real exit code is nonzero, not a state ever
+/// reached by walking the array forward from `"Created"`. It rejoins the
+/// same cleanup path either way, so it just needs its own successor here.
 pub fn next_state(current: &str) -> Option<&'static str> {
+    if current == "Failed" {
+        return Some("VolumeDetaching");
+    }
     let index = STATE_SEQUENCE.iter().position(|state| *state == current)?;
     STATE_SEQUENCE.get(index + 1).copied()
 }
@@ -166,8 +199,11 @@ pub fn next_state(current: &str) -> Option<&'static str> {
 /// unconditionally; every other state only advances once its real work
 /// actually succeeds (a one-shot action) or its polled target is actually
 /// reached (a polling state) -- otherwise the job stays put and tries
-/// again next tick. Returns how many jobs were advanced (for
-/// logging/testing).
+/// again next tick. `ContainerRunning` is the one state that can advance
+/// to somewhere *other* than `next_state(status)` (`"Failed"` instead of
+/// `"Succeeded"`), so every handler below reports the actual target
+/// status to move to (`None` meaning "stay put"), not just whether to
+/// advance. Returns how many jobs were advanced (for logging/testing).
 pub async fn advance_all(pool: &SqlitePool, ctx: &JobContext) -> Result<usize> {
     let rows = sqlx::query(
         "SELECT id, name, namespace, status, spec, last_transition_time FROM jobs WHERE status != ?",
@@ -192,42 +228,44 @@ pub async fn advance_all(pool: &SqlitePool, ctx: &JobContext) -> Result<usize> {
             continue;
         };
 
-        let should_advance = match status.as_str() {
-            "VolumePending" => {
-                handle_volume_pending(
-                    pool,
-                    ctx,
-                    &id,
-                    &namespace,
-                    &name,
-                    &spec_str,
-                    last_transition_time,
-                )
-                .await?
-            }
-            "VMPending" => {
-                handle_vm_pending(
-                    pool,
-                    ctx,
-                    &id,
-                    &namespace,
-                    &name,
-                    &spec_str,
-                    last_transition_time,
-                )
-                .await?
-            }
+        let target_status: Option<&'static str> = match status.as_str() {
+            "VolumePending" => handle_volume_pending(
+                pool,
+                ctx,
+                &id,
+                &namespace,
+                &name,
+                &spec_str,
+                last_transition_time,
+            )
+            .await?
+            .then_some(next),
+            "VMPending" => handle_vm_pending(
+                pool,
+                ctx,
+                &id,
+                &namespace,
+                &name,
+                &spec_str,
+                last_transition_time,
+            )
+            .await?
+            .then_some(next),
             "FirewallApplying" => {
                 handle_firewall_applying(pool, ctx, &id, &namespace, &name, last_transition_time)
                     .await?
+                    .then_some(next)
             }
-            "FirewallVerified" => {
-                handle_firewall_verified(pool, ctx, &id, &namespace, &name).await?
-            }
-            "VMCreating" => handle_vm_creating(pool, ctx, &id, &namespace, &name).await?,
+            "FirewallVerified" => handle_firewall_verified(pool, ctx, &id, &namespace, &name)
+                .await?
+                .then_some(next),
+            "VMCreating" => handle_vm_creating(pool, ctx, &id, &namespace, &name)
+                .await?
+                .then_some(next),
             "VolumeAttaching" => {
                 handle_volume_attaching(pool, ctx, &id, &namespace, &name, last_transition_time)
                     .await?
+                    .then_some(next)
             }
             "ContainerRunning" => {
                 handle_container_running(pool, ctx, &id, &namespace, &name).await?
@@ -235,17 +273,19 @@ pub async fn advance_all(pool: &SqlitePool, ctx: &JobContext) -> Result<usize> {
             "VolumeDetaching" => {
                 handle_volume_detaching(pool, ctx, &id, &namespace, &name, last_transition_time)
                     .await?
+                    .then_some(next)
             }
             "VMTerminating" => {
                 handle_vm_terminating(pool, ctx, &id, &namespace, &name, last_transition_time)
                     .await?
+                    .then_some(next)
             }
-            _ => true,
+            _ => Some(next),
         };
 
-        if !should_advance {
+        let Some(target_status) = target_status else {
             continue;
-        }
+        };
 
         let now = Utc::now().timestamp();
         sqlx::query(
@@ -255,14 +295,14 @@ pub async fn advance_all(pool: &SqlitePool, ctx: &JobContext) -> Result<usize> {
             WHERE id = ?
             "#,
         )
-        .bind(next)
+        .bind(target_status)
         .bind(now)
         .bind(now)
         .bind(&id)
         .execute(pool)
         .await?;
 
-        tracing::info!("job {namespace}/{name}: {status} -> {next}");
+        tracing::info!("job {namespace}/{name}: {status} -> {target_status}");
         advanced += 1;
     }
 
@@ -697,44 +737,103 @@ async fn handle_volume_attaching(
 
 /// `ContainerRunning`: the container itself was already started
 /// autonomously by cloud-init, not by this handler -- there's nothing for
-/// the shim to *do* here, only to notice when it's done. Polls
-/// `get_server` and treats the worker VM shutting itself down (cloud-
-/// init's own last action, see `bootstrap/cloud-init-template.sh`) as the
-/// real, SSH-free completion signal. A polling state: still running is
-/// logged at `debug`, never a failed attempt.
+/// the shim to *do* here, only to notice when it's done. SSHes in and
+/// checks for `/tmp/exit-code` (written by `bootstrap/cloud-init-
+/// template.sh` as its very last action, once `podman wait` returns) --
+/// its absence or emptiness means the container is still running, a
+/// polling case logged at `debug`, never a failed attempt. Once found,
+/// fetches the full container logs too (`podman logs {id}`) and caches
+/// both in `jobs.exit_code`/`.cached_logs` before choosing the real next
+/// state: `"Succeeded"` for exit code 0, `"Failed"` for anything else --
+/// see `next_state`'s own docs for how `"Failed"` rejoins the normal
+/// cleanup path from there.
 async fn handle_container_running(
     pool: &SqlitePool,
     ctx: &JobContext,
     job_id: &str,
     namespace: &str,
     name: &str,
-) -> Result<bool> {
-    let Some(vm_id) = worker_vm_id(pool, job_id).await? else {
-        return Ok(true);
-    };
+) -> Result<Option<&'static str>> {
     if ctx.dry_run {
-        return Ok(true);
+        return Ok(Some("Succeeded"));
+    }
+    let Some(ip) = worker_ssh_ip(pool, job_id).await? else {
+        // Shouldn't happen (VMCreating always records this before
+        // advancing) -- treat defensively as "nothing to check".
+        return Ok(Some("Succeeded"));
+    };
+    if ctx.worker_ssh_private_key.is_empty() {
+        tracing::warn!(
+            "job {namespace}/{name}: upcloud.worker_ssh_private_key is empty, cannot fetch the \
+             real exit code/logs from {ip} -- marking Succeeded without them"
+        );
+        return Ok(Some("Succeeded"));
     }
 
-    match ctx.provider.get_server(&vm_id).await {
-        Ok(server) if server.state != "started" => {
-            tracing::info!(
-                "job {namespace}/{name}: worker VM {vm_id} is {} (container finished)",
-                server.state
-            );
-            Ok(true)
-        }
-        Ok(_) => {
-            tracing::debug!("job {namespace}/{name}: container still running on {vm_id}");
-            Ok(false)
-        }
+    let exit_code_output = match ssh::exec_once(
+        &ip,
+        ctx.worker_ssh_port,
+        &ctx.worker_ssh_private_key,
+        "cat /tmp/exit-code",
+    )
+    .await
+    {
+        Ok(output) => output,
         Err(err) => {
-            tracing::warn!(
-                "job {namespace}/{name}: failed to poll worker VM {vm_id}, will retry: {err}"
+            tracing::debug!(
+                "job {namespace}/{name}: SSH to worker {ip} not ready yet, will retry: {err}"
             );
-            Ok(false)
+            return Ok(None);
         }
-    }
+    };
+    let Ok(exit_code) = String::from_utf8_lossy(&exit_code_output.stdout)
+        .trim()
+        .parse::<i64>()
+    else {
+        // The file doesn't exist yet (or is still empty) -- the script
+        // hasn't finished, not a failure.
+        tracing::debug!("job {namespace}/{name}: container still running on {ip}");
+        return Ok(None);
+    };
+
+    let container_id = ssh::exec_once(
+        &ip,
+        ctx.worker_ssh_port,
+        &ctx.worker_ssh_private_key,
+        "cat /tmp/container-id.txt",
+    )
+    .await
+    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    .unwrap_or_default();
+
+    // Sanity-checked before ever being interpolated into a shell command
+    // below -- container_id is normally our own cloud-init script's own
+    // output, but a defensive check costs nothing and means a garbled/
+    // unexpected read can never become a shell-injection vector.
+    let logs = if !container_id.is_empty() && container_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        ssh::exec_once(
+            &ip,
+            ctx.worker_ssh_port,
+            &ctx.worker_ssh_private_key,
+            &format!("podman logs {container_id}"),
+        )
+        .await
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+    } else {
+        tracing::warn!(
+            "job {namespace}/{name}: no valid container ID read from {ip}, logs unavailable"
+        );
+        String::new()
+    };
+
+    record_completion(pool, job_id, exit_code, &logs).await?;
+    tracing::info!("job {namespace}/{name}: container finished on {ip}, exit code {exit_code}");
+    Ok(Some(if exit_code == 0 {
+        "Succeeded"
+    } else {
+        "Failed"
+    }))
 }
 
 /// `VolumeDetaching`: detach (if a worker VM exists) then delete the
@@ -914,6 +1013,36 @@ async fn set_worker_ssh_ip(pool: &SqlitePool, job_id: &str, ip: &str) -> Result<
     Ok(())
 }
 
+async fn worker_ssh_ip(pool: &SqlitePool, job_id: &str) -> Result<Option<String>> {
+    let ip: Option<String> = sqlx::query_scalar("SELECT worker_ssh_ip FROM jobs WHERE id = ?")
+        .bind(job_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(ip)
+}
+
+/// Records a job's real completion (Phase 10): its exit code and the
+/// worker's full container logs, fetched over SSH by
+/// `handle_container_running` while the worker VM is still up -- the only
+/// time they're ever fetchable, since `VMTerminating` deletes the VM a
+/// few states later regardless of whether cleanup succeeds.
+/// `jobs.cached_logs` is what `api::logs`'s non-follow/fallback path
+/// serves once the worker is gone.
+async fn record_completion(
+    pool: &SqlitePool,
+    job_id: &str,
+    exit_code: i64,
+    logs: &str,
+) -> Result<()> {
+    sqlx::query("UPDATE jobs SET exit_code = ?, cached_logs = ? WHERE id = ?")
+        .bind(exit_code)
+        .bind(logs)
+        .bind(job_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Records a failed real-call attempt (`retry_count`/`last_error`,
 /// both existing columns front-loaded in Phase 1's original schema) and
 /// logs it -- at `warn` normally, escalating to `error` once it's been
@@ -963,6 +1092,7 @@ async fn record_failed_attempt(
 mod tests {
     use super::*;
     use crate::providers::upcloud::UpCloudProvider;
+    use std::collections::HashMap;
 
     fn mock_ctx(dry_run: bool) -> JobContext {
         JobContext {
@@ -973,6 +1103,8 @@ mod tests {
             worker_template_uuid: "01000000-0000-4000-8000-000030240200".to_string(),
             worker_ssh_public_keys: vec!["ssh-ed25519 AAAA test".to_string()],
             own_public_ip: Some("203.0.113.5".to_string()),
+            worker_ssh_private_key: crate::ssh::tests::throwaway_private_key_pem(),
+            worker_ssh_port: ssh::SSH_PORT,
         }
     }
 
@@ -1569,42 +1701,113 @@ mod tests {
         assert_eq!(advanced, 1);
     }
 
-    #[tokio::test]
-    async fn test_container_running_waits_while_started() {
-        let app = axum::Router::new().route(
-            "/1.3/server/:uuid",
-            axum::routing::get(|| async {
-                axum::Json(serde_json::json!({"server": {"uuid": "srv1", "title": "t", "state": "started"}}))
-            }),
-        );
-        let provider = crate::providers::upcloud::tests::mock_server(app).await;
-        let mut ctx = mock_ctx(false);
-        ctx.provider = Arc::new(provider);
-
-        let pool = crate::db::init_pool(":memory:").await.unwrap();
-        insert_job_with_vm(&pool, "ContainerRunning", "srv1").await;
-
-        let advanced = advance_all(&pool, &ctx).await.unwrap();
-        assert_eq!(advanced, 0);
+    async fn insert_job_with_ssh_ip(pool: &SqlitePool, status: &str, ip: &str) {
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, worker_vm_id, worker_ssh_ip, created_at, updated_at, version) \
+             VALUES ('j1', 'job-one', 'default', '{}', ?, 'srv1', ?, 0, 0, 1)",
+        )
+        .bind(status)
+        .bind(ip)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
-    async fn test_container_running_advances_once_vm_stops_itself() {
-        let app = axum::Router::new().route(
-            "/1.3/server/:uuid",
-            axum::routing::get(|| async {
-                axum::Json(serde_json::json!({"server": {"uuid": "srv1", "title": "t", "state": "stopped"}}))
-            }),
-        );
-        let provider = crate::providers::upcloud::tests::mock_server(app).await;
+    async fn test_container_running_waits_while_no_exit_code_file_yet() {
+        // No "cat /tmp/exit-code" entry -- the mock server's default
+        // (empty stdout, exit 1) simulates the file not existing yet.
+        let (host, port) = crate::ssh::tests::mock_ssh_server(HashMap::new()).await;
         let mut ctx = mock_ctx(false);
-        ctx.provider = Arc::new(provider);
+        ctx.worker_ssh_port = port;
 
         let pool = crate::db::init_pool(":memory:").await.unwrap();
-        insert_job_with_vm(&pool, "ContainerRunning", "srv1").await;
+        insert_job_with_ssh_ip(&pool, "ContainerRunning", &host).await;
+
+        let advanced = advance_all(&pool, &ctx).await.unwrap();
+        assert_eq!(advanced, 0, "must not advance until /tmp/exit-code exists");
+
+        let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = 'j1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "ContainerRunning");
+    }
+
+    #[tokio::test]
+    async fn test_container_running_zero_exit_code_advances_to_succeeded() {
+        let mut responses = HashMap::new();
+        responses.insert("cat /tmp/exit-code", ("0", 0));
+        responses.insert("cat /tmp/container-id.txt", ("abc123", 0));
+        responses.insert("podman logs abc123", ("hello from the container\n", 0));
+        let (host, port) = crate::ssh::tests::mock_ssh_server(responses).await;
+        let mut ctx = mock_ctx(false);
+        ctx.worker_ssh_port = port;
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_job_with_ssh_ip(&pool, "ContainerRunning", &host).await;
 
         let advanced = advance_all(&pool, &ctx).await.unwrap();
         assert_eq!(advanced, 1);
+
+        let (status, exit_code, cached_logs): (String, Option<i64>, Option<String>) =
+            sqlx::query_as("SELECT status, exit_code, cached_logs FROM jobs WHERE id = 'j1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "Succeeded");
+        assert_eq!(exit_code, Some(0));
+        assert_eq!(cached_logs.as_deref(), Some("hello from the container\n"));
+    }
+
+    #[tokio::test]
+    async fn test_container_running_nonzero_exit_code_advances_to_failed() {
+        let mut responses = HashMap::new();
+        responses.insert("cat /tmp/exit-code", ("1", 0));
+        responses.insert("cat /tmp/container-id.txt", ("abc123", 0));
+        responses.insert("podman logs abc123", ("boom\n", 0));
+        let (host, port) = crate::ssh::tests::mock_ssh_server(responses).await;
+        let mut ctx = mock_ctx(false);
+        ctx.worker_ssh_port = port;
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_job_with_ssh_ip(&pool, "ContainerRunning", &host).await;
+
+        let advanced = advance_all(&pool, &ctx).await.unwrap();
+        assert_eq!(advanced, 1);
+
+        let (status, exit_code): (String, Option<i64>) =
+            sqlx::query_as("SELECT status, exit_code FROM jobs WHERE id = 'j1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "Failed");
+        assert_eq!(exit_code, Some(1));
+
+        // "Failed" must rejoin the normal cleanup path, same as "Succeeded".
+        assert_eq!(next_state("Failed"), Some("VolumeDetaching"));
+    }
+
+    #[tokio::test]
+    async fn test_container_running_with_no_ssh_key_configured_advances_without_exit_code() {
+        let (host, port) = crate::ssh::tests::mock_ssh_server(HashMap::new()).await;
+        let mut ctx = mock_ctx(false);
+        ctx.worker_ssh_port = port;
+        ctx.worker_ssh_private_key = String::new();
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_job_with_ssh_ip(&pool, "ContainerRunning", &host).await;
+
+        let advanced = advance_all(&pool, &ctx).await.unwrap();
+        assert_eq!(advanced, 1);
+
+        let (status, exit_code): (String, Option<i64>) =
+            sqlx::query_as("SELECT status, exit_code FROM jobs WHERE id = 'j1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "Succeeded");
+        assert_eq!(exit_code, None);
     }
 
     #[tokio::test]

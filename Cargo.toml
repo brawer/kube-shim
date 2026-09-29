@@ -56,7 +56,20 @@ tokio-stream = "0.1"
 # args/env) as base64 blobs rather than interpolating them into shell text
 # directly -- see src/cloud_init.rs's own module docs for why.
 base64 = "0.22"
+# Phase 10: SSH client to worker VMs (log streaming, real exit-code capture)
+# -- never a subprocess. default-features disabled to drop the default
+# "aws-lc-rs" crypto backend (needs cmake, unavailable/unwanted in the
+# musl/Alpine release build) in favor of "ring", the same substitution
+# tls.rs/rustls-acme already make for the exact same reason (Phase 3/4).
+russh = { version = "0.63", default-features = false, features = ["ring", "rsa", "flate2"] }
 
 [dev-dependencies]
 rcgen = "0.13"
 tempfile = "3"
+# Phase 10: generates a throwaway keypair for src/ssh.rs's tests, which run
+# against a real local russh server rather than a hand-mocked transport --
+# same "real local server" testing pattern every other phase's own tests use.
+# Pinned to the same major version russh's own dependency tree resolves to
+# (verified via `cargo tree`) -- a mismatched rand_core major version fails
+# to compile against PrivateKey::random's CryptoRng bound.
+rand = "0.10"

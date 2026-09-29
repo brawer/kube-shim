@@ -20,12 +20,14 @@
 use anyhow::{Context, Result};
 use sqlx::{Row, SqlitePool};
 
-/// `(table, column, type-and-constraints)`. Empty right now -- nothing
-/// currently needs a new column on an existing table -- but real, and
-/// exercised by `test_apply_added_columns_*` below against an explicit
-/// list, so the mechanism itself is proven before the day it's actually
-/// needed for real.
-const ADDED_COLUMNS: &[(&str, &str, &str)] = &[];
+/// `(table, column, type-and-constraints)`. First real entry (Phase 10):
+/// `jobs.cached_logs` holds a job's full `podman logs` output, captured
+/// once via SSH right after real completion is detected
+/// (`reconcile::job`'s `ContainerRunning` handler) -- so `kubectl logs`
+/// still works once the worker VM itself is gone (`VMTerminating`
+/// deletes it a few states later), the same way a real Kubernetes pod's
+/// logs remain fetchable for a while after the pod exits.
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[("jobs", "cached_logs", "TEXT")];
 
 pub async fn run(pool: &SqlitePool) -> Result<()> {
     apply_added_columns(pool, ADDED_COLUMNS).await
@@ -117,8 +119,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_with_empty_list_is_a_harmless_noop() {
+    async fn test_init_pool_adds_the_real_added_columns() {
+        // init_pool() (src/db/mod.rs) already calls run() as part of its
+        // own normal startup sequence -- this exercises that real,
+        // production path end to end against the real ADDED_COLUMNS list,
+        // rather than just apply_added_columns() directly against a
+        // hand-picked test column as this module's other tests do.
         let pool = crate::db::init_pool(":memory:").await.unwrap();
-        run(&pool).await.unwrap();
+        assert!(column_exists(&pool, "jobs", "cached_logs").await.unwrap());
     }
 }

@@ -1,5 +1,6 @@
 #!/bin/bash
-# kube-shim worker VM startup script (Phase 9).
+# kube-shim worker VM startup script (Phase 9, exit-code signaling
+# reworked in Phase 10 -- see the bottom of this file).
 #
 # This is a *template*: src/cloud_init.rs embeds this file at compile time
 # (include_str!) and substitutes the __KUBESHIM_..._B64__ placeholders
@@ -20,6 +21,7 @@ set -u
 
 STATUS_FILE=/tmp/job-status.txt
 CONTAINER_ID_FILE=/tmp/container-id.txt
+EXIT_CODE_FILE=/tmp/exit-code
 
 echo "Waiting for volume..." > "$STATUS_FILE"
 
@@ -80,13 +82,17 @@ podman wait "$CONTAINER_ID" > /dev/null
 EXIT_CODE=$(podman inspect "$CONTAINER_ID" --format '{{.State.ExitCode}}')
 echo "Exit code: $EXIT_CODE" >> "$STATUS_FILE"
 
-# Signals completion to the shim's own reconciliation loop, which has no
-# SSH access to this VM yet to read the status file directly (that's
-# Phase 10's job -- see docs/IMPLEMENTATION_PLAN.md Phase 9's own notes).
-# Powering off is a real, SSH-free completion signal the shim already has
-# a primitive for: its `ContainerRunning` handler polls this server's own
-# provider-reported state (get_server) and treats the transition away
-# from "started" as "the job is done", regardless of the container's exit
-# code -- real success/failure determination from this status file is
-# deferred to whichever phase actually reads it over SSH.
-poweroff
+# Signals completion to the shim over SSH (Phase 10): its
+# `ContainerRunning` handler polls for this exact file, and once it
+# exists, fetches the real exit code from it plus the full container
+# logs (`podman logs`) before the worker VM is torn down a few states
+# later. This is the very last thing the script does, deliberately not
+# followed by `poweroff` -- Phase 9's own version of this script powered
+# the VM off itself as an SSH-free completion signal (no SSH client
+# existed yet); now that one does, the shim needs the VM to stay up long
+# enough to actually connect and read this file, so it stays running
+# (and billing) until the shim explicitly deletes it. See
+# src/reconcile/job.rs's own module docs for the real trade-off this is
+# -- a shim that crashes before noticing now leaves the worker running
+# indefinitely, where the old mechanism would have self-terminated.
+echo "$EXIT_CODE" > "$EXIT_CODE_FILE"
