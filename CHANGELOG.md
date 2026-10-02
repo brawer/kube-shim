@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.12](https://github.com/brawer/kube-shim/compare/v0.1.11...v0.1.12) (2026-10-02)
+
+
+### 🆕 Enhancements
+
+* idempotent retries, deadline/timeout enforcement, network timeouts (Phase 11) ([#41](https://github.com/brawer/kube-shim/issues/41)) ([5263836](https://github.com/brawer/kube-shim/commit/526383675c64db24aefb5ce9ad1bca912d0038c0))
+
 ## [0.1.11](https://github.com/brawer/kube-shim/compare/v0.1.10...v0.1.11) (2026-09-29)
 
 
