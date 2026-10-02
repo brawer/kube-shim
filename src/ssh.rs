@@ -29,9 +29,24 @@ use russh::client::{self, Handle};
 use russh::keys::{decode_secret_key, PrivateKeyWithHashAlg};
 use russh::ChannelMsg;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+
+/// Phase 11: bounds the initial TCP connect + SSH handshake. Without
+/// this, a worker whose firewall silently drops packets (rather than
+/// actively refusing the connection) would hang on the OS's own TCP
+/// connect timeout, commonly 1-2+ minutes -- far longer than useful for
+/// a reconciliation tick that's meant to retry every `FALLBACK_INTERVAL`
+/// (10s).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Separate from `CONNECT_TIMEOUT`: once connected, this is how long the
+/// session may go with no traffic at all before `russh` itself tears it
+/// down -- catches a connection that completed its handshake but then
+/// genuinely stalled (e.g. the remote process wedged).
+const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Everything `api::logs` (Phase 10) needs to SSH into a worker on
 /// demand, handed to the router as an `Extension` -- separate from
@@ -50,6 +65,8 @@ pub enum SshError {
     Protocol(#[from] russh::Error),
     #[error("SSH authentication failed")]
     AuthenticationFailed,
+    #[error("connection timed out after {0:?}")]
+    ConnectTimeout(Duration),
 }
 
 /// The result of a one-shot (non-streaming) command: everything the
@@ -89,9 +106,32 @@ async fn connect_and_open_channel(
     private_key_pem: &str,
     command: &str,
 ) -> Result<russh::Channel<client::Msg>, SshError> {
+    connect_and_open_channel_with_timeout(host, port, private_key_pem, command, CONNECT_TIMEOUT)
+        .await
+}
+
+/// Split out from `connect_and_open_channel` purely so a test can pass a
+/// short timeout and verify `ConnectTimeout` actually fires, rather than
+/// paying the real `CONNECT_TIMEOUT` (15s) on every test run just to
+/// prove the wrapper works.
+async fn connect_and_open_channel_with_timeout(
+    host: &str,
+    port: u16,
+    private_key_pem: &str,
+    command: &str,
+    connect_timeout: Duration,
+) -> Result<russh::Channel<client::Msg>, SshError> {
     let key_pair = decode_secret_key(private_key_pem, None)?;
-    let config = Arc::new(client::Config::default());
-    let mut session: Handle<Client> = client::connect(config, (host, port), Client).await?;
+    let config = Arc::new(client::Config {
+        inactivity_timeout: Some(INACTIVITY_TIMEOUT),
+        ..Default::default()
+    });
+    let mut session: Handle<Client> = tokio::time::timeout(
+        connect_timeout,
+        client::connect(config, (host, port), Client),
+    )
+    .await
+    .map_err(|_| SshError::ConnectTimeout(connect_timeout))??;
 
     let auth_result = session
         .authenticate_publickey(
@@ -408,6 +448,34 @@ pub(crate) mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SshError::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn test_connect_timeout_fires_against_a_silent_peer() {
+        // A real TCP listener that never calls accept(): the TCP
+        // handshake itself completes (the kernel ACKs from the listen
+        // backlog regardless of the application), but russh's own SSH
+        // banner/version exchange then hangs forever waiting for a peer
+        // that never speaks -- exactly the "connected but silent" case
+        // CONNECT_TIMEOUT exists to bound, verified here with a short
+        // timeout rather than the real 15s one.
+        // Bound but never accept()-ed from -- kept alive for the whole
+        // test so the OS socket stays open without ever being read from.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let key = throwaway_private_key_pem();
+        let err = super::connect_and_open_channel_with_timeout(
+            "127.0.0.1",
+            addr.port(),
+            &key,
+            "echo hi",
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, SshError::ConnectTimeout(_)));
     }
 
     #[tokio::test]
