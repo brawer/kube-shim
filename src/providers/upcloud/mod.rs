@@ -16,8 +16,23 @@ use crate::providers::{
 use async_trait::async_trait;
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
+use std::time::Duration;
 
 const DEFAULT_BASE_URL: &str = "https://api.upcloud.com/1.3";
+
+/// Phase 11: without this, a hung/slow UpCloud API call (a dropped
+/// connection that never resets, a backend that accepts the TCP
+/// connection but never responds) would block that one `await`
+/// indefinitely -- and since `reconcile::job::advance_all` processes jobs
+/// one at a time in a single sequential loop, that one stuck call blocks
+/// the *entire* reconciliation tick, not just the job that triggered it.
+/// 30s is generous for any real UpCloud endpoint this project calls (all
+/// single-resource CRUD, nothing bulk) while still being far short of
+/// `reconcile::job::RETRY_ESCALATION_THRESHOLD` (5 min), so a hung call
+/// surfaces as an ordinary, retried `ProviderError` well before that
+/// job's own stuck-state timeout would otherwise fire for an unrelated
+/// reason.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct UpCloudProvider {
     client: reqwest::Client,
@@ -34,7 +49,10 @@ impl UpCloudProvider {
     /// instead of the real UpCloud API.
     pub fn with_base_url(token: impl Into<String>, base_url: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .expect("reqwest::Client::builder() with only a timeout set should never fail"),
             base_url: base_url.into(),
             token: token.into(),
         }

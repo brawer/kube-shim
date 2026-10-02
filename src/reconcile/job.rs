@@ -24,6 +24,30 @@
 //! VM/firewall timeouts as its own deliverable) -- rather than growing a
 //! second, cruder timeout mechanism here just for this one transition.
 //!
+//! **Phase 11 closes that gap, plus two more real ones:**
+//! - `advance_all` now enforces both `activeDeadlineSeconds` (the job's
+//!   own declared worst-case bound, from `created_at`) and a uniform
+//!   5-minute stuck-state timeout (from `last_transition_time`,
+//!   reusing `RETRY_ESCALATION_THRESHOLD`) for every state short of
+//!   `Succeeded`/`Failed` -- see `is_pre_completion_state`,
+//!   `active_deadline_seconds`, and `force_failed`. Either bound firing
+//!   forces the job straight to `"Failed"`, which rejoins the normal
+//!   `VolumeDetaching`/`VMTerminating` cleanup path rather than needing
+//!   its own cleanup logic.
+//! - `handle_volume_pending`/`handle_vm_pending` now check for an
+//!   already-existing, untracked volume/VM (by its exact expected
+//!   title) before creating a new one -- closing the window where a
+//!   crash between a real `create_volume`/`create_server` call
+//!   succeeding and the corresponding DB row committing would otherwise
+//!   launch a second, billable duplicate on the next retry. Orphan
+//!   scanning (Phase 8/9) was already a backstop for this, eventually --
+//!   this avoids creating the duplicate in the first place.
+//! - Both `UpCloudProvider`'s HTTP client (`src/providers/upcloud/
+//!   mod.rs`) and `src/ssh.rs`'s connections now have real timeouts --
+//!   previously, a hung network call to either could block an entire
+//!   reconciliation tick indefinitely, which no amount of state-level
+//!   timeout logic here would ever notice or recover from.
+//!
 //! **Two real findings from Phase 9, still true, changing the pipeline's
 //! shape from what was originally planned:**
 //!
@@ -61,12 +85,13 @@
 //! resource to reach a target state it hasn't reached *yet* is not a
 //! failure -- normal boot time, normal propagation lag, normal container
 //! runtime -- so it only logs at `debug` and never touches
-//! `retry_count`/`last_error`. The real gap this leaves (documented, not
-//! fixed here): a resource that never *does* reach its target state polls
-//! silently forever, with no timeout. That's explicitly Phase 11's job
-//! ("Reconciliation Hardening" already lists volume/VM/firewall timeouts
-//! as its own deliverable) -- see this module's own precedent from Phase
-//! 8, which left the equivalent gap for one-shot actions the same way.
+//! `retry_count`/`last_error`. Phase 11 closes the gap this used to leave
+//! open (a resource that never reaches its target state polling
+//! silently forever) with a *separate* mechanism layered on top in
+//! `advance_all` -- the uniform stuck-state timeout, driven by
+//! `last_transition_time` regardless of whether this tick's own handler
+//! even runs -- rather than teaching every polling handler its own
+//! timeout logic individually.
 
 use crate::providers::{
     CloudProvider, CreateServerRequest, CreateVolumeRequest, FirewallAction, FirewallDirection,
@@ -84,9 +109,11 @@ use uuid::Uuid;
 /// top-level docs for why the order isn't a straight reading of
 /// docs/IMPLEMENTATION_PLAN.md's original "Reconciliation Loop State
 /// Machine" diagram (that diagram is updated to match this, not the other
-/// way around). Minus `BudgetWait` (Phase 13 doesn't exist yet) and
-/// collapsing the real `Succeeded`/`Failed` fork down to always
-/// `Succeeded` (no real exit-code visibility yet -- Phase 10's job).
+/// way around). Minus `BudgetWait` (Phase 13 doesn't exist yet). The real
+/// `Succeeded`/`Failed` fork (Phase 10) isn't in this array at all --
+/// `"Failed"` is a lateral branch `next_state` special-cases, not a state
+/// ever reached by walking forward from `"Created"`; see that function's
+/// own docs.
 const STATE_SEQUENCE: &[&str] = &[
     "Created",
     "VolumePending",
@@ -194,6 +221,73 @@ pub fn next_state(current: &str) -> Option<&'static str> {
     STATE_SEQUENCE.get(index + 1).copied()
 }
 
+/// True for every state strictly before `"Succeeded"` in `STATE_SEQUENCE`
+/// -- the states Phase 11's `activeDeadlineSeconds`/stuck-state
+/// enforcement (`advance_all`) actually applies to. `"Succeeded"`,
+/// `"Failed"`, and everything in the cleanup tail after them (
+/// `VolumeDetaching`/`VolumeDeleted`/`VMTerminating`) are excluded on
+/// purpose: a job that's already finished or already cleaning up has
+/// nothing left for a deadline to meaningfully cut short, and forcing it
+/// to `"Failed"` again would either be a no-op (`next_state("Failed")`
+/// already points at `VolumeDetaching`, same place a stuck cleanup state
+/// already is) or actively wrong (overwriting a real `"Succeeded"`
+/// outcome after the fact).
+fn is_pre_completion_state(status: &str) -> bool {
+    let succeeded_index = STATE_SEQUENCE
+        .iter()
+        .position(|s| *s == "Succeeded")
+        .expect("Succeeded is always in STATE_SEQUENCE");
+    match STATE_SEQUENCE.iter().position(|s| s == &status) {
+        Some(index) => index < succeeded_index,
+        None => false,
+    }
+}
+
+/// `spec.activeDeadlineSeconds`, Kubernetes' own field name and location
+/// (top-level on the pod template's enclosing spec -- see
+/// `find_ephemeral_volume`'s own docs on this spec's shape). Phase 5's
+/// admission check guarantees every real CronJob has this set, but a
+/// missing/malformed value here just disables deadline enforcement for
+/// that job rather than erroring -- the per-state stuck-timeout check
+/// (`advance_all`) still applies regardless.
+fn active_deadline_seconds(spec: &JsonValue) -> Option<i64> {
+    spec.get("activeDeadlineSeconds")?.as_i64()
+}
+
+/// Force-fails a job that exceeded its `activeDeadlineSeconds` or got
+/// stuck in one state for too long (Phase 11) -- sets `status = Failed`
+/// directly (bypassing the normal per-state handlers entirely for this
+/// tick) and records why in `last_error`. Deliberately does *not* try to
+/// synchronously delete whatever volume/VM the job might have -- forcing
+/// `"Failed"` is enough, since `next_state("Failed")` already rejoins the
+/// exact same `VolumeDetaching` -> `VolumeDeleted` -> `VMTerminating`
+/// cleanup path every other failure uses, which already tolerates
+/// cleaning up a partial/nonexistent set of resources. A few extra ticks
+/// (seconds, not minutes, given `FALLBACK_INTERVAL`) to actually finish
+/// deleting things is an acceptable cost for not duplicating that cleanup
+/// logic a second time here.
+async fn force_failed(
+    pool: &SqlitePool,
+    job_id: &str,
+    namespace: &str,
+    name: &str,
+    reason: &str,
+    now: i64,
+) -> Result<()> {
+    tracing::warn!("job {namespace}/{name}: forcing Failed: {reason}");
+    sqlx::query(
+        "UPDATE jobs SET status = 'Failed', last_error = ?, last_transition_time = ?, \
+         updated_at = ?, version = version + 1 WHERE id = ?",
+    )
+    .bind(reason)
+    .bind(now)
+    .bind(now)
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Advances every job not yet in `TERMINAL_STATE` by up to one state.
 /// States with no real work (see `STATE_SEQUENCE`'s own docs) advance
 /// unconditionally; every other state only advances once its real work
@@ -206,12 +300,13 @@ pub fn next_state(current: &str) -> Option<&'static str> {
 /// advance. Returns how many jobs were advanced (for logging/testing).
 pub async fn advance_all(pool: &SqlitePool, ctx: &JobContext) -> Result<usize> {
     let rows = sqlx::query(
-        "SELECT id, name, namespace, status, spec, last_transition_time FROM jobs WHERE status != ?",
+        "SELECT id, name, namespace, status, spec, last_transition_time, created_at FROM jobs WHERE status != ?",
     )
     .bind(TERMINAL_STATE)
     .fetch_all(pool)
     .await?;
 
+    let now = Utc::now().timestamp();
     let mut advanced = 0;
     for row in rows {
         let id: String = row.get(0);
@@ -220,6 +315,7 @@ pub async fn advance_all(pool: &SqlitePool, ctx: &JobContext) -> Result<usize> {
         let status: String = row.get(3);
         let spec_str: String = row.get(4);
         let last_transition_time: Option<i64> = row.get(5);
+        let created_at: i64 = row.get(6);
 
         let Some(next) = next_state(&status) else {
             tracing::warn!(
@@ -227,6 +323,53 @@ pub async fn advance_all(pool: &SqlitePool, ctx: &JobContext) -> Result<usize> {
             );
             continue;
         };
+
+        // Phase 11: a job still short of Succeeded/Failed gets force-
+        // failed if either bound is exceeded -- checked before, and
+        // instead of, this tick's normal per-state handling. See
+        // `force_failed`'s own docs for why both checks exist and why
+        // forcing "Failed" here (rather than deleting resources
+        // synchronously) is enough: it rejoins the same real cleanup
+        // path (`VolumeDetaching`/`VMTerminating`) every other failure
+        // already uses.
+        if is_pre_completion_state(&status) {
+            let spec: JsonValue = serde_json::from_str(&spec_str).unwrap_or(JsonValue::Null);
+            if let Some(deadline) = active_deadline_seconds(&spec) {
+                if now - created_at > deadline {
+                    force_failed(
+                        pool,
+                        &id,
+                        &namespace,
+                        &name,
+                        &format!(
+                            "DeadlineExceeded: activeDeadlineSeconds ({deadline}s) exceeded \
+                             while in state {status}"
+                        ),
+                        now,
+                    )
+                    .await?;
+                    advanced += 1;
+                    continue;
+                }
+            }
+
+            let stuck_since = last_transition_time.unwrap_or(created_at);
+            if now - stuck_since > RETRY_ESCALATION_THRESHOLD {
+                force_failed(
+                    pool,
+                    &id,
+                    &namespace,
+                    &name,
+                    &format!(
+                        "StateTimeout: stuck in {status} for over {RETRY_ESCALATION_THRESHOLD}s"
+                    ),
+                    now,
+                )
+                .await?;
+                advanced += 1;
+                continue;
+            }
+        }
 
         let target_status: Option<&'static str> = match status.as_str() {
             "VolumePending" => handle_volume_pending(
@@ -287,7 +430,6 @@ pub async fn advance_all(pool: &SqlitePool, ctx: &JobContext) -> Result<usize> {
             continue;
         };
 
-        let now = Utc::now().timestamp();
         sqlx::query(
             r#"
             UPDATE jobs
@@ -377,6 +519,26 @@ async fn handle_volume_pending(
     }
 
     let title = format!("{}-vol-{name}", ctx.resource_prefix);
+
+    // Phase 11: idempotency -- a crash between create_volume() succeeding
+    // and insert_job_volume() committing below would otherwise create a
+    // second, duplicate volume the next time this same retry runs. Check
+    // for one with this job's exact expected title first and reuse it if
+    // found, rather than relying solely on the orphan scanner (Phase 8)
+    // to notice and clean up the duplicate later.
+    if let Ok(existing) = ctx.provider.list_volumes(&ctx.zone).await {
+        if let Some(found) = existing.into_iter().find(|v| v.title == title) {
+            tracing::warn!(
+                "job {namespace}/{name}: found existing untracked volume {} titled {title:?} \
+                 (likely a crash before this was recorded last time) -- reusing it instead of \
+                 creating a duplicate",
+                found.id
+            );
+            insert_job_volume(pool, job_id, size_gb, tier, &found.id).await?;
+            return Ok(true);
+        }
+    }
+
     let request = CreateVolumeRequest {
         size_gb,
         tier: tier.upcloud_tier().to_string(),
@@ -483,6 +645,24 @@ async fn handle_vm_pending(
     };
 
     let title = format!("{}-worker-{name}", ctx.resource_prefix);
+
+    // Phase 11: idempotency -- same reasoning as handle_volume_pending's
+    // own check. A crash between create_server() succeeding and
+    // set_worker_vm() committing below would otherwise launch a second,
+    // duplicate (and billable) worker VM on this same retry.
+    if let Ok(existing) = ctx.provider.list_servers(&ctx.zone).await {
+        if let Some(found) = existing.into_iter().find(|s| s.title == title) {
+            tracing::warn!(
+                "job {namespace}/{name}: found existing untracked worker VM {} titled {title:?} \
+                 (likely a crash before this was recorded last time) -- reusing it instead of \
+                 creating a duplicate",
+                found.id
+            );
+            set_worker_vm(pool, job_id, &found.id, &title).await?;
+            return Ok(true);
+        }
+    }
+
     let request = CreateServerRequest {
         title: title.clone(),
         hostname: title.clone(),
@@ -1150,10 +1330,13 @@ mod tests {
     #[tokio::test]
     async fn test_advance_all_moves_each_job_one_step() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = Utc::now().timestamp();
         sqlx::query(
             "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
-             VALUES ('j1', 'job-one', 'default', '{}', 'Created', 0, 0, 1)",
+             VALUES ('j1', 'job-one', 'default', '{}', 'Created', ?, ?, 1)",
         )
+        .bind(now)
+        .bind(now)
         .execute(&pool)
         .await
         .unwrap();
@@ -1186,10 +1369,13 @@ mod tests {
     #[tokio::test]
     async fn test_advance_all_increments_version() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = Utc::now().timestamp();
         sqlx::query(
             "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
-             VALUES ('j1', 'job-one', 'default', '{}', 'Created', 0, 0, 1)",
+             VALUES ('j1', 'job-one', 'default', '{}', 'Created', ?, ?, 1)",
         )
+        .bind(now)
+        .bind(now)
         .execute(&pool)
         .await
         .unwrap();
@@ -1219,11 +1405,14 @@ mod tests {
     #[tokio::test]
     async fn test_volume_pending_dry_run_advances_without_provider_call() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = Utc::now().timestamp();
         sqlx::query(
             "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
-             VALUES ('j1', 'job-one', 'default', ?, 'VolumePending', 0, 0, 1)",
+             VALUES ('j1', 'job-one', 'default', ?, 'VolumePending', ?, ?, 1)",
         )
         .bind(ephemeral_volume_spec())
+        .bind(now)
+        .bind(now)
         .execute(&pool)
         .await
         .unwrap();
@@ -1247,10 +1436,13 @@ mod tests {
     #[tokio::test]
     async fn test_volume_pending_with_no_ephemeral_volume_advances_without_creating_one() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = Utc::now().timestamp();
         sqlx::query(
             "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
-             VALUES ('j1', 'job-one', 'default', '{\"template\":{\"spec\":{}}}', 'VolumePending', 0, 0, 1)",
+             VALUES ('j1', 'job-one', 'default', '{\"template\":{\"spec\":{}}}', 'VolumePending', ?, ?, 1)",
         )
+        .bind(now)
+        .bind(now)
         .execute(&pool)
         .await
         .unwrap();
@@ -1280,11 +1472,14 @@ mod tests {
         ctx.provider = Arc::new(provider);
 
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = Utc::now().timestamp();
         sqlx::query(
             "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
-             VALUES ('j1', 'job-one', 'default', ?, 'VolumePending', 0, 0, 1)",
+             VALUES ('j1', 'job-one', 'default', ?, 'VolumePending', ?, ?, 1)",
         )
         .bind(ephemeral_volume_spec())
+        .bind(now)
+        .bind(now)
         .execute(&pool)
         .await
         .unwrap();
@@ -1362,11 +1557,14 @@ mod tests {
     #[tokio::test]
     async fn test_vm_pending_dry_run_advances_without_provider_call() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = Utc::now().timestamp();
         sqlx::query(
             "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
-             VALUES ('j1', 'job-one', 'default', ?, 'VMPending', 0, 0, 1)",
+             VALUES ('j1', 'job-one', 'default', ?, 'VMPending', ?, ?, 1)",
         )
         .bind(ephemeral_volume_spec())
+        .bind(now)
+        .bind(now)
         .execute(&pool)
         .await
         .unwrap();
@@ -1389,11 +1587,14 @@ mod tests {
     #[tokio::test]
     async fn test_vm_pending_refuses_with_no_ssh_keys_configured() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = Utc::now().timestamp();
         sqlx::query(
             "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
-             VALUES ('j1', 'job-one', 'default', ?, 'VMPending', 0, 0, 1)",
+             VALUES ('j1', 'job-one', 'default', ?, 'VMPending', ?, ?, 1)",
         )
         .bind(ephemeral_volume_spec())
+        .bind(now)
+        .bind(now)
         .execute(&pool)
         .await
         .unwrap();
@@ -1428,11 +1629,14 @@ mod tests {
         ctx.provider = Arc::new(provider);
 
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = Utc::now().timestamp();
         sqlx::query(
             "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
-             VALUES ('j1', 'job-one', 'default', ?, 'VMPending', 0, 0, 1)",
+             VALUES ('j1', 'job-one', 'default', ?, 'VMPending', ?, ?, 1)",
         )
         .bind(ephemeral_volume_spec())
+        .bind(now)
+        .bind(now)
         .execute(&pool)
         .await
         .unwrap();
@@ -1462,11 +1666,14 @@ mod tests {
             }}
         })
         .to_string();
+        let now = Utc::now().timestamp();
         sqlx::query(
             "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
-             VALUES ('j1', 'job-one', 'default', ?, 'VMPending', 0, 0, 1)",
+             VALUES ('j1', 'job-one', 'default', ?, 'VMPending', ?, ?, 1)",
         )
         .bind(spec)
+        .bind(now)
+        .bind(now)
         .execute(&pool)
         .await
         .unwrap();
@@ -1483,12 +1690,20 @@ mod tests {
     }
 
     async fn insert_job_with_vm(pool: &SqlitePool, status: &str, vm_id: &str) {
+        // created_at/last_transition_time must be realistic (not the
+        // literal epoch) -- Phase 11's stuck-timeout/deadline enforcement
+        // in advance_all() treats a row that looks decades old exactly
+        // like a real, genuinely stuck job and force-fails it.
+        let now = Utc::now().timestamp();
         sqlx::query(
-            "INSERT INTO jobs (id, name, namespace, spec, status, worker_vm_id, created_at, updated_at, version) \
-             VALUES ('j1', 'job-one', 'default', '{}', ?, ?, 0, 0, 1)",
+            "INSERT INTO jobs (id, name, namespace, spec, status, worker_vm_id, created_at, updated_at, last_transition_time, version) \
+             VALUES ('j1', 'job-one', 'default', '{}', ?, ?, ?, ?, ?, 1)",
         )
         .bind(status)
         .bind(vm_id)
+        .bind(now)
+        .bind(now)
+        .bind(now)
         .execute(pool)
         .await
         .unwrap();
@@ -1702,12 +1917,16 @@ mod tests {
     }
 
     async fn insert_job_with_ssh_ip(pool: &SqlitePool, status: &str, ip: &str) {
+        let now = Utc::now().timestamp();
         sqlx::query(
-            "INSERT INTO jobs (id, name, namespace, spec, status, worker_vm_id, worker_ssh_ip, created_at, updated_at, version) \
-             VALUES ('j1', 'job-one', 'default', '{}', ?, 'srv1', ?, 0, 0, 1)",
+            "INSERT INTO jobs (id, name, namespace, spec, status, worker_vm_id, worker_ssh_ip, created_at, updated_at, last_transition_time, version) \
+             VALUES ('j1', 'job-one', 'default', '{}', ?, 'srv1', ?, ?, ?, ?, 1)",
         )
         .bind(status)
         .bind(ip)
+        .bind(now)
+        .bind(now)
+        .bind(now)
         .execute(pool)
         .await
         .unwrap();
@@ -1970,5 +2189,310 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "Archived");
+    }
+
+    // --- Phase 11: activeDeadlineSeconds / stuck-state enforcement ---
+
+    #[test]
+    fn test_is_pre_completion_state_covers_the_working_states_only() {
+        for state in [
+            "Created",
+            "VolumePending",
+            "VolumeCreating",
+            "VolumeCreated",
+            "VMPending",
+            "FirewallApplying",
+            "FirewallVerified",
+            "VMCreating",
+            "VMRunning",
+            "VolumeAttaching",
+            "VolumeAttached",
+            "ContainerRunning",
+        ] {
+            assert!(is_pre_completion_state(state), "{state} should be covered");
+        }
+        for state in [
+            "Succeeded",
+            "Failed",
+            "VolumeDetaching",
+            "VolumeDeleted",
+            "VMTerminating",
+            "Archived",
+            "SomeUnknownState",
+        ] {
+            assert!(
+                !is_pre_completion_state(state),
+                "{state} should not be covered"
+            );
+        }
+    }
+
+    async fn insert_job_with_deadline(
+        pool: &SqlitePool,
+        status: &str,
+        created_at: i64,
+        last_transition_time: i64,
+        active_deadline_seconds: i64,
+    ) {
+        let spec = serde_json::json!({
+            "activeDeadlineSeconds": active_deadline_seconds,
+            "template": {"spec": {"containers": [{"image": "busybox:latest"}]}}
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, last_transition_time, version) \
+             VALUES ('j1', 'job-one', 'default', ?, ?, ?, ?, ?, 1)",
+        )
+        .bind(spec)
+        .bind(status)
+        .bind(created_at)
+        .bind(created_at)
+        .bind(last_transition_time)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_active_deadline_seconds_exceeded_forces_failed() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = Utc::now().timestamp();
+        // Created 100s ago with a 60s deadline -- already exceeded, even
+        // though this particular state (VolumeAttached, a mock
+        // passthrough) hasn't itself been "stuck" for long at all.
+        insert_job_with_deadline(&pool, "VolumeAttached", now - 100, now - 5, 60).await;
+
+        let advanced = advance_all(&pool, &mock_ctx(true)).await.unwrap();
+        assert_eq!(advanced, 1);
+
+        let (status, last_error): (String, Option<String>) =
+            sqlx::query_as("SELECT status, last_error FROM jobs WHERE id = 'j1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "Failed");
+        assert!(last_error.unwrap().contains("DeadlineExceeded"));
+    }
+
+    #[tokio::test]
+    async fn test_active_deadline_seconds_not_yet_exceeded_advances_normally() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = Utc::now().timestamp();
+        // Created 10s ago with a 3600s deadline -- nowhere close.
+        insert_job_with_deadline(&pool, "VolumeAttached", now - 10, now - 5, 3600).await;
+
+        let advanced = advance_all(&pool, &mock_ctx(true)).await.unwrap();
+        assert_eq!(advanced, 1);
+
+        let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = 'j1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "ContainerRunning");
+    }
+
+    #[tokio::test]
+    async fn test_active_deadline_seconds_does_not_apply_once_in_cleanup() {
+        // A job whose deadline passed ages ago but is already cleaning up
+        // (VolumeDetaching, past Succeeded/Failed) must not be yanked back
+        // to "Failed" -- is_pre_completion_state excludes this state.
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = Utc::now().timestamp();
+        insert_job_with_deadline(&pool, "VolumeDetaching", now - 100_000, now - 100_000, 60).await;
+
+        let advanced = advance_all(&pool, &mock_ctx(true)).await.unwrap();
+        assert_eq!(advanced, 1);
+
+        let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = 'j1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "VolumeDeleted",
+            "normal cleanup must proceed untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stuck_one_shot_state_times_out_to_failed() {
+        // VolumePending, repeatedly failing against a real provider error,
+        // for far longer than RETRY_ESCALATION_THRESHOLD -- must give up
+        // rather than retry forever (the gap Phase 8/9 explicitly left
+        // open for Phase 11 to close).
+        let app = axum::Router::new().route(
+            "/1.3/storage",
+            axum::routing::post(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+        );
+        let provider = crate::providers::upcloud::tests::mock_server(app).await;
+        let mut ctx = mock_ctx(false);
+        ctx.provider = Arc::new(provider);
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = Utc::now().timestamp();
+        // No activeDeadlineSeconds this time -- only the per-state stuck
+        // timeout should fire.
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, last_transition_time, retry_count, version) \
+             VALUES ('j1', 'job-one', 'default', ?, 'VolumePending', ?, ?, ?, 40, 1)",
+        )
+        .bind(ephemeral_volume_spec())
+        .bind(now - 1000)
+        .bind(now - 1000)
+        .bind(now - (RETRY_ESCALATION_THRESHOLD + 1))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let advanced = advance_all(&pool, &ctx).await.unwrap();
+        assert_eq!(advanced, 1);
+
+        let (status, last_error): (String, Option<String>) =
+            sqlx::query_as("SELECT status, last_error FROM jobs WHERE id = 'j1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "Failed");
+        assert!(last_error.unwrap().contains("StateTimeout"));
+    }
+
+    #[tokio::test]
+    async fn test_stuck_polling_state_times_out_to_failed() {
+        // FirewallVerified, never seeing the expected rules appear, for
+        // far longer than RETRY_ESCALATION_THRESHOLD.
+        let app = axum::Router::new().route(
+            "/1.3/server/:uuid/firewall_rule",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"firewall_rules": {"firewall_rule": []}}))
+            }),
+        );
+        let provider = crate::providers::upcloud::tests::mock_server(app).await;
+        let mut ctx = mock_ctx(false);
+        ctx.provider = Arc::new(provider);
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, worker_vm_id, created_at, updated_at, last_transition_time, version) \
+             VALUES ('j1', 'job-one', 'default', '{}', 'FirewallVerified', 'srv1', ?, ?, ?, 1)",
+        )
+        .bind(now - 1000)
+        .bind(now - 1000)
+        .bind(now - (RETRY_ESCALATION_THRESHOLD + 1))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let advanced = advance_all(&pool, &ctx).await.unwrap();
+        assert_eq!(advanced, 1);
+
+        let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = 'j1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "Failed");
+    }
+
+    #[tokio::test]
+    async fn test_volume_pending_reuses_existing_untracked_volume_instead_of_duplicating() {
+        // Simulates a crash between create_volume() succeeding and
+        // insert_job_volume() committing: the real volume already exists
+        // (with the exact expected title) but nothing tracks it yet.
+        let create_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let create_called_clone = create_called.clone();
+        let app = axum::Router::new()
+            .route(
+                "/1.3/storage/normal",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({"storages": {"storage": [
+                        {"uuid": "vol-existing", "size": 1, "tier": "maxiops", "title": "kube-shim-test-vol-job-one", "zone": "de-fra1"}
+                    ]}}))
+                }),
+            )
+            .route(
+                "/1.3/storage",
+                axum::routing::post(move || {
+                    create_called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                    async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }
+                }),
+            );
+        let provider = crate::providers::upcloud::tests::mock_server(app).await;
+        let mut ctx = mock_ctx(false);
+        ctx.provider = Arc::new(provider);
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
+             VALUES ('j1', 'job-one', 'default', ?, 'VolumePending', ?, ?, 1)",
+        )
+        .bind(ephemeral_volume_spec())
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let advanced = advance_all(&pool, &ctx).await.unwrap();
+        assert_eq!(advanced, 1);
+        assert!(
+            !create_called.load(std::sync::atomic::Ordering::SeqCst),
+            "must reuse the existing volume, never call create_volume"
+        );
+
+        let provider_volume_id: String =
+            sqlx::query_scalar("SELECT provider_volume_id FROM job_volumes WHERE job_id = 'j1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(provider_volume_id, "vol-existing");
+    }
+
+    #[tokio::test]
+    async fn test_vm_pending_reuses_existing_untracked_server_instead_of_duplicating() {
+        let create_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let create_called_clone = create_called.clone();
+        let app = axum::Router::new()
+            .route(
+                "/1.3/server",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({"servers": {"server": [
+                        {"uuid": "srv-existing", "title": "kube-shim-test-worker-job-one", "state": "started", "zone": "de-fra1"}
+                    ]}}))
+                })
+                .post(move || {
+                    create_called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                    async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }
+                }),
+            );
+        let provider = crate::providers::upcloud::tests::mock_server(app).await;
+        let mut ctx = mock_ctx(false);
+        ctx.provider = Arc::new(provider);
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
+             VALUES ('j1', 'job-one', 'default', ?, 'VMPending', ?, ?, 1)",
+        )
+        .bind(ephemeral_volume_spec())
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let advanced = advance_all(&pool, &ctx).await.unwrap();
+        assert_eq!(advanced, 1);
+        assert!(
+            !create_called.load(std::sync::atomic::Ordering::SeqCst),
+            "must reuse the existing server, never call create_server"
+        );
+
+        let worker_vm_id: Option<String> =
+            sqlx::query_scalar("SELECT worker_vm_id FROM jobs WHERE id = 'j1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(worker_vm_id.as_deref(), Some("srv-existing"));
     }
 }

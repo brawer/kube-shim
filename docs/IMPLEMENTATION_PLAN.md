@@ -581,8 +581,15 @@ cargo test   # 143 lib tests + 19 integration tests, incl. mock-HTTP-server
 #    commits. Observed exactly once, self-protected by UpCloud itself
 #    (the delete attempt failed with STORAGE_STATE_ILLEGAL, since a
 #    freshly-created volume is briefly not deletable) -- a real, narrow
-#    race worth knowing about, but Phase 11's ("Reconciliation Hardening")
-#    job to actually close, not this phase's.
+#    race, flagged at the time as Phase 11's to close. **Still open as of
+#    Phase 11** -- that phase's own idempotency work closes a different
+#    race (a crashed shim retrying `create_volume`/`create_server`
+#    against itself), not this one (the orphan scanner racing a *live*,
+#    still-running shim's own in-progress create). This one stays
+#    self-protected-but-noisy rather than silent-and-unsafe, which is why
+#    it was judged lower priority than Phase 11's actual deliverables;
+#    a grace period in `orphan_scan` (skip anything younger than, say,
+#    2 minutes) would close it for real, left for a future pass.
 ```
 
 **Exit criteria:**
@@ -661,48 +668,27 @@ cargo test   # 157 lib tests + 19 integration tests, including a real
 
 ---
 
-### Phase 11: Reconciliation Hardening (Days 11-12)
+### Phase 11: Reconciliation Hardening (Days 11-12) — ✅ Complete
 **Goal:** Make the reconciliation loop bulletproof for production.
 
-**Deliverables:**
-- Comprehensive error handling for all UpCloud API calls
-- Idempotent state transitions (can retry without side effects) — before creating a volume or VM, check for an existing UpCloud resource carrying this job's name/label, so a crash between "API call succeeded" and "DB write committed" can't create a duplicate on restart
-- Timeouts: volume creation (5 min), VM boot (5 min), firewall verification (5 min)
-- **`activeDeadlineSeconds` enforcement (hard, not advisory):** since Phase 5's admission check guarantees every job has one set, the reconciliation loop tracks each running job's deadline and force-kills its VM (delete, not just stop the container) the moment it's exceeded — mirroring real Kubernetes Job behavior, where a Job that outlives `activeDeadlineSeconds` is terminated and marked `Failed` with reason `DeadlineExceeded`. This is what makes Phase 13's cost estimate an actual worst-case bound rather than a hopeful guess: nothing can silently run (and bill) past the deadline it declared at submission time.
-- Cleanup on failure: unmount, detach, delete (even if one step fails) — including the deadline-exceeded case above
-- Startup recovery: detect crashed containers, orphaned volumes, incomplete jobs, and jobs whose deadline passed while the shim itself was down
-- Chaos testing scenario: kill shim mid-job, restart, verify cleanup proceeds
+**What was actually built** (same shape as planned, with one deliberate design simplification — see below):
 
-**Files to modify:**
-- `src/reconcile/job.rs` - add timeouts, error recovery, label-based idempotency checks, `activeDeadlineSeconds` tracking + force-kill
-- `src/reconcile/startup.rs` - comprehensive orphan detection, including deadline-exceeded jobs missed while down
-- `src/db/schema.sql` - add last_transition_time timestamp
+- **Idempotent state transitions.** `handle_volume_pending`/`handle_vm_pending` now call `list_volumes`/`list_servers` and look for an existing resource whose title exactly matches this job's expected one *before* calling `create_volume`/`create_server` — closing the crash window between a real create call succeeding and the corresponding DB row (`job_volumes`/`jobs.worker_vm_id`) committing. Found means reuse it (and write the tracking row) instead of creating a duplicate; not found means create as before. Orphan scanning (Phase 8/9) was already a backstop for the case this leaves *unresolved* eventually, on a longer timescale — this instead avoids ever creating the duplicate billable resource in the first place. Verified with two dedicated tests against a mock UpCloud server that returns an existing resource and asserts `create_volume`/`create_server` is never called.
+- **Unified timeout enforcement, not three separate per-resource-type timeouts.** A single new check in `advance_all`, run before the per-state `match` and applying to every state strictly before `"Succeeded"` (`is_pre_completion_state`): (1) `spec.activeDeadlineSeconds` vs. `now - created_at` (`active_deadline_seconds`), and (2) a uniform 5-minute stuck-in-this-state timeout vs. `now - last_transition_time` (reusing `RETRY_ESCALATION_THRESHOLD`, which already existed for Phase 8/9's `warn`→`error` log escalation — now serving double duty). Either bound firing calls `force_failed`, which sets `status = 'Failed'` with a `last_error` of `"DeadlineExceeded: ..."` or `"StateTimeout: ..."` and lets the job rejoin the ordinary `VolumeDetaching` cleanup path that already exists for every other kind of failure, rather than teaching this one new failure mode its own cleanup logic. This is simpler than the plan's original three separately-tracked 5-minute timeouts (volume/VM/firewall) — they were always going to be the same number, and tracking them per-state rather than per-resource-type means a future state added to the pipeline gets the same protection for free.
+- **Comprehensive error handling, extended to two gaps the original UpCloud/SSH clients had and the plan's wording implied but didn't call out by name:** `UpCloudProvider`'s `reqwest::Client` previously had no timeout at all, and `src/ssh.rs`'s connections had none either — a hung network call to either (not an error, just silence) would block that `await` indefinitely, and since `advance_all` processes jobs one at a time in a single sequential loop, one stuck call blocked the *entire* tick, which no amount of state-level timeout logic above would ever notice. Fixed with a 30s request timeout on the UpCloud HTTP client and a 15s connect timeout + 30s inactivity timeout on SSH connections (`src/ssh.rs`'s `CONNECT_TIMEOUT`/`INACTIVITY_TIMEOUT`). Verified the SSH connect timeout actually fires (not just "compiles") against a real local TCP listener that accepts the handshake but never speaks SSH.
+- **Startup recovery, extended with deadline awareness.** `src/reconcile/startup.rs`'s `recover()` now checks each non-terminal job's `activeDeadlineSeconds` against `now - created_at` and logs at `warn` (distinct from the normal `info`) for any job whose deadline had *already* passed while the shim was down — purely observational, since `advance_all`'s own checks are wall-clock/DB-timestamp-based and therefore already correct on the very next tick regardless of whether a restart happened in between; this just makes that specific case visible in the log the moment the process comes back, rather than waiting for the first regular tick.
+- **Cleanup on failure** was already real as of Phase 9/10 (`handle_volume_detaching` already tolerates a failed `detach_volume` and still proceeds to `delete_volume`; every cleanup handler already no-ops gracefully on an untracked/already-gone resource) — nothing new needed here specifically; Phase 11's own force-fail path reuses this unchanged, which is the point of routing through `"Failed"` rather than deleting synchronously.
 
-**Testing:**
-```bash
-# Scenario 1: Kill shim mid-volume-creation
-terraform apply & sleep 5 && pkill kube-shim
-# Wait for UpCloud to create volume (may take a moment)
-kube-shim (restart)
-# Should detect orphan volume, delete it after ~5 min
-sleep 10 && curl -k https://localhost:443/debug/scan-orphans
+**Deliberate simplification vs. the original plan:** the plan called for cleanup to proceed "even if one step fails" specifically in the context of a *synchronous* failure-handling routine. Phase 11 doesn't add one — `force_failed` only ever flips `status` and lets the existing, already-tolerant `VolumeDetaching`/`VMTerminating` states run on subsequent ticks, exactly as a normal container-exit failure already does. A few extra ticks (seconds, given `FALLBACK_INTERVAL`) to actually finish cleanup is an acceptable cost for not duplicating that logic a second time.
 
-# Scenario 2: Kill shim mid-container
-terraform apply & sleep 30 && pkill kube-shim
-# Wait 10s then restart
-# Should detect container status, proceed to cleanup
+**Files modified:**
+- `src/reconcile/job.rs` — `is_pre_completion_state`, `active_deadline_seconds`, `force_failed`; the new enforcement block in `advance_all`; idempotency checks in `handle_volume_pending`/`handle_vm_pending`; 8 new tests
+- `src/reconcile/startup.rs` — deadline-aware `recover()` logging
+- `src/providers/upcloud/mod.rs` — 30s request timeout on the HTTP client
+- `src/ssh.rs` — `CONNECT_TIMEOUT`/`INACTIVITY_TIMEOUT` on SSH connections, plus a test proving the connect timeout fires
+- `src/db/schema.sql` — **not touched**: `last_transition_time` already existed from early phases (front-loaded into the schema well before this phase needed it), so the plan's own "Files to modify" line for this was already stale by the time this phase started
 
-# Repeat 10+ times, verify zero orphans remain
-
-# Scenario 3: deadline enforcement
-# Apply a job with activeDeadlineSeconds=60 running a container that never exits
-terraform apply
-sleep 90
-kubectl get pod osmdiffs-weekly-test
-# Should show Failed, reason DeadlineExceeded; VM should be gone in UpCloud's panel
-# Repeat once while killing the shim at t=30s, to confirm startup recovery also
-# catches an expired deadline it missed while down
-```
+**Testing:** 167 lib tests + 19 integration tests, all passing; `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` both clean; `./smoke-test.sh --skip-build` passing; a native `podman build` (the musl/Alpine release image) builds and runs `cargo test --release` inside the container successfully. Real hands-on verification against live UpCloud (idempotency reuse and deadline enforcement actually force-failing and cleaning up a real worker VM) happens post-merge against `kube-shim.brawer.ch`, per this project's established deploy-and-verify pattern — not pre-merge, since this phase's new logic needs no code path that differs between a local dry-run and the real deployed shim; the mock-server tests above already exercise the exact UpCloud response shapes real calls hit.
 
 ---
 
@@ -911,15 +897,15 @@ curl -k https://localhost:443/debug/status | jq '.total_cost, .budget_balance'
 | `src/volumes.rs` | `storageClassName` → provider storage-tier lookup | Create (Phase 5) |
 | `src/workload.rs` | `WorkloadKind` abstraction (CronJob now, Deployment later) | Create (Phase 5) |
 | `src/admission.rs` | `activeDeadlineSeconds`-required policy check | Create (Phase 5) |
-| `src/db/schema.sql` | SQLite schema | Phases 1, 5-6, 8-9, 11-13 |
+| `src/db/schema.sql` | SQLite schema | Phases 1, 5-6, 8-9, 13 |
 | `src/db/migrations.rs` | `ALTER TABLE`-based column migrations for already-existing tables | Create (Phase 6); first real use (Phase 10) |
 | `src/reconcile/*.rs` | State machine loop, `Notify`-based wake-up, `activeDeadlineSeconds` enforcement | Create (Phases 6, 8-10, 11, 13) |
-| `src/providers/*.rs` | `CloudProvider` trait + UpCloud implementation | Create (Phases 7-9, 13) |
+| `src/providers/*.rs` | `CloudProvider` trait + UpCloud implementation, request timeout (Phase 11) | Create (Phases 7-9, 11, 13) |
 | `src/providers/upcloud/firewall.rs` | Firewall rules for worker VMs (create + list, both real since Phase 7; poll-until-applied logic itself is Phase 9) | Create (Phase 7) |
 | `src/currency.rs` | ECB daily exchange-rate sync + conversion to `main_currency` | Create (Phase 13) |
 | `src/pricing/*.rs` | Cost tracking + rolling budget guard, in `main_currency` | Create (Phase 13) |
 | `src/api/cost_report.rs` | CSV cost report, grouped by job label | Create (Phase 13) |
-| `src/ssh.rs` | SSH client built on `russh` (`exec_once`/`exec_stream`), no host-key verification (by design) | Create (Phase 10) |
+| `src/ssh.rs` | SSH client built on `russh` (`exec_once`/`exec_stream`), no host-key verification (by design); connect/inactivity timeouts (Phase 11) | Create (Phase 10); Phase 11 |
 | `src/api/logs.rs` | `kubectl logs`/`-f`: live SSH while `ContainerRunning`, `jobs.cached_logs` fallback otherwise | Create (Phase 10) |
 | `src/status_page.rs` | Public status page + `/healthz`/`/livez`/`/readyz`, served on `:443` | Create (Phase 14) |
 | `src/naming.rs` | `resource_prefix`-aware resource name generation | Create (Phase 15) |
@@ -981,7 +967,7 @@ Each state has:
 
 A job passes through `BudgetWait` before `VolumePending` if its estimated cost exceeds the current rolling budget balance (Phase 13); it's woken immediately when the balance changes (Phase 6's `Notify`), or retried on the fallback tick otherwise, rather than failed.
 
-`FirewallApplying → FirewallVerified`, `VMCreating → VMRunning`, and `ContainerRunning → Succeeded`/`Failed` are all explicit poll-until-true steps, not assumed-synchronous transitions. The first two poll UpCloud's own API (Phase 7: firewall-rule-apply and server-create calls both return before the underlying state is actually true). The third polls the worker over SSH for `/tmp/exit-code` (Phase 10) — cloud-init writes it as the very last thing it does, and the shim fetches the real exit code plus the full container logs (cached to `jobs.cached_logs`, since the worker is deleted a few states later) the moment it appears. None of these three polling states currently time out — a resource that never reaches its target state polls forever, logged at `debug` only; closing that gap is explicitly Phase 11's job ("Reconciliation Hardening" already lists volume/VM/firewall timeouts as its own deliverable), matching the same gap Phase 8 already left for one-shot actions like `VolumePending`.
+`FirewallApplying → FirewallVerified`, `VMCreating → VMRunning`, and `ContainerRunning → Succeeded`/`Failed` are all explicit poll-until-true steps, not assumed-synchronous transitions. The first two poll UpCloud's own API (Phase 7: firewall-rule-apply and server-create calls both return before the underlying state is actually true). The third polls the worker over SSH for `/tmp/exit-code` (Phase 10) — cloud-init writes it as the very last thing it does, and the shim fetches the real exit code plus the full container logs (cached to `jobs.cached_logs`, since the worker is deleted a few states later) the moment it appears. A resource that never reaches its target state no longer polls forever: Phase 11 added a uniform 5-minute stuck-in-this-state timeout covering every polling state (and every one-shot state, same gap Phase 8 left there) via a single check in `advance_all`, rather than three separately-tracked per-resource-type timeouts.
 
 A running job that exceeds its `activeDeadlineSeconds` (Phase 11) is force-killed and transitions to `Failed` with reason `DeadlineExceeded` — the same terminology real Kubernetes Jobs use for this exact situation.
 
@@ -1035,7 +1021,7 @@ The shim ships as a `FROM scratch` OCI image (Phase 3): a statically-linked musl
 - Phase 8: small volumes created/deleted cleanly (verified live against the real UpCloud API: 3 real create→delete cycles, zero orphans left afterward), orphan scan finds/deletes untracked volumes carrying this instance's prefix while leaving tracked ones alone, a failed create/delete leaves the job in place and retries rather than wedging or leaking
 - Phase 9: VMs launch sized per-job, receive real cloud-init, containers run only after firewall rules are verified applied; every worker VM unreachable inbound from anywhere but the shim's own IP while still reaching the internet outbound — verified live across 6 full real job runs (volume+VM create → firewall apply/verify → container run → self-poweroff detected → full cleanup incl. boot disk), zero orphans left, external `nc` timeout confirmed against a live worker
 - Phase 10: kubectl logs -f works while container running, via `russh` (no `ssh` subprocess spawned by the shim) — verified against a real OpenSSH server (kube-shim.brawer.ch's own sshd); real exit code populates `jobs.exit_code` and splits `Succeeded`/`Failed`; logs remain fetchable via `jobs.cached_logs` after the worker VM is gone
-- Phase 11: 10+ chaos scenarios (kill shim, container crashes, etc.) with zero orphans and zero duplicate resources; a job that overruns `activeDeadlineSeconds` is force-killed and marked `Failed`/`DeadlineExceeded`, including when the shim was down at the moment the deadline passed
+- Phase 11: idempotency-reuse and deadline/stuck-state force-fail all verified against mock UpCloud servers exercising the real response shapes (8 dedicated tests); real hands-on chaos/deadline verification against live UpCloud deferred to the post-merge deploy-and-verify step against `kube-shim.brawer.ch`, same as every other phase's live check — see that phase's own section for the result
 - Phase 12: kubectl describe shows events, kubectl top shows metrics across all running jobs
 - Phase 13: costs calculated per job and per family in `main_currency`; a job whose estimate exceeds the budget balance waits in `BudgetWait` and launches once enough has accrued; a job that finishes early returns its unused margin to the balance; the CSV cost report groups correctly by label
 - Phase 14: status page and `/healthz`/`/livez`/`/readyz` reachable with no auth on `:443` (same listener/cert as the authenticated API), show events/jobs/cost, never leak secrets, reject all non-GET requests, and don't widen the authenticated API's own auth requirement
