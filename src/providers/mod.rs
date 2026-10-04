@@ -156,6 +156,15 @@ pub trait CloudProvider: Send + Sync {
     /// see docs/IMPLEMENTATION_PLAN.md Phase 7. Phase 9 is what actually
     /// builds the poll loop; this method is the primitive it polls with.
     async fn get_server(&self, server_id: &str) -> Result<Server, ProviderError>;
+    /// UpCloud rejects `delete_server` on a server whose `state` isn't
+    /// `"stopped"` yet (`409 SERVER_STATE_ILLEGAL`) -- verified live
+    /// against the real API (docs/IMPLEMENTATION_PLAN.md Phase 11's real
+    /// finding), not assumed. Every caller of `delete_server` on a worker
+    /// VM that might still be running must call this first and wait for
+    /// `get_server` to actually report `"stopped"` before deleting --
+    /// this call itself only *requests* the stop, which UpCloud carries
+    /// out asynchronously, same as `create_server`/`create_firewall_rules`.
+    async fn stop_server(&self, server_id: &str) -> Result<Server, ProviderError>;
     async fn delete_server(&self, server_id: &str) -> Result<(), ProviderError>;
     /// Every server that currently exists in `zone` -- not filtered by
     /// title/prefix, same convention as `list_volumes`. Added in Phase 9

@@ -95,7 +95,7 @@
 
 use crate::providers::{
     CloudProvider, CreateServerRequest, CreateVolumeRequest, FirewallAction, FirewallDirection,
-    FirewallFamily, FirewallRule,
+    FirewallFamily, FirewallRule, ProviderError,
 };
 use crate::{cloud_init, ssh, volumes, workload};
 use anyhow::Result;
@@ -1100,6 +1100,59 @@ async fn handle_vm_terminating(
     if ctx.dry_run {
         tracing::info!("DRY-RUN: would delete worker VM {vm_id} for job {namespace}/{name}");
         return Ok(true);
+    }
+
+    // UpCloud rejects delete_server on a server that isn't already
+    // "stopped" (409 SERVER_STATE_ILLEGAL) -- real finding from Phase 11's
+    // own live verification, not assumed. Since Phase 10 leaves the worker
+    // VM genuinely running right up until this state, this check isn't
+    // optional: without it, every real job's cleanup would hit this same
+    // error and retry forever (VMTerminating has no stuck-state timeout of
+    // its own, by design -- see is_pre_completion_state).
+    let server = match ctx.provider.get_server(&vm_id).await {
+        Ok(server) => Some(server),
+        Err(ProviderError::NotFound(_)) => None,
+        Err(err) => {
+            record_failed_attempt(
+                pool,
+                job_id,
+                namespace,
+                name,
+                &err.to_string(),
+                last_transition_time,
+            )
+            .await?;
+            return Ok(false);
+        }
+    };
+
+    if let Some(server) = &server {
+        if server.state != "stopped" {
+            if server.state == "started" {
+                tracing::info!(
+                    "job {namespace}/{name}: stopping worker VM {vm_id} before deleting it"
+                );
+                if let Err(err) = ctx.provider.stop_server(&vm_id).await {
+                    record_failed_attempt(
+                        pool,
+                        job_id,
+                        namespace,
+                        name,
+                        &err.to_string(),
+                        last_transition_time,
+                    )
+                    .await?;
+                    return Ok(false);
+                }
+            } else {
+                tracing::debug!(
+                    "job {namespace}/{name}: waiting for worker VM {vm_id} to stop \
+                     (state: {}) before deleting it",
+                    server.state
+                );
+            }
+            return Ok(false);
+        }
     }
 
     match ctx.provider.delete_server(&vm_id).await {
@@ -2172,7 +2225,10 @@ mod tests {
     async fn test_vm_terminating_real_success_deletes_and_advances() {
         let app = axum::Router::new().route(
             "/1.3/server/:uuid",
-            axum::routing::delete(|| async { axum::http::StatusCode::NO_CONTENT }),
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"server": {"uuid": "srv1", "title": "t", "state": "stopped"}}))
+            })
+            .delete(|| async { axum::http::StatusCode::NO_CONTENT }),
         );
         let provider = crate::providers::upcloud::tests::mock_server(app).await;
         let mut ctx = mock_ctx(false);
@@ -2189,6 +2245,89 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "Archived");
+    }
+
+    #[tokio::test]
+    async fn test_vm_terminating_stops_a_running_server_before_deleting_it() {
+        // Phase 11's real live finding: UpCloud refuses delete_server on a
+        // server that's still "started" (409 SERVER_STATE_ILLEGAL). This
+        // tick must call stop_server instead of delete_server, and must
+        // NOT advance the job yet -- deletion only happens once a later
+        // tick observes "stopped".
+        let delete_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delete_called_clone = delete_called.clone();
+        let stop_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_called_clone = stop_called.clone();
+        let app = axum::Router::new()
+            .route(
+                "/1.3/server/:uuid",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({"server": {"uuid": "srv1", "title": "t", "state": "started"}}))
+                })
+                .delete(move || {
+                    delete_called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                    async { axum::http::StatusCode::NO_CONTENT }
+                }),
+            )
+            .route(
+                "/1.3/server/:uuid/stop",
+                axum::routing::post(move || {
+                    stop_called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                    async {
+                        axum::Json(serde_json::json!({"server": {"uuid": "srv1", "title": "t", "state": "started"}}))
+                    }
+                }),
+            );
+        let provider = crate::providers::upcloud::tests::mock_server(app).await;
+        let mut ctx = mock_ctx(false);
+        ctx.provider = Arc::new(provider);
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_job_with_vm(&pool, "VMTerminating", "srv1").await;
+
+        let advanced = advance_all(&pool, &ctx).await.unwrap();
+        assert_eq!(
+            advanced, 0,
+            "must not advance until the server is actually stopped"
+        );
+        assert!(stop_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !delete_called.load(std::sync::atomic::Ordering::SeqCst),
+            "must not call delete_server while the server is still started"
+        );
+
+        let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = 'j1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "VMTerminating");
+    }
+
+    #[tokio::test]
+    async fn test_vm_terminating_waits_while_server_is_stopping() {
+        // An intermediate state (neither "started" nor "stopped" yet) must
+        // not re-issue stop_server, and must not advance.
+        let app = axum::Router::new().route(
+            "/1.3/server/:uuid",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"server": {"uuid": "srv1", "title": "t", "state": "stopping"}}))
+            }),
+        );
+        let provider = crate::providers::upcloud::tests::mock_server(app).await;
+        let mut ctx = mock_ctx(false);
+        ctx.provider = Arc::new(provider);
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_job_with_vm(&pool, "VMTerminating", "srv1").await;
+
+        let advanced = advance_all(&pool, &ctx).await.unwrap();
+        assert_eq!(advanced, 0);
+
+        let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = 'j1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "VMTerminating");
     }
 
     // --- Phase 11: activeDeadlineSeconds / stuck-state enforcement ---

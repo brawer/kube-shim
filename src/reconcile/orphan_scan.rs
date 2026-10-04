@@ -92,6 +92,27 @@ async fn scan_and_clean_servers(pool: &SqlitePool, ctx: &JobContext) -> Result<u
             continue;
         }
 
+        // Same real constraint as reconcile::job's handle_vm_terminating:
+        // UpCloud refuses to delete a server that isn't already "stopped"
+        // (409 SERVER_STATE_ILLEGAL) -- an untracked worker VM found here
+        // is often still genuinely running, so this can't skip straight
+        // to delete_server the way it used to.
+        if server.state != "stopped" {
+            if server.state == "started" {
+                tracing::warn!(
+                    "orphan scan: stopping untracked worker VM {} ({}) before deleting it",
+                    server.id,
+                    server.title
+                );
+                if let Err(err) = ctx.provider.stop_server(&server.id).await {
+                    tracing::error!("orphan scan: failed to stop server {}: {err}", server.id);
+                }
+            }
+            // Stop is asynchronous -- deletion is left for a future scan
+            // once the server has actually reached "stopped".
+            continue;
+        }
+
         tracing::warn!(
             "orphan scan: deleting untracked worker VM {} ({})",
             server.id,
@@ -215,8 +236,13 @@ mod tests {
             .route(
                 "/1.3/server",
                 axum::routing::get(|| async {
+                    // Already "stopped" -- e.g. a worker whose job finished
+                    // and that got stopped on a previous scan (see
+                    // test_stops_a_running_untracked_worker_vm_before_deleting_it
+                    // for the "still started" path, which can't delete in
+                    // the same scan).
                     Json(json!({"servers": {"server": [
-                        {"uuid": "orphan-vm-1", "title": "kube-shim-worker-osmdiffs-weekly-123", "state": "started", "zone": "de-fra1"},
+                        {"uuid": "orphan-vm-1", "title": "kube-shim-worker-osmdiffs-weekly-123", "state": "stopped", "zone": "de-fra1"},
                         {"uuid": "not-ours", "title": "some-other-server", "state": "started", "zone": "de-fra1"}
                     ]}}))
                 }),
@@ -230,6 +256,54 @@ mod tests {
 
         let cleaned = scan_and_clean(&pool, &ctx_with(provider)).await.unwrap();
         assert_eq!(cleaned, 1);
+    }
+
+    #[tokio::test]
+    async fn test_stops_a_running_untracked_worker_vm_before_deleting_it() {
+        // Real Phase 11 finding: UpCloud refuses delete_server on a
+        // "started" server (409 SERVER_STATE_ILLEGAL). An untracked worker
+        // found still running must be stopped first, not deleted
+        // immediately -- deletion is left for a later scan.
+        let delete_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delete_called_clone = delete_called.clone();
+        let stop_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_called_clone = stop_called.clone();
+        let app = axum::Router::new()
+            .route(
+                "/1.3/storage/normal",
+                axum::routing::get(|| async { Json(json!({"storages": {"storage": []}})) }),
+            )
+            .route(
+                "/1.3/server",
+                axum::routing::get(|| async {
+                    Json(json!({"servers": {"server": [
+                        {"uuid": "orphan-vm-1", "title": "kube-shim-worker-osmdiffs-weekly-123", "state": "started", "zone": "de-fra1"}
+                    ]}}))
+                }),
+            )
+            .route(
+                "/1.3/server/:uuid",
+                axum::routing::delete(move || {
+                    delete_called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                    async { axum::http::StatusCode::NO_CONTENT }
+                }),
+            )
+            .route(
+                "/1.3/server/:uuid/stop",
+                axum::routing::post(move || {
+                    stop_called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                    async {
+                        Json(json!({"server": {"uuid": "orphan-vm-1", "title": "t", "state": "started"}}))
+                    }
+                }),
+            );
+        let provider = mock_server(app).await;
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+
+        let cleaned = scan_and_clean(&pool, &ctx_with(provider)).await.unwrap();
+        assert_eq!(cleaned, 0, "deletion is deferred to a later scan");
+        assert!(stop_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!delete_called.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]
