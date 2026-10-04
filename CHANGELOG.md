@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.0](https://github.com/brawer/kube-shim/compare/v0.1.13...v0.2.0) (2026-10-04)
+
+
+### 🆕 Enhancements
+
+* Events + Metrics APIs (Phase 12) ([#46](https://github.com/brawer/kube-shim/issues/46)) ([19560f9](https://github.com/brawer/kube-shim/commit/19560f933cdac877799363c90a89a0bfa481e06f))
+* honor resources.limits on the worker VM, to de-risk migration to real k8s ([#48](https://github.com/brawer/kube-shim/issues/48)) ([b30381c](https://github.com/brawer/kube-shim/commit/b30381c36c6c29565dd893fd19502f53d23f692c))
+
+
+### 🚧 Maintenance
+
+* release as 0.2.0 ([#49](https://github.com/brawer/kube-shim/issues/49)) ([776f5d6](https://github.com/brawer/kube-shim/commit/776f5d690fbeff7da5d2edbc0953a492f1fd99e0))
+
 ## [0.1.13](https://github.com/brawer/kube-shim/compare/v0.1.12...v0.1.13) (2026-10-04)
 
 
