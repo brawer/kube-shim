@@ -285,6 +285,40 @@ async fn force_failed(
     .bind(job_id)
     .execute(pool)
     .await?;
+    record_event(pool, job_id, "Failed", reason, "Warning").await?;
+    Ok(())
+}
+
+/// Records one row in `events` (Phase 12) -- `kubectl describe pod` reads
+/// these back via `api::events::list_events`, joined against `jobs` for
+/// the job's own name/namespace (`events.job_id` is the job's internal
+/// UUID, not its user-facing name). Deliberately one row per occurrence,
+/// never de-duplicated/counted the way a real apiserver would collapse
+/// repeated identical events -- this project's own transitions are each
+/// already a distinct, one-time occurrence (a job never re-enters the
+/// same state twice on its way from `Created` to `Archived`), so there's
+/// nothing to collapse.
+async fn record_event(
+    pool: &SqlitePool,
+    job_id: &str,
+    reason: &str,
+    message: &str,
+    event_type: &str,
+) -> Result<()> {
+    let id = Uuid::new_v4().to_string();
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        "INSERT INTO events (id, job_id, reason, message, timestamp, type) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(job_id)
+    .bind(reason)
+    .bind(message)
+    .bind(now)
+    .bind(event_type)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -445,6 +479,19 @@ pub async fn advance_all(pool: &SqlitePool, ctx: &JobContext) -> Result<usize> {
         .await?;
 
         tracing::info!("job {namespace}/{name}: {status} -> {target_status}");
+        let event_type = if target_status == "Failed" {
+            "Warning"
+        } else {
+            "Normal"
+        };
+        record_event(
+            pool,
+            &id,
+            target_status,
+            &format!("Transitioned from {status} to {target_status}"),
+            event_type,
+        )
+        .await?;
         advanced += 1;
     }
 
@@ -463,7 +510,11 @@ fn find_ephemeral_volume(spec: &JsonValue) -> Option<&JsonValue> {
         .find_map(|v| v.pointer("/ephemeral/volumeClaimTemplate/spec"))
 }
 
-fn extract_resource_requests(spec: &JsonValue) -> (Option<u32>, Option<u32>) {
+/// `pub(crate)`: also used by `api::metrics` (Phase 12) to estimate
+/// resource usage across every currently non-terminal job, the same way
+/// `handle_vm_pending` already sizes the worker VM itself from these same
+/// values.
+pub(crate) fn extract_resource_requests(spec: &JsonValue) -> (Option<u32>, Option<u32>) {
     let requests = spec.pointer("/template/spec/containers/0/resources/requests");
     let cpu_cores = requests
         .and_then(|r| r.get("cpu"))
@@ -2411,6 +2462,32 @@ mod tests {
                 .unwrap();
         assert_eq!(status, "Failed");
         assert!(last_error.unwrap().contains("DeadlineExceeded"));
+
+        let (reason, event_type, message): (String, String, String) =
+            sqlx::query_as("SELECT reason, type, message FROM events WHERE job_id = 'j1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reason, "Failed");
+        assert_eq!(event_type, "Warning");
+        assert!(message.contains("DeadlineExceeded"));
+    }
+
+    #[tokio::test]
+    async fn test_normal_transition_records_a_normal_event() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_job_with_vm(&pool, "VMTerminating", "srv1").await;
+
+        let advanced = advance_all(&pool, &mock_ctx(true)).await.unwrap();
+        assert_eq!(advanced, 1);
+
+        let (reason, event_type): (String, String) =
+            sqlx::query_as("SELECT reason, type FROM events WHERE job_id = 'j1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reason, "Archived");
+        assert_eq!(event_type, "Normal");
     }
 
     #[tokio::test]

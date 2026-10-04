@@ -43,8 +43,14 @@ pub fn build_router(
 ) -> Router {
     Router::new()
         // Discovery endpoints
+        .route("/api", get(api::discovery_root))
+        .route("/apis", get(api::discovery_apis_root))
         .route("/api/v1", get(api::discovery_v1))
         .route("/apis/batch/v1", get(api::discovery_batch_v1))
+        .route(
+            "/apis/metrics.k8s.io/v1beta1",
+            get(api::discovery_metrics_v1beta1),
+        )
         // Health check
         .route("/health", get(api::health))
         // Secrets API
@@ -56,11 +62,38 @@ pub fn build_router(
             "/api/v1/namespaces/:namespace/secrets/:name",
             get(api::secret::get_secret).delete(api::secret::delete_secret),
         )
-        // Pod logs (Phase 10) -- one pod per job run, so "pod name" is a
-        // job's own `name` directly.
+        // Pods (Phase 12's minimal synthetic GET; Phase 10's /log
+        // subresource) -- one pod per job run, so "pod name" is a job's
+        // own `name` directly.
+        .route(
+            "/api/v1/namespaces/:namespace/pods/:name",
+            get(api::pods::get_pod),
+        )
         .route(
             "/api/v1/namespaces/:namespace/pods/:name/log",
             get(api::logs::get_pod_log),
+        )
+        // Events (Phase 12) -- what `kubectl describe pod` reads.
+        .route(
+            "/api/v1/namespaces/:namespace/events",
+            get(api::events::list_events),
+        )
+        // Metrics (Phase 12) -- what `kubectl top nodes`/`kubectl top
+        // pods` read. "nodes" is cluster-scoped (no namespace); "pods"
+        // has both an all-namespaces form (`kubectl top pods -A`) and a
+        // namespaced one (plain `kubectl top pods`), matching real
+        // metrics-server's own dual-route convention.
+        .route(
+            "/apis/metrics.k8s.io/v1beta1/nodes",
+            get(api::metrics::list_node_metrics),
+        )
+        .route(
+            "/apis/metrics.k8s.io/v1beta1/pods",
+            get(api::metrics::list_pod_metrics),
+        )
+        .route(
+            "/apis/metrics.k8s.io/v1beta1/namespaces/:namespace/pods",
+            get(api::metrics::list_pod_metrics_for_namespace),
         )
         // CronJobs API
         .route(

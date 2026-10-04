@@ -696,30 +696,30 @@ cargo test   # 157 lib tests + 19 integration tests, including a real
 
 ---
 
-### Phase 12: Events + Metrics APIs (Days 12-13)
+### Phase 12: Events + Metrics APIs (Days 12-13) — ✅ Complete
 **Goal:** Add observability for `kubectl describe` and monitoring across the whole cronjob family, not just one workload.
 
-**Deliverables:**
-- Events table in SQLite: reason, message, timestamp
-- Emit events during reconciliation: "VolumeCreated", "VMStarting", "FirewallVerified", "ContainerRunning", "BudgetWait", etc.
-- Metrics API: `GET /apis/metrics.k8s.io/v1beta1/nodes` and `/pods`
-- Estimate CPU/memory from running jobs (CPU cores * job count, etc.), aggregated across every cronjob, not just osmdiffs
+**What was actually built:**
 
-**Files to create/modify:**
-- `src/api/events.rs` (new) - list events
-- `src/api/metrics.rs` (new) - node and pod metrics
-- `src/reconcile/job.rs` - emit events at each state change
-- `src/db/schema.sql` - add events table
+- **Events, emitted generically from one choke point, not sprinkled per-handler.** `events` (the table itself was front-loaded since Phase 1, like `job_volumes`/`last_transition_time` — nothing new to migrate). `reconcile::job::record_event` is called from exactly two places: once in `advance_all`'s own shared `UPDATE jobs ... ` block, right after *any* real transition commits (reason = the new `target_status` itself — `"VolumeCreated"`, `"FirewallVerified"`, `"ContainerRunning"`, etc., already exactly matching the plan's own example reasons, verbatim, since they're literally this project's own state names), and once in `force_failed` (reason `"Failed"`, message = the existing `DeadlineExceeded`/`StateTimeout` detail string, type `Warning`). Every other transition is `Normal`. This covers every example reason the plan named except `"BudgetWait"`, which doesn't exist as a state yet (Phase 13).
+- **`api::events::list_events`** (`GET /api/v1/namespaces/:namespace/events`) — joins `events` against `jobs` to resolve `job_id` back to a name (events don't know a job's user-facing name directly), and parses the real `fieldSelector=involvedObject.name=...` query parameter `kubectl describe pod` actually sends, not just an unfiltered dump.
+- **`api::metrics`** (`GET /apis/metrics.k8s.io/v1beta1/nodes` and `/pods`, plus the namespaced `/namespaces/:namespace/pods` real metrics-server also exposes) — every number is an estimate from each non-terminal job's own `resources.requests` (the same values `handle_vm_pending` already uses to size the worker VM), not a real measurement; there's no cAdvisor or SSH-based sampling anywhere. "Node" is a fiction too: this project has no node pool, just ephemeral per-job worker VMs, so `list_node_metrics` reports exactly one synthetic aggregate node (named `"kube-shim"`) summing every non-terminal job's request, matching the plan's own "aggregated across every cronjob" wording.
+- **Three real findings from hands-on verification against a real `kubectl` v1.37 client (not just mock-server tests) — all three would have shipped silently broken without actually running `kubectl` against this:**
+  1. **`kubectl top`/`kubectl describe` call the bare, version-less `/api` and `/apis` discovery roots *before* ever touching a specific group-version's resource list — confirmed via `kubectl top nodes -v=8`, which 404s on exactly those two paths and never even attempts `/apis/metrics.k8s.io/v1beta1/nodes`.** Neither existed (this project's discovery was always `/api/v1`/`/apis/batch/v1` directly, skipping the aggregate roots — which happened to never matter for Terraform's own provider, apparently, but does for kubectl). Added `api::discovery_root` (`/api` → `APIVersions`) and `api::discovery_apis_root` (`/apis` → `APIGroupList`).
+  2. **`kubectl describe pod` needs a real base Pod object to fetch before it goes on to list events for it** — there was no standalone Pod GET anywhere (only the `/log` subresource, Phase 10). Added `api::pods::get_pod`, a minimal synthetic Pod whose `status.phase` is derived from the job's own state (`ContainerRunning` → `Running`, `Succeeded`/`Failed` direct, the cleanup tail inferring whichever of those it already reached from `last_error`, everything earlier → `Pending`) — deliberately not a full Pod spec/list (`discovery_v1` advertises only the `get` verb, honestly, since there's no `list` handler behind it).
+  3. **`kubectl describe pod`'s Events table computes its own "Age" column by unmarshaling `firstTimestamp`/`lastTimestamp` through client-go's real, camelCase-tagged `v1.Event` struct — not by passing them through opaquely the way `reason`/`message` are.** This project's established convention for every other resource (`Secret`/`CronJob`) is plain snake_case field names with no `#[serde(rename_all)]`, which happens to never matter for single-word fields (`reason`, `status`, `phase`) but silently produced `<unknown>` for these two multi-word ones instead of an error — easy to miss without actually running `kubectl describe`, which is exactly why this project insists on real hands-on verification rather than trusting a shape looks right. Fixed with a field-level `#[serde(rename)]` on just these two fields in the new `Event` struct; every *existing* resource's snake_case convention is left exactly as-is (an incompatible change to it would be a major-version API break per this project's own SemVer rule, for a cosmetic win nothing currently depends on).
+- **Deliberate limitation, not a cut corner: `kubectl top nodes` doesn't fully work.** Beyond the metrics data itself (which is correct and independently verified via `kubectl get --raw /apis/metrics.k8s.io/v1beta1/nodes`), the `kubectl top nodes` *subcommand* also requires a real `GET /api/v1/nodes` — the actual core Node object list, not metrics — to cross-reference against, which this project doesn't implement and deliberately won't: there is no node pool here, just a single control-plane VPS and ephemeral per-job worker VMs, so faking a Node object would misrepresent the architecture for a cosmetic win on one CLI subcommand. `kubectl top pods` (which *does* map onto something real, one pod per job run) was verified working completely, end-to-end, with real formatted output.
 
-**Testing:**
-```bash
-kubectl describe pod osmdiffs-weekly-...
-# Should see Events section with VolumeCreated, VMStarting, etc.
+**Files created/modified:**
+- `src/api/events.rs` (new) — `list_events`, `Event`/`EventList`, field-selector parsing; 5 tests
+- `src/api/metrics.rs` (new) — `list_node_metrics`/`list_pod_metrics`/`list_pod_metrics_for_namespace`; 4 tests
+- `src/api/pods.rs` (new) — `get_pod`, the phase-inference helper; 5 tests
+- `src/api/mod.rs` — `discovery_root`, `discovery_apis_root`, `discovery_metrics_v1beta1`; `pods`/`events` added to `discovery_v1`
+- `src/app.rs` — routes for all of the above
+- `src/reconcile/job.rs` — `record_event`, called from `advance_all` and `force_failed`; `extract_resource_requests` made `pub(crate)` for `api::metrics` to reuse; 2 tests
+- `src/db/schema.sql` — **not touched**: `events` already existed, front-loaded since Phase 1
 
-kubectl top nodes
-kubectl top pods
-# Should show estimated CPU/memory usage across all concurrently running jobs
-```
+**Testing:** 188 lib tests + 19 integration tests, all passing; `cargo fmt --check`/`cargo clippy --all-targets -- -D warnings` clean; `./smoke-test.sh --skip-build` passing. **Real hands-on verification against a real `kubectl` v1.37.0 client** (not just mock HTTP tests) against a local dry-run instance: a full job run's real event history fetched via `kubectl get --raw` with the real `fieldSelector` kubectl sends; `kubectl top pods` showing correct aggregated CPU/memory across multiple concurrent dry-run jobs; `kubectl describe pod` showing the full, correctly-ordered Events table with working Age — this is what surfaced all three real findings above, none of which any mock-server unit test could have caught.
 
 ---
 
@@ -903,7 +903,7 @@ curl -k https://localhost:443/debug/status | jq '.total_cost, .budget_balance'
 | `src/admission.rs` | `activeDeadlineSeconds`-required policy check | Create (Phase 5) |
 | `src/db/schema.sql` | SQLite schema | Phases 1, 5-6, 8-9, 13 |
 | `src/db/migrations.rs` | `ALTER TABLE`-based column migrations for already-existing tables | Create (Phase 6); first real use (Phase 10) |
-| `src/reconcile/*.rs` | State machine loop, `Notify`-based wake-up, `activeDeadlineSeconds` enforcement | Create (Phases 6, 8-10, 11, 13) |
+| `src/reconcile/*.rs` | State machine loop, `Notify`-based wake-up, `activeDeadlineSeconds` enforcement, event recording | Create (Phases 6, 8-12, 13) |
 | `src/providers/*.rs` | `CloudProvider` trait + UpCloud implementation, request timeout (Phase 11) | Create (Phases 7-9, 11, 13) |
 | `src/providers/upcloud/firewall.rs` | Firewall rules for worker VMs (create + list, both real since Phase 7; poll-until-applied logic itself is Phase 9) | Create (Phase 7) |
 | `src/currency.rs` | ECB daily exchange-rate sync + conversion to `main_currency` | Create (Phase 13) |
@@ -911,6 +911,9 @@ curl -k https://localhost:443/debug/status | jq '.total_cost, .budget_balance'
 | `src/api/cost_report.rs` | CSV cost report, grouped by job label | Create (Phase 13) |
 | `src/ssh.rs` | SSH client built on `russh` (`exec_once`/`exec_stream`), no host-key verification (by design); connect/inactivity timeouts (Phase 11) | Create (Phase 10); Phase 11 |
 | `src/api/logs.rs` | `kubectl logs`/`-f`: live SSH while `ContainerRunning`, `jobs.cached_logs` fallback otherwise | Create (Phase 10) |
+| `src/api/events.rs` | `kubectl describe pod`'s Events table: lists `events`, joined against `jobs`, with real `fieldSelector` support | Create (Phase 12) |
+| `src/api/metrics.rs` | `kubectl top nodes`/`kubectl top pods`: CPU/memory estimated from each job's own resource requests | Create (Phase 12) |
+| `src/api/pods.rs` | Minimal synthetic Pod `GET`, needed for `kubectl describe pod` to have a base object to fetch | Create (Phase 12) |
 | `src/status_page.rs` | Public status page + `/healthz`/`/livez`/`/readyz`, served on `:443` | Create (Phase 14) |
 | `src/naming.rs` | `resource_prefix`-aware resource name generation | Create (Phase 15) |
 | `src/config.rs` | Configuration parsing | Phases 1-2, 4-5, 7, 9 |
@@ -1026,7 +1029,7 @@ The shim ships as a `FROM scratch` OCI image (Phase 3): a statically-linked musl
 - Phase 9: VMs launch sized per-job, receive real cloud-init, containers run only after firewall rules are verified applied; every worker VM unreachable inbound from anywhere but the shim's own IP while still reaching the internet outbound — verified live across 6 full real job runs (volume+VM create → firewall apply/verify → container run → self-poweroff detected → full cleanup incl. boot disk), zero orphans left, external `nc` timeout confirmed against a live worker
 - Phase 10: kubectl logs -f works while container running, via `russh` (no `ssh` subprocess spawned by the shim) — verified against a real OpenSSH server (kube-shim.brawer.ch's own sshd); real exit code populates `jobs.exit_code` and splits `Succeeded`/`Failed`; logs remain fetchable via `jobs.cached_logs` after the worker VM is gone
 - Phase 11: idempotency-reuse and deadline/stuck-state force-fail all verified against mock UpCloud servers exercising the real response shapes (8 dedicated tests); real hands-on chaos/deadline verification against live UpCloud deferred to the post-merge deploy-and-verify step against `kube-shim.brawer.ch`, same as every other phase's live check — see that phase's own section for the result
-- Phase 12: kubectl describe shows events, kubectl top shows metrics across all running jobs
+- Phase 12: verified against a real `kubectl` v1.37 client, not just mocks — `kubectl describe pod` shows the full, correctly-ordered Events table with working Age; `kubectl top pods` shows correct aggregated CPU/memory across multiple concurrent jobs; `kubectl top nodes` deliberately doesn't fully work (no real Node object, by design — see that phase's own section)
 - Phase 13: costs calculated per job and per family in `main_currency`; a job whose estimate exceeds the budget balance waits in `BudgetWait` and launches once enough has accrued; a job that finishes early returns its unused margin to the balance; the CSV cost report groups correctly by label
 - Phase 14: status page and `/healthz`/`/livez`/`/readyz` reachable with no auth on `:443` (same listener/cert as the authenticated API), show events/jobs/cost, never leak secrets, reject all non-GET requests, and don't widen the authenticated API's own auth requirement
 - Phase 15: all resources named with the configured `resource_prefix`, cleanup script works, two instances with different prefixes don't interfere with each other's orphan scans
