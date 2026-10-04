@@ -511,20 +511,25 @@ fn find_ephemeral_volume(spec: &JsonValue) -> Option<&JsonValue> {
 }
 
 /// `pub(crate)`: also used by `api::metrics` (Phase 12) to estimate
-/// resource usage across every currently non-terminal job, the same way
-/// `handle_vm_pending` already sizes the worker VM itself from these same
-/// values.
+/// resource usage across every currently non-terminal job. Returns
+/// `(cpu_millicores, memory_mb)` -- full precision, *not* rounded up to
+/// whole cores/gigabytes the way `handle_vm_pending`'s own VM-sizing
+/// needs (see `workload::parse_cpu_millicores`'s docs for why those are
+/// two deliberately different concerns): a job that requested `"500m"`/
+/// `"512Mi"` should be reported as having requested exactly that, not
+/// `kubectl top`-overstated to a whole core/GB just because that's what
+/// ended up provisioned underneath it.
 pub(crate) fn extract_resource_requests(spec: &JsonValue) -> (Option<u32>, Option<u32>) {
     let requests = spec.pointer("/template/spec/containers/0/resources/requests");
-    let cpu_cores = requests
+    let cpu_millicores = requests
         .and_then(|r| r.get("cpu"))
         .and_then(JsonValue::as_str)
-        .and_then(|q| workload::parse_cpu_cores(q).ok());
-    let memory_gb = requests
+        .and_then(|q| workload::parse_cpu_millicores(q).ok());
+    let memory_mb = requests
         .and_then(|r| r.get("memory"))
         .and_then(JsonValue::as_str)
-        .and_then(|q| volumes::parse_storage_quantity_gb(q).ok());
-    (cpu_cores, memory_gb)
+        .and_then(|q| volumes::parse_storage_quantity_mb(q).ok());
+    (cpu_millicores, memory_mb)
 }
 
 /// `VolumePending`: create the job's ephemeral volume for real (or log
@@ -641,15 +646,18 @@ async fn handle_vm_pending(
     last_transition_time: Option<i64>,
 ) -> Result<bool> {
     let spec: JsonValue = serde_json::from_str(spec_str).unwrap_or(JsonValue::Null);
-    let (cpu_cores, memory_gb) = extract_resource_requests(&spec);
-    let plan =
-        workload::smallest_fitting_server_plan(cpu_cores.unwrap_or(1), memory_gb.unwrap_or(1));
+    let (cpu_millicores, memory_mb) = extract_resource_requests(&spec);
+    // Rounded *up* here, deliberately: UpCloud has no fractional-core or
+    // sub-GB-memory plans, so sizing the actual worker VM needs whole
+    // units, even though the request itself (and everything reporting
+    // on it, e.g. api::metrics) keeps full precision.
+    let cpu_cores = cpu_millicores.unwrap_or(1000).div_ceil(1000);
+    let memory_gb = memory_mb.unwrap_or(1024).div_ceil(1024);
+    let plan = workload::smallest_fitting_server_plan(cpu_cores, memory_gb);
 
     let Some(plan) = plan else {
         let msg = format!(
-            "no known server plan is big enough for {}/{} CPU/GB requested",
-            cpu_cores.unwrap_or(1),
-            memory_gb.unwrap_or(1)
+            "no known server plan is big enough for {cpu_cores}/{memory_gb} CPU/GB requested"
         );
         record_failed_attempt(pool, job_id, namespace, name, &msg, last_transition_time).await?;
         return Ok(false);
@@ -658,7 +666,7 @@ async fn handle_vm_pending(
     if ctx.dry_run {
         tracing::info!(
             "DRY-RUN: would launch VM for job {namespace}/{name}: plan {} \
-             ({cpu_cores:?} CPU / {memory_gb:?}GB requested)",
+             ({cpu_cores} CPU / {memory_gb}GB requested)",
             plan.name
         );
         return Ok(true);
@@ -1686,6 +1694,45 @@ mod tests {
             worker_vm_id.is_none(),
             "dry-run must never create a real VM"
         );
+    }
+
+    #[tokio::test]
+    async fn test_vm_pending_rounds_fractional_request_up_to_a_whole_plan() {
+        // UpCloud has no fractional-core/sub-GB-memory plans -- a job
+        // that asked for "500m"/"512Mi" must still get sized onto a
+        // real, whole-unit plan (the smallest one that fits), even
+        // though extract_resource_requests itself now preserves that
+        // fractional precision for api::metrics's own purposes.
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = Utc::now().timestamp();
+        let spec = serde_json::json!({
+            "template": {"spec": {
+                "containers": [{"image": "x", "resources": {"requests": {"cpu": "500m", "memory": "512Mi"}}}]
+            }}
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
+             VALUES ('j1', 'job-one', 'default', ?, 'VMPending', ?, ?, 1)",
+        )
+        .bind(spec)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let advanced = advance_all(&pool, &mock_ctx(true)).await.unwrap();
+        assert_eq!(
+            advanced, 1,
+            "a fractional request must still find a fitting plan, not error out"
+        );
+
+        let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = 'j1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "FirewallApplying");
     }
 
     #[tokio::test]

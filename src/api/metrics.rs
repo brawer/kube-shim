@@ -31,17 +31,31 @@ pub struct Usage {
     pub memory: String,
 }
 
-fn format_usage(cpu_cores: u32, memory_gb: u32) -> Usage {
-    Usage {
-        cpu: cpu_cores.to_string(),
-        memory: format!("{memory_gb}Gi"),
+/// Formats millicores the way a real `resource.Quantity` would print
+/// itself: a whole number of cores bare (`"2"`), anything fractional
+/// with the `m` suffix (`"500m"`) -- not always-millicores, which would
+/// make every whole-core job show as e.g. `"2000m"` instead of the more
+/// readable `"2"` kubectl itself prefers.
+fn format_cpu_millicores(millicores: u32) -> String {
+    if millicores.is_multiple_of(1000) {
+        (millicores / 1000).to_string()
+    } else {
+        format!("{millicores}m")
     }
 }
 
-/// Every non-terminal job's own `(cpu_cores, memory_gb)` request,
+fn format_usage(cpu_millicores: u32, memory_mb: u32) -> Usage {
+    Usage {
+        cpu: format_cpu_millicores(cpu_millicores),
+        memory: format!("{memory_mb}Mi"),
+    }
+}
+
+/// Every non-terminal job's own `(cpu_millicores, memory_mb)` request,
 /// defaulting the same way `handle_vm_pending` does when a value is
-/// missing (1 core / 1GB) -- so this matches what would actually get
-/// provisioned, not a silent undercount.
+/// missing (1 core / 1GB, i.e. 1000 millicores / 1024 MB) -- full
+/// request precision, not rounded up to whatever got provisioned (see
+/// `reconcile::job::extract_resource_requests`'s own docs on why).
 async fn non_terminal_job_requests(
     pool: &SqlitePool,
 ) -> Result<Vec<(String, String, u32, u32)>, sqlx::Error> {
@@ -56,12 +70,12 @@ async fn non_terminal_job_requests(
             let namespace: String = row.get(1);
             let spec_str: String = row.get(2);
             let spec: JsonValue = serde_json::from_str(&spec_str).unwrap_or(JsonValue::Null);
-            let (cpu_cores, memory_gb) = extract_resource_requests(&spec);
+            let (cpu_millicores, memory_mb) = extract_resource_requests(&spec);
             (
                 name,
                 namespace,
-                cpu_cores.unwrap_or(1),
-                memory_gb.unwrap_or(1),
+                cpu_millicores.unwrap_or(1000),
+                memory_mb.unwrap_or(1024),
             )
         })
         .collect())
@@ -76,8 +90,8 @@ async fn non_terminal_job_requests(
 /// node yet, same as a real machine that hasn't booted.
 pub(crate) struct AllocatedWorkerVm {
     pub vm_name: String,
-    pub request_cpu_cores: u32,
-    pub request_memory_gb: u32,
+    pub request_cpu_millicores: u32,
+    pub request_memory_mb: u32,
 }
 
 pub(crate) async fn allocated_worker_vms(
@@ -96,11 +110,11 @@ pub(crate) async fn allocated_worker_vms(
             let vm_name: String = row.get(0);
             let spec_str: String = row.get(1);
             let spec: JsonValue = serde_json::from_str(&spec_str).unwrap_or(JsonValue::Null);
-            let (cpu_cores, memory_gb) = extract_resource_requests(&spec);
+            let (cpu_millicores, memory_mb) = extract_resource_requests(&spec);
             AllocatedWorkerVm {
                 vm_name,
-                request_cpu_cores: cpu_cores.unwrap_or(1),
-                request_memory_gb: memory_gb.unwrap_or(1),
+                request_cpu_millicores: cpu_millicores.unwrap_or(1000),
+                request_memory_mb: memory_mb.unwrap_or(1024),
             }
         })
         .collect())
@@ -143,7 +157,7 @@ pub async fn list_node_metrics(
             metadata: NodeMetricsMetadata { name: vm.vm_name },
             timestamp: chrono::Utc::now().to_rfc3339(),
             window: "10s".to_string(),
-            usage: format_usage(vm.request_cpu_cores, vm.request_memory_gb),
+            usage: format_usage(vm.request_cpu_millicores, vm.request_memory_mb),
         })
         .collect();
 
@@ -360,7 +374,7 @@ mod tests {
         assert_eq!(list.items.len(), 1);
         assert_eq!(list.items[0].metadata.name, "kube-shim-worker-a");
         assert_eq!(list.items[0].usage.cpu, "2");
-        assert_eq!(list.items[0].usage.memory, "4Gi");
+        assert_eq!(list.items[0].usage.memory, "4096Mi");
     }
 
     #[tokio::test]
@@ -394,7 +408,47 @@ mod tests {
             .unwrap();
         let list: NodeMetricsList = serde_json::from_slice(&body).unwrap();
         assert_eq!(list.items[0].usage.cpu, "1");
-        assert_eq!(list.items[0].usage.memory, "1Gi");
+        assert_eq!(list.items[0].usage.memory, "1024Mi");
+    }
+
+    #[tokio::test]
+    async fn test_node_metrics_preserves_fractional_cpu_and_sub_gigabyte_memory() {
+        // The whole reason request_cpu_millicores/request_memory_mb
+        // exist instead of reusing handle_vm_pending's own whole-unit
+        // rounding: a job that asked for "500m"/"512Mi" must be
+        // reported as exactly that, not overstated to "1"/"1Gi" just
+        // because that's what the worker VM actually got provisioned
+        // as underneath it.
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_job_with_vm(
+            &pool,
+            "j1",
+            "a",
+            "default",
+            "VMRunning",
+            &spec_with_requests("500m", "512Mi"),
+            "kube-shim-worker-a",
+        )
+        .await;
+
+        let router = Router::new()
+            .route("/nodes", get(list_node_metrics))
+            .with_state(pool);
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/nodes")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let list: NodeMetricsList = serde_json::from_slice(&body).unwrap();
+        assert_eq!(list.items[0].usage.cpu, "500m");
+        assert_eq!(list.items[0].usage.memory, "512Mi");
     }
 
     #[tokio::test]

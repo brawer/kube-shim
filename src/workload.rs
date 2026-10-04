@@ -76,13 +76,17 @@ pub fn smallest_fitting_server_plan(cpu_cores: u32, memory_gb: u32) -> Option<&'
 }
 
 /// Parses a Kubernetes CPU resource quantity (`resources.requests.cpu`,
-/// e.g. `"2"` or `"500m"` for 500 millicores) into a whole number of
-/// cores, rounding up so a request never ends up under-provisioned.
-/// `resources.requests.memory` uses the exact same `Ki`/`Mi`/`Gi`/`Ti`
-/// quantity format `src/volumes.rs` already parses for storage, so memory
-/// requests reuse `volumes::parse_storage_quantity_gb()` directly rather
-/// than duplicating that logic here.
-pub fn parse_cpu_cores(quantity: &str) -> Result<u32, String> {
+/// e.g. `"2"` or `"500m"` for 500 millicores) into millicores, the same
+/// integer-precision unit Kubernetes itself uses internally -- real
+/// Kubernetes CPU requests are *not* restricted to whole cores (that's
+/// standard k8s, not specific to Borg), and this project needs to
+/// preserve that precision for accurate `kubectl top`/events reporting
+/// (`api::metrics`/`api::nodes`), not just for VM sizing. `parse_cpu_cores`
+/// below is a *separate, deliberately lossy* wrapper over this, used only
+/// where a whole-core answer is actually required (`smallest_fitting_server_plan`:
+/// UpCloud's own plan catalog only offers whole-CPU-count plans, so there's
+/// no such thing as provisioning "0.5 CPU" regardless of what the job asked for).
+pub fn parse_cpu_millicores(quantity: &str) -> Result<u32, String> {
     let quantity = quantity.trim();
     if let Some(millicores) = quantity.strip_suffix('m') {
         let millicores: f64 = millicores
@@ -91,7 +95,7 @@ pub fn parse_cpu_cores(quantity: &str) -> Result<u32, String> {
         if millicores < 0.0 {
             return Err(format!("CPU quantity must not be negative: {quantity:?}"));
         }
-        return Ok((millicores / 1000.0).ceil() as u32);
+        return Ok(millicores.round() as u32);
     }
 
     let cores: f64 = quantity
@@ -100,7 +104,17 @@ pub fn parse_cpu_cores(quantity: &str) -> Result<u32, String> {
     if cores < 0.0 {
         return Err(format!("CPU quantity must not be negative: {quantity:?}"));
     }
-    Ok(cores.ceil() as u32)
+    Ok((cores * 1000.0).round() as u32)
+}
+
+/// Rounds a CPU request *up* to a whole number of cores -- see
+/// `parse_cpu_millicores`'s own docs for why this lossy rounding exists
+/// as a separate function rather than being the only way to parse this
+/// field: it's correct for sizing a worker VM (UpCloud has no
+/// fractional-core plans), wrong for reporting what was actually asked
+/// for.
+pub fn parse_cpu_cores(quantity: &str) -> Result<u32, String> {
+    Ok(parse_cpu_millicores(quantity)?.div_ceil(1000))
 }
 
 #[cfg(test)]
@@ -161,5 +175,18 @@ mod tests {
     fn test_parse_cpu_cores_rejects_negative() {
         assert!(parse_cpu_cores("-2").is_err());
         assert!(parse_cpu_cores("-500m").is_err());
+    }
+
+    #[test]
+    fn test_parse_cpu_millicores_preserves_fractional_precision() {
+        assert_eq!(parse_cpu_millicores("500m"), Ok(500));
+        assert_eq!(parse_cpu_millicores("1500m"), Ok(1500));
+        assert_eq!(parse_cpu_millicores("2"), Ok(2000));
+        assert_eq!(parse_cpu_millicores("1.5"), Ok(1500));
+    }
+
+    #[test]
+    fn test_parse_cpu_millicores_rejects_negative() {
+        assert!(parse_cpu_millicores("-500m").is_err());
     }
 }

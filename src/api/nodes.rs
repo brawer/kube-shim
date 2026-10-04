@@ -71,10 +71,17 @@ pub async fn list_nodes(
     let items = vms
         .into_iter()
         .map(|vm| {
-            let plan = smallest_fitting_server_plan(vm.request_cpu_cores, vm.request_memory_gb);
+            // Same rounding-up-to-whole-units `handle_vm_pending` itself
+            // does before calling this -- the node's reported capacity
+            // is what UpCloud actually provisioned, which is always a
+            // whole core/GB plan, never the job's own (possibly
+            // fractional) request.
+            let cpu_cores = vm.request_cpu_millicores.div_ceil(1000);
+            let memory_gb = vm.request_memory_mb.div_ceil(1024);
+            let plan = smallest_fitting_server_plan(cpu_cores, memory_gb);
             let (cpu, memory) = plan
                 .map(|p| (p.cpu_cores, p.memory_gb))
-                .unwrap_or((vm.request_cpu_cores, vm.request_memory_gb));
+                .unwrap_or((cpu_cores, memory_gb));
             let resources = NodeResources {
                 cpu: cpu.to_string(),
                 memory: format!("{memory}Gi"),
