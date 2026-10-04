@@ -162,6 +162,43 @@ pub(super) async fn get_server(
     Ok(to_server(response.server))
 }
 
+#[derive(Serialize)]
+struct StopServerBody {
+    stop_server: StopServerParams,
+}
+
+#[derive(Serialize)]
+struct StopServerParams {
+    /// "hard" rather than "soft": a worker VM's own workload is a batch
+    /// container the shim is already done with by the time this is ever
+    /// called (`VMTerminating`, or orphan scanning) -- there's nothing
+    /// left worth a graceful ACPI shutdown waiting on, and "soft" risks
+    /// never completing at all if the guest OS doesn't respond to it.
+    stop_type: &'static str,
+}
+
+/// Requests that UpCloud stop the server -- asynchronous, same as
+/// `create_server`: the response reflects the state at the moment the
+/// request was accepted (typically still `"started"`), not the eventual
+/// `"stopped"` state. Callers must poll `get_server` afterward and wait
+/// for `"stopped"` before calling `delete_server`.
+pub(super) async fn stop_server(
+    provider: &UpCloudProvider,
+    server_id: &str,
+) -> Result<Server, ProviderError> {
+    let body = StopServerBody {
+        stop_server: StopServerParams { stop_type: "hard" },
+    };
+    let response: ServerEnvelope = provider
+        .send_json(
+            provider
+                .request(Method::POST, &format!("/server/{server_id}/stop"))
+                .json(&body),
+        )
+        .await?;
+    Ok(to_server(response.server))
+}
+
 pub(super) async fn delete_server(
     provider: &UpCloudProvider,
     server_id: &str,
@@ -290,6 +327,26 @@ mod tests {
         let provider = mock_server(app).await;
 
         let server = provider.get_server("003a02c7").await.unwrap();
+        assert_eq!(server.state, "started");
+    }
+
+    #[tokio::test]
+    async fn test_stop_server_requests_a_hard_stop() {
+        let app = axum::Router::new().route(
+            "/1.3/server/:uuid/stop",
+            axum::routing::post(
+                |Path(_uuid): Path<String>, Json(body): Json<serde_json::Value>| async move {
+                    assert_eq!(body["stop_server"]["stop_type"], "hard");
+                    Json(json!({"server": {"uuid": "003a02c7", "title": "t", "state": "started"}}))
+                },
+            ),
+        );
+        let provider = mock_server(app).await;
+
+        let server = provider.stop_server("003a02c7").await.unwrap();
+        // Still "started" in the immediate response -- UpCloud carries the
+        // stop out asynchronously, exactly like create_server's own
+        // eventual-consistency behavior.
         assert_eq!(server.state, "started");
     }
 

@@ -79,10 +79,27 @@ pub struct Server {
     pub title: String,
     /// Provider-native state string (e.g. `"maintenance"`, `"started"`,
     /// `"stopped"` for UpCloud) -- not normalized into a shared enum yet,
-    /// since there's only one provider to normalize against.
+    /// since there's only one provider to normalize against. A closed
+    /// Rust enum here would need a catch-all variant anyway (UpCloud can
+    /// introduce a new transitional value any time, same reasoning as
+    /// `CreateVolumeRequest::tier`'s own doc comment), and would mean
+    /// leaking one specific provider's vocabulary into a struct meant to
+    /// stay provider-agnostic. `is_started`/`is_stopped` below exist so
+    /// callers compare against one named place instead of a scattered
+    /// string literal at each call site.
     pub state: String,
     pub public_ipv4: Option<String>,
     pub public_ipv6: Option<String>,
+}
+
+impl Server {
+    pub fn is_started(&self) -> bool {
+        self.state == "started"
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.state == "stopped"
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +173,15 @@ pub trait CloudProvider: Send + Sync {
     /// see docs/IMPLEMENTATION_PLAN.md Phase 7. Phase 9 is what actually
     /// builds the poll loop; this method is the primitive it polls with.
     async fn get_server(&self, server_id: &str) -> Result<Server, ProviderError>;
+    /// UpCloud rejects `delete_server` on a server whose `state` isn't
+    /// `"stopped"` yet (`409 SERVER_STATE_ILLEGAL`) -- verified live
+    /// against the real API (docs/IMPLEMENTATION_PLAN.md Phase 11's real
+    /// finding), not assumed. Every caller of `delete_server` on a worker
+    /// VM that might still be running must call this first and wait for
+    /// `get_server` to actually report `"stopped"` before deleting --
+    /// this call itself only *requests* the stop, which UpCloud carries
+    /// out asynchronously, same as `create_server`/`create_firewall_rules`.
+    async fn stop_server(&self, server_id: &str) -> Result<Server, ProviderError>;
     async fn delete_server(&self, server_id: &str) -> Result<(), ProviderError>;
     /// Every server that currently exists in `zone` -- not filtered by
     /// title/prefix, same convention as `list_volumes`. Added in Phase 9
@@ -187,4 +213,33 @@ pub trait CloudProvider: Send + Sync {
     /// (e.g. `"server_plan_DEV-1xCPU-1GB-10GB"`, `"storage_maxiops"`) --
     /// see `PriceEntry`'s own docs for why this stays a raw passthrough.
     async fn get_pricing(&self, zone: &str, price_key: &str) -> Result<PriceEntry, ProviderError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Server;
+
+    fn server_with_state(state: &str) -> Server {
+        Server {
+            id: "srv1".to_string(),
+            title: "t".to_string(),
+            state: state.to_string(),
+            public_ipv4: None,
+            public_ipv6: None,
+        }
+    }
+
+    #[test]
+    fn test_is_started_true_only_for_started() {
+        assert!(server_with_state("started").is_started());
+        assert!(!server_with_state("stopped").is_started());
+        assert!(!server_with_state("maintenance").is_started());
+    }
+
+    #[test]
+    fn test_is_stopped_true_only_for_stopped() {
+        assert!(server_with_state("stopped").is_stopped());
+        assert!(!server_with_state("started").is_stopped());
+        assert!(!server_with_state("stopping").is_stopped());
+    }
 }

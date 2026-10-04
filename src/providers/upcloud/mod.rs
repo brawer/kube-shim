@@ -152,6 +152,10 @@ impl CloudProvider for UpCloudProvider {
         servers::get_server(self, server_id).await
     }
 
+    async fn stop_server(&self, server_id: &str) -> Result<Server, ProviderError> {
+        servers::stop_server(self, server_id).await
+    }
+
     async fn delete_server(&self, server_id: &str) -> Result<(), ProviderError> {
         servers::delete_server(self, server_id).await
     }
