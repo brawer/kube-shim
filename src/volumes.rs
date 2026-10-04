@@ -57,16 +57,16 @@ impl StorageTier {
     }
 }
 
-/// Parses a Kubernetes resource quantity (as used for
-/// `resources.requests.storage`, e.g. `"250Gi"`, `"10G"`, `"500Mi"`) into a
-/// whole number of gigabytes, rounding up so the provisioned volume is
-/// never smaller than what was actually requested. Only the suffixes
-/// that make sense for a scratch-disk-sized ephemeral volume are
-/// supported -- binary (`Ki`/`Mi`/`Gi`/`Ti`) and decimal (`K`/`M`/`G`/`T`)
-/// -- not the full Kubernetes quantity grammar (exponent notation,
-/// sub-byte fractions, etc.), which nothing in this project's workloads
-/// needs.
-pub fn parse_storage_quantity_gb(quantity: &str) -> Result<u32, String> {
+/// Parses a Kubernetes resource quantity (`"250Gi"`, `"10G"`, `"500Mi"`,
+/// ...) into its exact byte count, with no rounding at all -- the shared
+/// core both `parse_storage_quantity_gb` and `parse_storage_quantity_mb`
+/// build on, each applying its own rounding policy for its own purpose.
+/// Only the suffixes that make sense for a scratch-disk-sized ephemeral
+/// volume or a memory request are supported -- binary (`Ki`/`Mi`/`Gi`/
+/// `Ti`) and decimal (`K`/`M`/`G`/`T`) -- not the full Kubernetes
+/// quantity grammar (exponent notation, sub-byte fractions, etc.), which
+/// nothing in this project's workloads needs.
+fn parse_storage_quantity_bytes(quantity: &str) -> Result<f64, String> {
     let quantity = quantity.trim();
     let (number_str, multiplier_bytes): (&str, f64) = if let Some(n) = quantity.strip_suffix("Ki") {
         (n, 1024.0)
@@ -97,8 +97,31 @@ pub fn parse_storage_quantity_gb(quantity: &str) -> Result<u32, String> {
         ));
     }
 
-    let gb = (number * multiplier_bytes) / (1024.0 * 1024.0 * 1024.0);
+    Ok(number * multiplier_bytes)
+}
+
+/// Rounds a storage/memory quantity *up* to a whole number of gigabytes
+/// -- correct for actually provisioning something (an ephemeral volume,
+/// a worker VM's memory tier), since UpCloud's own catalog is whole-GB
+/// granular and a request can never end up under-provisioned. Wrong for
+/// reporting what was actually asked for -- see `parse_storage_quantity_mb`
+/// for that (`api::metrics`/`api::nodes`' own use), and
+/// `workload::parse_cpu_millicores`'s docs for the exact same split on
+/// the CPU side.
+pub fn parse_storage_quantity_gb(quantity: &str) -> Result<u32, String> {
+    let bytes = parse_storage_quantity_bytes(quantity)?;
+    let gb = bytes / (1024.0 * 1024.0 * 1024.0);
     Ok(gb.ceil() as u32)
+}
+
+/// Rounds a storage/memory quantity to the *nearest* megabyte --
+/// preserves sub-gigabyte precision (`"512Mi"` stays meaningfully
+/// different from `"1Gi"`), unlike `parse_storage_quantity_gb`'s
+/// deliberate always-round-up-to-whole-GB behavior.
+pub fn parse_storage_quantity_mb(quantity: &str) -> Result<u32, String> {
+    let bytes = parse_storage_quantity_bytes(quantity)?;
+    let mb = bytes / (1024.0 * 1024.0);
+    Ok(mb.round() as u32)
 }
 
 #[cfg(test)]
@@ -172,5 +195,17 @@ mod tests {
     #[test]
     fn test_parse_storage_quantity_rejects_negative() {
         assert!(parse_storage_quantity_gb("-5Gi").is_err());
+    }
+
+    #[test]
+    fn test_parse_storage_quantity_mb_preserves_sub_gigabyte_precision() {
+        assert_eq!(parse_storage_quantity_mb("512Mi"), Ok(512));
+        assert_eq!(parse_storage_quantity_mb("1Gi"), Ok(1024));
+        assert_eq!(parse_storage_quantity_mb("256Mi"), Ok(256));
+    }
+
+    #[test]
+    fn test_parse_storage_quantity_mb_rejects_negative() {
+        assert!(parse_storage_quantity_mb("-5Mi").is_err());
     }
 }
