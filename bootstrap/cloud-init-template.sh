@@ -29,6 +29,8 @@ IMAGE=$(echo '__KUBESHIM_IMAGE_B64__' | base64 -d)
 mapfile -t COMMAND < <(echo '__KUBESHIM_COMMAND_B64__' | base64 -d)
 mapfile -t ARGS < <(echo '__KUBESHIM_ARGS_B64__' | base64 -d)
 mapfile -t ENV_LINES < <(echo '__KUBESHIM_ENV_B64__' | base64 -d)
+CPU_LIMIT=$(echo '__KUBESHIM_CPU_LIMIT_B64__' | base64 -d)
+MEMORY_LIMIT=$(echo '__KUBESHIM_MEMORY_LIMIT_B64__' | base64 -d)
 
 # The job's ephemeral volume, if it requested one, is attached by the shim
 # via a separate UpCloud API call made AFTER this VM is already running
@@ -74,8 +76,16 @@ for line in "${ENV_LINES[@]}"; do
     [ -n "$line" ] && ENV_ARGS+=(-e "$line")
 done
 
+# Empty CPU_LIMIT/MEMORY_LIMIT means the job's spec had no
+# resources.limits.cpu/.memory set -- omit the flag entirely rather than
+# defaulting to the request or to this VM's own plan size, matching real
+# Kubernetes semantics (no limit means unconstrained).
+RESOURCE_ARGS=()
+[ -n "$CPU_LIMIT" ] && RESOURCE_ARGS+=(--cpus "$CPU_LIMIT")
+[ -n "$MEMORY_LIMIT" ] && RESOURCE_ARGS+=(--memory "$MEMORY_LIMIT")
+
 echo "Starting container..." >> "$STATUS_FILE"
-CONTAINER_ID=$(podman run -d -v /scratch:/scratch "${ENV_ARGS[@]}" "$IMAGE" "${COMMAND[@]}" "${ARGS[@]}")
+CONTAINER_ID=$(podman run -d -v /scratch:/scratch "${RESOURCE_ARGS[@]}" "${ENV_ARGS[@]}" "$IMAGE" "${COMMAND[@]}" "${ARGS[@]}")
 echo "$CONTAINER_ID" > "$CONTAINER_ID_FILE"
 
 podman wait "$CONTAINER_ID" > /dev/null

@@ -4,7 +4,8 @@
 //! docs/IMPLEMENTATION_PLAN.md Phase 5.
 
 use crate::k8s_status;
-use crate::volumes::StorageTier;
+use crate::volumes::{self, StorageTier};
+use crate::workload;
 use axum::response::Response;
 use serde_json::Value as JsonValue;
 
@@ -71,6 +72,41 @@ pub fn validate_ephemeral_volume_storage_classes(
         }
     }
 
+    None
+}
+
+/// Validates `resources.limits.cpu`/`.memory` on the pod template's
+/// first container -- real Kubernetes validates the `Quantity` type at
+/// the OpenAPI-schema level and rejects a malformed value at admission
+/// time (a 400/422 before the object is ever persisted), it never
+/// silently accepts the manifest and drops the limit at runtime. Since
+/// `cloud_init::generate` passes these straight through to `podman run
+/// --cpus`/`--memory` (closing the gap where limits weren't honored at
+/// all), skipping this check would mean kube-shim accepts a manifest a
+/// real cluster would reject outright -- the opposite of what honoring
+/// `limits` in the first place was meant to de-risk.
+pub fn validate_resource_limits(object_description: &str, spec: &JsonValue) -> Option<Response> {
+    let limits = spec.pointer("/jobTemplate/spec/template/spec/containers/0/resources/limits")?;
+    let base_field = "spec.jobTemplate.spec.template.spec.containers[0].resources.limits";
+
+    if let Some(cpu) = limits.get("cpu").and_then(JsonValue::as_str) {
+        if workload::parse_cpu_millicores(cpu).is_err() {
+            return Some(k8s_status::invalid_field_value(
+                object_description,
+                &format!("{base_field}.cpu"),
+                cpu,
+            ));
+        }
+    }
+    if let Some(memory) = limits.get("memory").and_then(JsonValue::as_str) {
+        if volumes::parse_storage_quantity_mb(memory).is_err() {
+            return Some(k8s_status::invalid_field_value(
+                object_description,
+                &format!("{base_field}.memory"),
+                memory,
+            ));
+        }
+    }
     None
 }
 
@@ -173,5 +209,54 @@ mod tests {
             "volumes": [{"name": "creds", "secret": {"secretName": "osmdiffs-s3-credentials"}}]
         }}}}});
         assert!(validate_ephemeral_volume_storage_classes("CronJob \"x\"", &spec).is_none());
+    }
+
+    #[test]
+    fn test_resource_limits_no_limits_set_accepted() {
+        let spec = json!({"jobTemplate": {"spec": {"template": {"spec": {
+            "containers": [{"image": "x"}]
+        }}}}});
+        assert!(validate_resource_limits("CronJob \"x\"", &spec).is_none());
+    }
+
+    #[test]
+    fn test_resource_limits_valid_values_accepted() {
+        let spec = json!({"jobTemplate": {"spec": {"template": {"spec": {
+            "containers": [{"image": "x", "resources": {"limits": {"cpu": "500m", "memory": "512Mi"}}}]
+        }}}}});
+        assert!(validate_resource_limits("CronJob \"x\"", &spec).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_resource_limits_malformed_cpu_rejected() {
+        // Real Kubernetes rejects a malformed Quantity at admission time
+        // (OpenAPI schema validation) -- it never silently accepts the
+        // manifest and just drops the limit at runtime.
+        let spec = json!({"jobTemplate": {"spec": {"template": {"spec": {
+            "containers": [{"image": "x", "resources": {"limits": {"cpu": "not-a-quantity"}}}]
+        }}}}});
+        let response = validate_resource_limits("CronJob \"x\"", &spec).expect("must be rejected");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let message = response_message(response).await;
+        assert!(message.contains("resources.limits.cpu"));
+        assert!(message.contains("not-a-quantity"));
+    }
+
+    #[tokio::test]
+    async fn test_resource_limits_malformed_memory_rejected() {
+        let spec = json!({"jobTemplate": {"spec": {"template": {"spec": {
+            "containers": [{"image": "x", "resources": {"limits": {"memory": "lots"}}}]
+        }}}}});
+        let response = validate_resource_limits("CronJob \"x\"", &spec).expect("must be rejected");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert!(response_message(response)
+            .await
+            .contains("resources.limits.memory"));
     }
 }

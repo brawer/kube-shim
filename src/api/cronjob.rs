@@ -50,6 +50,9 @@ pub async fn create_cronjob(
     {
         return response;
     }
+    if let Some(response) = admission::validate_resource_limits(&object_description, &req.spec) {
+        return response;
+    }
 
     let namespace = req
         .metadata
