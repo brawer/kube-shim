@@ -79,10 +79,27 @@ pub struct Server {
     pub title: String,
     /// Provider-native state string (e.g. `"maintenance"`, `"started"`,
     /// `"stopped"` for UpCloud) -- not normalized into a shared enum yet,
-    /// since there's only one provider to normalize against.
+    /// since there's only one provider to normalize against. A closed
+    /// Rust enum here would need a catch-all variant anyway (UpCloud can
+    /// introduce a new transitional value any time, same reasoning as
+    /// `CreateVolumeRequest::tier`'s own doc comment), and would mean
+    /// leaking one specific provider's vocabulary into a struct meant to
+    /// stay provider-agnostic. `is_started`/`is_stopped` below exist so
+    /// callers compare against one named place instead of a scattered
+    /// string literal at each call site.
     pub state: String,
     pub public_ipv4: Option<String>,
     pub public_ipv6: Option<String>,
+}
+
+impl Server {
+    pub fn is_started(&self) -> bool {
+        self.state == "started"
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.state == "stopped"
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,4 +213,33 @@ pub trait CloudProvider: Send + Sync {
     /// (e.g. `"server_plan_DEV-1xCPU-1GB-10GB"`, `"storage_maxiops"`) --
     /// see `PriceEntry`'s own docs for why this stays a raw passthrough.
     async fn get_pricing(&self, zone: &str, price_key: &str) -> Result<PriceEntry, ProviderError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Server;
+
+    fn server_with_state(state: &str) -> Server {
+        Server {
+            id: "srv1".to_string(),
+            title: "t".to_string(),
+            state: state.to_string(),
+            public_ipv4: None,
+            public_ipv6: None,
+        }
+    }
+
+    #[test]
+    fn test_is_started_true_only_for_started() {
+        assert!(server_with_state("started").is_started());
+        assert!(!server_with_state("stopped").is_started());
+        assert!(!server_with_state("maintenance").is_started());
+    }
+
+    #[test]
+    fn test_is_stopped_true_only_for_stopped() {
+        assert!(server_with_state("stopped").is_stopped());
+        assert!(!server_with_state("started").is_stopped());
+        assert!(!server_with_state("stopping").is_stopped());
+    }
 }

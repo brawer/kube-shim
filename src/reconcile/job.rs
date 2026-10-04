@@ -843,7 +843,7 @@ async fn handle_vm_creating(
     }
 
     match ctx.provider.get_server(&vm_id).await {
-        Ok(server) if server.state == "started" => {
+        Ok(server) if server.is_started() => {
             if let Some(ip) = &server.public_ipv4 {
                 set_worker_ssh_ip(pool, job_id, ip).await?;
             }
@@ -1127,8 +1127,8 @@ async fn handle_vm_terminating(
     };
 
     if let Some(server) = &server {
-        if server.state != "stopped" {
-            if server.state == "started" {
+        if !server.is_stopped() {
+            if server.is_started() {
                 tracing::info!(
                     "job {namespace}/{name}: stopping worker VM {vm_id} before deleting it"
                 );

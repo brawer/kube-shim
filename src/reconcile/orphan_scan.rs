@@ -97,8 +97,8 @@ async fn scan_and_clean_servers(pool: &SqlitePool, ctx: &JobContext) -> Result<u
         // (409 SERVER_STATE_ILLEGAL) -- an untracked worker VM found here
         // is often still genuinely running, so this can't skip straight
         // to delete_server the way it used to.
-        if server.state != "stopped" {
-            if server.state == "started" {
+        if !server.is_stopped() {
+            if server.is_started() {
                 tracing::warn!(
                     "orphan scan: stopping untracked worker VM {} ({}) before deleting it",
                     server.id,
