@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.13](https://github.com/brawer/kube-shim/compare/v0.1.12...v0.1.13) (2026-10-04)
+
+
+### 🐞 Bug Fixes
+
+* stop worker VMs before deleting them (UpCloud rejects delete on a running server) ([#45](https://github.com/brawer/kube-shim/issues/45)) ([c5edf38](https://github.com/brawer/kube-shim/commit/c5edf38f6db25c9fb4c52920d274bc66a5cfb8b7))
+
+
+### 📚 Documentation
+
+* update README past Phase 1, point to the implementation plan ([#43](https://github.com/brawer/kube-shim/issues/43)) ([3583e9f](https://github.com/brawer/kube-shim/commit/3583e9f737dce66abc8bf54a426221b0b5a3aba6))
+
 ## [0.1.12](https://github.com/brawer/kube-shim/compare/v0.1.11...v0.1.12) (2026-10-02)
 
 
