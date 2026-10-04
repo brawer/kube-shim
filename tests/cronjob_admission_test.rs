@@ -170,3 +170,52 @@ async fn test_cronjob_with_no_ephemeral_volume_still_requires_deadline() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn test_cronjob_with_malformed_resource_limit_rejected() {
+    let router = test_router().await;
+    let spec = json!({
+        "schedule": "0 2 * * 0",
+        "jobTemplate": {"spec": {
+            "activeDeadlineSeconds": 3600,
+            "template": {"spec": {"containers": [{
+                "name": "x", "image": "y",
+                "resources": {"limits": {"cpu": "not-a-quantity"}}
+            }]}}
+        }}
+    });
+
+    let response = router
+        .oneshot(create_cronjob_request("bad-cpu-limit", spec))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let json = response_json(response).await;
+    assert_eq!(json["reason"], "Invalid");
+    assert!(json["message"]
+        .as_str()
+        .unwrap()
+        .contains("resources.limits.cpu"));
+}
+
+#[tokio::test]
+async fn test_cronjob_with_valid_resource_limits_accepted() {
+    let router = test_router().await;
+    let spec = json!({
+        "schedule": "0 2 * * 0",
+        "jobTemplate": {"spec": {
+            "activeDeadlineSeconds": 3600,
+            "template": {"spec": {"containers": [{
+                "name": "x", "image": "y",
+                "resources": {"limits": {"cpu": "500m", "memory": "512Mi"}}
+            }]}}
+        }}
+    });
+
+    let response = router
+        .oneshot(create_cronjob_request("good-limits", spec))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+}

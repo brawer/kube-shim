@@ -597,6 +597,10 @@ cargo test   # 143 lib tests + 19 integration tests, incl. mock-HTTP-server
 - Every worker VM unreachable inbound from outside the shim's own IP but can still reach the internet outbound — verified live (external `nc` timeout; outbound proven implicitly by `apt-get install podman` and the container's own image pull succeeding inside every one of the six real runs)
 - VM + volume + boot disk all genuinely deleted, zero orphans — verified live across all six runs
 
+**Follow-up, post-Phase-12: `resources.limits` is now honored by `podman run`, not just `requests`.** A real question surfaced this: `resources.requests` was only ever used to pick a worker VM's *plan size* (`workload::smallest_fitting_server_plan`) — the container itself ran with no `--cpus`/`--memory` cap at all, able to use the whole VM regardless of what the job's manifest declared as its `limits`. Since each worker VM is single-tenant (exactly one container, created and destroyed with the one job), there was never a fairness reason to cap it the way a real cluster's node would need to — but a job migrating to a real cluster later would suddenly be capped at its declared `limits` for the first time, discovering any `limits`-too-low bug only there, not here. `cloud_init::generate` now reads `containers[0].resources.limits.cpu`/`.memory` and passes `--cpus <decimal-cores>`/`--memory <N>m` to `podman run` when set — full precision, reusing Phase 12's own `workload::parse_cpu_millicores`/`volumes::parse_storage_quantity_mb` (podman's `--cpus` takes a real decimal, not Kubernetes' millicore string, and its `--memory` suffix convention is `b`/`k`/`m`/`g`, not `Ki`/`Mi`/`Gi` — a direct, lossless handoff from the MB-precision parser, not a second unit conversion). No limit set means no flag at all, matching real Kubernetes semantics (unconstrained), not "capped at the request" or "capped at the VM's own plan size."
+
+A malformed `resources.limits.cpu`/`.memory` is now also rejected at admission time (`src/admission.rs`'s new `validate_resource_limits`, wired into `create_cronjob` alongside the existing two checks) — real Kubernetes validates the `Quantity` type at the OpenAPI-schema level and rejects a bad value outright (400/422) before the object is ever persisted, it never silently accepts the manifest and drops the limit at runtime. `cloud_init::generate` itself still tolerates an invalid value gracefully (omits the flag rather than failing the job run) as defense-in-depth, but that path shouldn't be reachable in practice now that admission catches it first.
+
 ---
 
 ### Phase 10: Log Streaming (Days 10-11) — ✅ Complete
@@ -905,7 +909,7 @@ curl -k https://localhost:443/debug/status | jq '.total_cost, .budget_balance'
 | `src/api/*.rs` | Kubernetes API handlers | Phases 1, 5, 10, 12 |
 | `src/volumes.rs` | `storageClassName` → provider storage-tier lookup | Create (Phase 5) |
 | `src/workload.rs` | `WorkloadKind` abstraction (CronJob now, Deployment later) | Create (Phase 5) |
-| `src/admission.rs` | `activeDeadlineSeconds`-required policy check | Create (Phase 5) |
+| `src/admission.rs` | `activeDeadlineSeconds`-required policy check; `resources.limits` quantity validation | Create (Phase 5); Phase 9 follow-up |
 | `src/db/schema.sql` | SQLite schema | Phases 1, 5-6, 8-9, 13 |
 | `src/db/migrations.rs` | `ALTER TABLE`-based column migrations for already-existing tables | Create (Phase 6); first real use (Phase 10) |
 | `src/reconcile/*.rs` | State machine loop, `Notify`-based wake-up, `activeDeadlineSeconds` enforcement, event recording | Create (Phases 6, 8-12, 13) |
@@ -923,7 +927,7 @@ curl -k https://localhost:443/debug/status | jq '.total_cost, .budget_balance'
 | `src/status_page.rs` | Public status page + `/healthz`/`/livez`/`/readyz`, served on `:443` | Create (Phase 14) |
 | `src/naming.rs` | `resource_prefix`-aware resource name generation | Create (Phase 15) |
 | `src/config.rs` | Configuration parsing | Phases 1-2, 4-5, 7, 9 |
-| `src/cloud_init.rs` | Worker VM `user_data` generation (base64-escaped job values) | Create (Phase 9) |
+| `src/cloud_init.rs` | Worker VM `user_data` generation (base64-escaped job values); `resources.limits` → `podman run --cpus`/`--memory` | Create (Phase 9); Phase 9 follow-up |
 | `src/metadata.rs` | Shim's own public IPv4, via UpCloud's metadata service | Create (Phase 9) |
 | `config.toml` | Runtime config template | Create (Phase 1) |
 | `bootstrap/provision.sh` | One-time VPS setup | Phases 1-4, 9 (small `cd /` fix) |

@@ -16,6 +16,7 @@
 //! inside the template's single-quoted `'...'` literals is safe by
 //! construction, not just by convention.
 
+use crate::{volumes, workload};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde_json::Value as JsonValue;
@@ -49,12 +50,67 @@ pub fn generate(spec: &JsonValue) -> Result<String, String> {
     let command = string_array(container, "command").join("\n");
     let args = string_array(container, "args").join("\n");
     let env = env_lines(container).join("\n");
+    let cpu_limit = cpu_limit_flag_value(container);
+    let memory_limit = memory_limit_flag_value(container);
 
     Ok(TEMPLATE
         .replace("__KUBESHIM_IMAGE_B64__", &b64(image))
         .replace("__KUBESHIM_COMMAND_B64__", &b64(&command))
         .replace("__KUBESHIM_ARGS_B64__", &b64(&args))
-        .replace("__KUBESHIM_ENV_B64__", &b64(&env)))
+        .replace("__KUBESHIM_ENV_B64__", &b64(&env))
+        .replace("__KUBESHIM_CPU_LIMIT_B64__", &b64(&cpu_limit))
+        .replace("__KUBESHIM_MEMORY_LIMIT_B64__", &b64(&memory_limit)))
+}
+
+fn resource_limit_quantity<'a>(container: &'a JsonValue, key: &str) -> Option<&'a str> {
+    container.pointer("/resources/limits")?.get(key)?.as_str()
+}
+
+/// `resources.limits.cpu`, as the decimal core count `podman run
+/// --cpus` expects (e.g. `"0.5"`, `"2"`) -- *not* rounded up to a whole
+/// core the way `handle_vm_pending`'s own VM sizing needs to be (UpCloud
+/// has no fractional-core plans; podman's `--cpus` has no such
+/// restriction, so there's no reason to lose precision here). Empty
+/// when unset, which the template then omits the flag entirely for --
+/// matching real Kubernetes semantics, where no limit means
+/// unconstrained, not "capped at the request" or "capped at whatever VM
+/// plan got picked."
+fn cpu_limit_flag_value(container: &JsonValue) -> String {
+    let Some(quantity) = resource_limit_quantity(container, "cpu") else {
+        return String::new();
+    };
+    let Ok(millicores) = workload::parse_cpu_millicores(quantity) else {
+        return String::new();
+    };
+    if millicores.is_multiple_of(1000) {
+        (millicores / 1000).to_string()
+    } else {
+        // Exact for any u32 millicore value -- three decimal places is
+        // this project's own precision floor (parse_cpu_millicores
+        // never produces a finer-grained value), so this never needs
+        // real rounding, just trimming trailing zeros for readability.
+        format!("{:.3}", millicores as f64 / 1000.0)
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    }
+}
+
+/// `resources.limits.memory`, as the `podman run --memory` flag expects
+/// -- a byte count with podman's own `b`/`k`/`m`/`g` suffix convention,
+/// *not* Kubernetes' `Ki`/`Mi`/`Gi`. `m` here is the same 1024-based
+/// megabyte `volumes::parse_storage_quantity_mb` already uses, so this
+/// is a direct, lossless handoff, not a second unit conversion. Empty
+/// when unset -- see `cpu_limit_flag_value`'s own docs on why that's
+/// the correct default, not "cap at the request."
+fn memory_limit_flag_value(container: &JsonValue) -> String {
+    let Some(quantity) = resource_limit_quantity(container, "memory") else {
+        return String::new();
+    };
+    let Ok(mb) = volumes::parse_storage_quantity_mb(quantity) else {
+        return String::new();
+    };
+    format!("{mb}m")
 }
 
 fn string_array(container: &JsonValue, field: &str) -> Vec<String> {
@@ -133,6 +189,8 @@ mod tests {
             "__KUBESHIM_COMMAND_B64__",
             "__KUBESHIM_ARGS_B64__",
             "__KUBESHIM_ENV_B64__",
+            "__KUBESHIM_CPU_LIMIT_B64__",
+            "__KUBESHIM_MEMORY_LIMIT_B64__",
         ] {
             assert!(
                 !script.contains(placeholder),
@@ -211,5 +269,57 @@ mod tests {
 
         assert!(!script.contains("rm -rf /"));
         assert_eq!(decode_between(&script, "IMAGE=$(echo "), "x'; rm -rf / #");
+    }
+
+    #[test]
+    fn test_no_resource_limits_means_no_flags() {
+        let spec = container_spec(json!({"image": "busybox:latest"}));
+        let script = generate(&spec).unwrap();
+
+        assert_eq!(decode_between(&script, "CPU_LIMIT=$(echo "), "");
+        assert_eq!(decode_between(&script, "MEMORY_LIMIT=$(echo "), "");
+    }
+
+    #[test]
+    fn test_whole_core_limit_has_no_decimal() {
+        let spec = container_spec(json!({
+            "image": "busybox:latest",
+            "resources": {"limits": {"cpu": "2", "memory": "4Gi"}}
+        }));
+        let script = generate(&spec).unwrap();
+
+        assert_eq!(decode_between(&script, "CPU_LIMIT=$(echo "), "2");
+        assert_eq!(decode_between(&script, "MEMORY_LIMIT=$(echo "), "4096m");
+    }
+
+    #[test]
+    fn test_fractional_cpu_limit_is_a_decimal_podman_understands() {
+        let spec = container_spec(json!({
+            "image": "busybox:latest",
+            "resources": {"limits": {"cpu": "500m", "memory": "512Mi"}}
+        }));
+        let script = generate(&spec).unwrap();
+
+        assert_eq!(decode_between(&script, "CPU_LIMIT=$(echo "), "0.5");
+        assert_eq!(decode_between(&script, "MEMORY_LIMIT=$(echo "), "512m");
+    }
+
+    #[test]
+    fn test_invalid_limit_quantity_does_not_block_script_generation() {
+        // A real malformed resources.limits.cpu is rejected at admission
+        // time (src/admission.rs's validate_resource_limits), before a
+        // CronJob with one is ever accepted -- this shouldn't be
+        // reachable in practice. This test covers the defense-in-depth
+        // fallback here regardless: generate() itself must never panic
+        // or fail a job run over a bad value that somehow reached it
+        // (e.g. a row written before that admission check existed), it
+        // just omits the flag, same as if the field had been left out.
+        let spec = container_spec(json!({
+            "image": "busybox:latest",
+            "resources": {"limits": {"cpu": "not-a-quantity"}}
+        }));
+        let script = generate(&spec).unwrap();
+
+        assert_eq!(decode_between(&script, "CPU_LIMIT=$(echo "), "");
     }
 }
