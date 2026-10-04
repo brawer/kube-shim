@@ -78,6 +78,12 @@ pub fn build_router(
             "/api/v1/namespaces/:namespace/events",
             get(api::events::list_events),
         )
+        // Nodes (Phase 12 follow-up) -- one per currently-allocated
+        // worker VM; cluster-scoped, so no :namespace segment. Needed
+        // for `kubectl top nodes` to have a real object to correlate
+        // against the metrics.k8s.io data below (see api::nodes's own
+        // docs).
+        .route("/api/v1/nodes", get(api::nodes::list_nodes))
         // Metrics (Phase 12) -- what `kubectl top nodes`/`kubectl top
         // pods` read. "nodes" is cluster-scoped (no namespace); "pods"
         // has both an all-namespaces form (`kubectl top pods -A`) and a

@@ -8,13 +8,16 @@
 //! wording ("Estimate CPU/memory from running jobs"), not a stand-in for
 //! a feature that was supposed to measure something real.
 //!
-//! "Node" is a fiction here too: this project has no Kubernetes nodes,
-//! just ephemeral worker VMs, one per job run. `list_node_metrics`
-//! reports exactly one synthetic node (named after `resource_prefix`)
-//! whose usage is the sum of every non-terminal job's own request --
-//! "total estimated load across the whole cronjob family," matching
-//! this phase's own stated goal, collapsed into the one row `kubectl top
-//! nodes` expects to be able to show.
+//! "Node" is *not* a fiction here, on reflection -- a first version of
+//! this reported one synthetic aggregate node summing every job's
+//! request, reasoning that this project has no node pool at all. But a
+//! worker VM genuinely *is* a node in the real Kubernetes sense: a
+//! machine that runs exactly one pod. It just doesn't live in a
+//! long-lived static pool the way a real cluster's nodes do -- it's
+//! created and destroyed together with the one job it exists for. One
+//! `NodeMetrics` entry per currently-allocated worker VM (`api::nodes`'s
+//! own `Node` objects use the same set) is a faithful mapping onto that,
+//! not a fiction layered on top of it.
 
 use crate::reconcile::job::extract_resource_requests;
 use axum::{extract::State, http::StatusCode, Json};
@@ -37,8 +40,8 @@ fn format_usage(cpu_cores: u32, memory_gb: u32) -> Usage {
 
 /// Every non-terminal job's own `(cpu_cores, memory_gb)` request,
 /// defaulting the same way `handle_vm_pending` does when a value is
-/// missing (1 core / 1GB) -- so the aggregate here matches what would
-/// actually get provisioned, not a silent undercount.
+/// missing (1 core / 1GB) -- so this matches what would actually get
+/// provisioned, not a silent undercount.
 async fn non_terminal_job_requests(
     pool: &SqlitePool,
 ) -> Result<Vec<(String, String, u32, u32)>, sqlx::Error> {
@@ -60,6 +63,45 @@ async fn non_terminal_job_requests(
                 cpu_cores.unwrap_or(1),
                 memory_gb.unwrap_or(1),
             )
+        })
+        .collect())
+}
+
+/// One entry per currently-allocated worker VM -- `pub(crate)` so
+/// `api::nodes` (the matching core v1 `Node` objects `kubectl top
+/// nodes` needs to exist before it'll even look at these metrics) can
+/// build its list from the exact same set, by name. A job only gets an
+/// entry once `handle_vm_pending` has actually recorded a
+/// `worker_vm_name` for it -- no VM yet means nothing to report as a
+/// node yet, same as a real machine that hasn't booted.
+pub(crate) struct AllocatedWorkerVm {
+    pub vm_name: String,
+    pub request_cpu_cores: u32,
+    pub request_memory_gb: u32,
+}
+
+pub(crate) async fn allocated_worker_vms(
+    pool: &SqlitePool,
+) -> Result<Vec<AllocatedWorkerVm>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT worker_vm_name, spec FROM jobs \
+         WHERE status != 'Archived' AND worker_vm_name IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let vm_name: String = row.get(0);
+            let spec_str: String = row.get(1);
+            let spec: JsonValue = serde_json::from_str(&spec_str).unwrap_or(JsonValue::Null);
+            let (cpu_cores, memory_gb) = extract_resource_requests(&spec);
+            AllocatedWorkerVm {
+                vm_name,
+                request_cpu_cores: cpu_cores.unwrap_or(1),
+                request_memory_gb: memory_gb.unwrap_or(1),
+            }
         })
         .collect())
 }
@@ -89,26 +131,26 @@ pub struct NodeMetricsList {
 pub async fn list_node_metrics(
     State(pool): State<SqlitePool>,
 ) -> Result<Json<NodeMetricsList>, (StatusCode, String)> {
-    let requests = non_terminal_job_requests(&pool)
+    let vms = allocated_worker_vms(&pool)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let total_cpu: u32 = requests.iter().map(|(_, _, cpu, _)| cpu).sum();
-    let total_memory: u32 = requests.iter().map(|(_, _, _, mem)| mem).sum();
+    let items = vms
+        .into_iter()
+        .map(|vm| NodeMetrics {
+            api_version: "metrics.k8s.io/v1beta1".to_string(),
+            kind: "NodeMetrics".to_string(),
+            metadata: NodeMetricsMetadata { name: vm.vm_name },
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            window: "10s".to_string(),
+            usage: format_usage(vm.request_cpu_cores, vm.request_memory_gb),
+        })
+        .collect();
 
     Ok(Json(NodeMetricsList {
         api_version: "metrics.k8s.io/v1beta1".to_string(),
         kind: "NodeMetricsList".to_string(),
-        items: vec![NodeMetrics {
-            api_version: "metrics.k8s.io/v1beta1".to_string(),
-            kind: "NodeMetrics".to_string(),
-            metadata: NodeMetricsMetadata {
-                name: "kube-shim".to_string(),
-            },
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            window: "10s".to_string(),
-            usage: format_usage(total_cpu, total_memory),
-        }],
+        items,
     }))
 }
 
@@ -230,6 +272,30 @@ mod tests {
         .unwrap();
     }
 
+    async fn insert_job_with_vm(
+        pool: &SqlitePool,
+        id: &str,
+        name: &str,
+        namespace: &str,
+        status: &str,
+        spec: &str,
+        vm_name: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, worker_vm_name, created_at, updated_at, version) \
+             VALUES (?, ?, ?, ?, ?, ?, 0, 0, 1)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(namespace)
+        .bind(spec)
+        .bind(status)
+        .bind(vm_name)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     fn spec_with_requests(cpu: &str, memory: &str) -> String {
         serde_json::json!({
             "template": {"spec": {"containers": [{
@@ -241,17 +307,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_node_metrics_sums_requests_across_non_terminal_jobs() {
+    async fn test_node_metrics_one_entry_per_allocated_worker_vm() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
-        insert_job(
+        insert_job_with_vm(
             &pool,
             "j1",
             "a",
             "default",
             "VMRunning",
             &spec_with_requests("2", "4Gi"),
+            "kube-shim-worker-a",
         )
         .await;
+        // No worker VM yet -- must not get a node entry.
         insert_job(
             &pool,
             "j2",
@@ -261,14 +329,15 @@ mod tests {
             &spec_with_requests("1", "2Gi"),
         )
         .await;
-        // Archived -- must not count.
-        insert_job(
+        // Archived -- must not count even if it still has a vm name.
+        insert_job_with_vm(
             &pool,
             "j3",
             "c",
             "default",
             "Archived",
             &spec_with_requests("8", "16Gi"),
+            "kube-shim-worker-c",
         )
         .await;
 
@@ -289,14 +358,24 @@ mod tests {
             .unwrap();
         let list: NodeMetricsList = serde_json::from_slice(&body).unwrap();
         assert_eq!(list.items.len(), 1);
-        assert_eq!(list.items[0].usage.cpu, "3");
-        assert_eq!(list.items[0].usage.memory, "6Gi");
+        assert_eq!(list.items[0].metadata.name, "kube-shim-worker-a");
+        assert_eq!(list.items[0].usage.cpu, "2");
+        assert_eq!(list.items[0].usage.memory, "4Gi");
     }
 
     #[tokio::test]
     async fn test_node_metrics_defaults_missing_requests_to_one_and_one() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
-        insert_job(&pool, "j1", "a", "default", "Created", "{}").await;
+        insert_job_with_vm(
+            &pool,
+            "j1",
+            "a",
+            "default",
+            "VMRunning",
+            "{}",
+            "kube-shim-worker-a",
+        )
+        .await;
 
         let router = Router::new()
             .route("/nodes", get(list_node_metrics))

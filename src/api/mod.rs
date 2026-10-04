@@ -2,6 +2,7 @@ pub mod cronjob;
 pub mod events;
 pub mod logs;
 pub mod metrics;
+pub mod nodes;
 pub mod pods;
 pub mod secret;
 
@@ -81,6 +82,15 @@ pub async fn discovery_v1() -> impl IntoResponse {
                 "singularName": "event",
                 "namespaced": true,
                 "kind": "Event",
+                "verbs": ["get", "list"]
+            },
+            {
+                "name": "nodes",
+                "singularName": "node",
+                // Cluster-scoped, same as a real Node -- there's no
+                // namespace a worker VM belongs to.
+                "namespaced": false,
+                "kind": "Node",
                 "verbs": ["get", "list"]
             }
         ]
