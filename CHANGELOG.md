@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.1](https://github.com/brawer/kube-shim/compare/v0.2.0...v0.2.1) (2026-10-05)
+
+
+### 🆕 Enhancements
+
+* real worker-VM metrics over SSH, replacing the request-based estimate ([#50](https://github.com/brawer/kube-shim/issues/50)) ([adc63f4](https://github.com/brawer/kube-shim/commit/adc63f43f2b1551d3d568985f69105375ec70a04))
+
+
+### 📚 Documentation
+
+* plan Phase 17 -- Prometheus /metrics (self-instrumentation + worker-VM VM stats) ([#51](https://github.com/brawer/kube-shim/issues/51)) ([e4330cc](https://github.com/brawer/kube-shim/commit/e4330cc43f3d0b0fdc5018b79f1556cfdc0a974f))
+* plan Phase 17 -- Prometheus /metrics (shim self-instrumentation + worker-VM virtual-memory stats) ([e4330cc](https://github.com/brawer/kube-shim/commit/e4330cc43f3d0b0fdc5018b79f1556cfdc0a974f))
+
 ## [0.2.0](https://github.com/brawer/kube-shim/compare/v0.1.13...v0.2.0) (2026-10-04)
 
 
