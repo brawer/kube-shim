@@ -6,12 +6,14 @@
 //! phases build directly on top of, not a throwaway prototype.
 
 pub mod job;
+pub mod metrics_collector;
 pub mod orphan_scan;
 pub mod schedule;
 pub mod startup;
 
 pub use job::JobContext;
 
+use crate::ssh;
 use anyhow::Result;
 use sqlx::SqlitePool;
 use std::sync::Arc;
@@ -35,6 +37,15 @@ const FALLBACK_INTERVAL: Duration = Duration::from_secs(10);
 /// job-tick wake-up as a reason to re-list the whole account's volumes.
 const ORPHAN_SCAN_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
+/// How often `reconcile::metrics_collector` SSHes into every currently
+/// `ContainerRunning` worker for a real `podman stats` + machine-health
+/// sample -- "real metrics, not fake numbers," per the user's own
+/// request that replaced `api::metrics`'s original design (estimated
+/// from `resources.requests`). 30s matches the cadence real Kubernetes
+/// metrics-server itself typically samples at by default, not picked
+/// arbitrarily.
+const METRICS_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Runs forever, driving the reconciliation loop: one pass immediately,
 /// then one every time either the fallback interval elapses or `notify`
 /// fires, whichever comes first. Callers wake it immediately by calling
@@ -57,6 +68,11 @@ pub async fn run(pool: SqlitePool, notify: Arc<Notify>, ctx: JobContext) {
         ctx.clone(),
         ORPHAN_SCAN_INTERVAL,
     ));
+    tokio::spawn(run_metrics_poll_loop(
+        pool.clone(),
+        ctx.clone(),
+        METRICS_POLL_INTERVAL,
+    ));
     run_with_interval(pool, notify, FALLBACK_INTERVAL, ctx).await
 }
 
@@ -77,6 +93,27 @@ async fn run_orphan_scan_loop(pool: SqlitePool, ctx: JobContext, interval_durati
             }
             Ok(_) => {}
             Err(err) => tracing::error!("orphan scan failed: {err:?}"),
+        }
+    }
+}
+
+/// Same shape as `run_orphan_scan_loop`: one pass immediately, then one
+/// every `interval_duration` thereafter, no `Notify` wake-up (a job
+/// becoming `ContainerRunning` doesn't need its first real sample any
+/// sooner than the next scheduled poll).
+async fn run_metrics_poll_loop(pool: SqlitePool, ctx: JobContext, interval_duration: Duration) {
+    let ssh_config = ssh::WorkerSshConfig {
+        private_key: ctx.worker_ssh_private_key.clone(),
+        port: ctx.worker_ssh_port,
+    };
+    let mut interval = tokio::time::interval(interval_duration);
+
+    loop {
+        interval.tick().await;
+
+        match metrics_collector::poll_once(&pool, &ssh_config).await {
+            Ok(_) => {}
+            Err(err) => tracing::error!("metrics poll failed: {err:?}"),
         }
     }
 }
