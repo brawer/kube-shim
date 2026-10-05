@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.2](https://github.com/brawer/kube-shim/compare/v0.2.1...v0.2.2) (2026-10-05)
+
+
+### 🆕 Enhancements
+
+* standalone batch/v1 Jobs, not only CronJob-spawned runs ([#55](https://github.com/brawer/kube-shim/issues/55)) ([4f6e941](https://github.com/brawer/kube-shim/commit/4f6e941c4c364d7112ad73f7009a4acc6a9c60f3))
+
+
+### 📚 Documentation
+
+* plan Phase 13 -- standalone batch/v1 Jobs ([#53](https://github.com/brawer/kube-shim/issues/53)) ([aefda0f](https://github.com/brawer/kube-shim/commit/aefda0f08a826deaba62c25e6d74f32919a392e7))
+
 ## [0.2.1](https://github.com/brawer/kube-shim/compare/v0.2.0...v0.2.1) (2026-10-05)
 
 
