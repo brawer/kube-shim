@@ -69,6 +69,23 @@ CREATE TABLE IF NOT EXISTS events (
     type TEXT NOT NULL DEFAULT 'Normal'  -- Normal or Warning
 );
 
+-- Real, measured worker-VM metrics (not estimated from resources.requests
+-- the way api::metrics used to): one row per job, upserted roughly every
+-- 30s by reconcile::metrics_collector while the job is ContainerRunning.
+-- Deliberately "latest sample" semantics, not a time series -- matching
+-- how real Kubernetes metrics-server itself only ever serves the most
+-- recent window, not history.
+CREATE TABLE IF NOT EXISTS worker_metrics (
+    job_id TEXT PRIMARY KEY,
+    cpu_millicores INTEGER NOT NULL,
+    memory_usage_bytes INTEGER NOT NULL,
+    node_memory_total_bytes INTEGER NOT NULL,
+    node_memory_used_bytes INTEGER NOT NULL,
+    node_cpu_count INTEGER NOT NULL,
+    node_load1 REAL NOT NULL,
+    sampled_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS hetzner_pricing (
     id TEXT PRIMARY KEY,
     server_type TEXT NOT NULL,
