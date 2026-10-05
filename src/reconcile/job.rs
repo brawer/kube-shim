@@ -232,7 +232,14 @@ pub fn next_state(current: &str) -> Option<&'static str> {
 /// already points at `VolumeDetaching`, same place a stuck cleanup state
 /// already is) or actively wrong (overwriting a real `"Succeeded"`
 /// outcome after the fact).
-fn is_pre_completion_state(status: &str) -> bool {
+///
+/// `pub(crate)`: also used by `reconcile::metrics_collector` to decide
+/// which jobs are even worth an SSH attempt -- combined with
+/// `worker_ssh_ip IS NOT NULL`, this naturally resolves to "from
+/// `VMRunning` (the first state with a real SSH IP) through
+/// `ContainerRunning`," without hardcoding that state list a second
+/// time somewhere that could drift from `STATE_SEQUENCE`.
+pub(crate) fn is_pre_completion_state(status: &str) -> bool {
     let succeeded_index = STATE_SEQUENCE
         .iter()
         .position(|s| *s == "Succeeded")

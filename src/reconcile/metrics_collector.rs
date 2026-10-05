@@ -4,22 +4,50 @@
 //! actually measured). "I'd like actual metrics, not fake numbers" --
 //! this is that.
 //!
-//! One combined SSH round-trip per currently-`ContainerRunning` job,
-//! every `reconcile::METRICS_POLL_INTERVAL`: `podman stats --format
-//! json` for the job's own container (verified hands-on against both a
-//! local podman 6.1.2 and the real apt-installed podman 4.9.3 this
-//! project's own worker VMs actually run -- same JSON schema on both),
-//! plus `free -b`/`nproc`/`/proc/loadavg` for the machine as a whole.
-//! Same SSH-safety rule `api::logs` already established: only ever
-//! attempted while `status == "ContainerRunning"` (a stale
-//! `worker_ssh_ip` could otherwise point at a since-reassigned IP, and
-//! this module's host-key verification is the same "accept any key" as
-//! everywhere else SSH is used here -- see `src/ssh.rs`'s own docs).
+//! One combined SSH round-trip per job, every
+//! `reconcile::METRICS_POLL_INTERVAL`: `podman stats --no-stream
+//! --format json` (verified hands-on against both a local podman 6.1.2
+//! and the real apt-installed podman 4.9.3 this project's own worker
+//! VMs actually run -- same JSON schema on both), plus
+//! `free -b`/`nproc`/`/proc/loadavg` for the machine as a whole.
+//!
+//! **Polled from `VMRunning` onward, not just `ContainerRunning`.**
+//! `worker_ssh_ip` is already set by the time a job reaches `VMRunning`
+//! (`handle_vm_creating`), and firewall rules are verified *before*
+//! that (`FirewallVerified` precedes `VMCreating` in `STATE_SEQUENCE`)
+//! -- so SSH is genuinely reachable for `VMRunning`/`VolumeAttaching`/
+//! `VolumeAttached` too, not just `ContainerRunning`. Collecting from
+//! `VMRunning` onward means a job stuck mid-provisioning (a volume
+//! attach retry loop, say) still gets real node-level visibility --
+//! exactly the case where "is the machine itself healthy" is most
+//! worth knowing. `job::is_pre_completion_state` (combined with
+//! `worker_ssh_ip IS NOT NULL`, which self-excludes every earlier
+//! state) is reused rather than hardcoding that state list a second
+//! time -- it already excludes the cleanup tail for the same reason
+//! `api::logs` already established: `worker_ssh_ip` is never cleared
+//! once set, but the worker VM it pointed at is deleted a few states
+//! later, and this module's host-key verification accepts any key --
+//! see `src/ssh.rs`'s own docs.
+//!
+//! **A sample's container stats and node-health are collected and
+//! recorded independently, not all-or-nothing.** `podman stats` with
+//! no container ID returns every *currently running* container as a
+//! JSON array -- zero entries (nothing started yet), one (today's
+//! only real case), or, if this project ever supports more than one
+//! container per pod, more than one; `Sample.containers` is a `Vec`
+//! for exactly that reason, not because multiple containers are
+//! supported anywhere else yet (`cloud_init`/`cloud-init-template.sh`
+//! still only ever start one). A job with zero running containers
+//! (still provisioning) still gets its *node* sample recorded -- Node-
+//! level serving shouldn't wait on Pod-level readiness any more than it
+//! does on a real cluster, where Node metrics are already independent
+//! of what's scheduled on it.
 //!
 //! Deliberately "latest sample, upserted" (`worker_metrics`), not a
 //! time series -- real Kubernetes metrics-server itself only ever
 //! serves the most recent window too, never history.
 
+use crate::reconcile::job::is_pre_completion_state;
 use crate::ssh::{self, WorkerSshConfig};
 use anyhow::Result;
 use chrono::Utc;
@@ -50,7 +78,7 @@ const SEP: &str = "___KUBESHIM_METRICS_SEP___";
 
 fn collection_command() -> String {
     format!(
-        "podman stats --no-stream --format json \"$(cat /tmp/container-id.txt 2>/dev/null)\" 2>/dev/null; \
+        "podman stats --no-stream --format json 2>/dev/null; \
          echo '{SEP}'; \
          free -b | awk '/^Mem:/ {{print $2, $3}}'; \
          echo '{SEP}'; \
@@ -60,10 +88,24 @@ fn collection_command() -> String {
     )
 }
 
+/// One currently-running container's own stats -- `name` is always
+/// `"main"` today (`cloud_init`'s own one-container-per-pod
+/// convention, matching `api::metrics`'s existing `ContainerMetrics`),
+/// but comes from `podman stats`' real `name` field, not hardcoded,
+/// so this doesn't need revisiting if that ever changes.
 #[derive(Debug, PartialEq)]
-struct Sample {
+struct ContainerSample {
+    name: String,
     cpu_millicores: u32,
     memory_usage_bytes: u64,
+}
+
+#[derive(Debug, PartialEq)]
+struct Sample {
+    /// Empty when nothing's running yet (still provisioning) -- see
+    /// this module's own top-level docs on why that's recorded as "no
+    /// container data" rather than discarding the whole sample.
+    containers: Vec<ContainerSample>,
     node_memory_total_bytes: u64,
     node_memory_used_bytes: u64,
     node_cpu_count: u32,
@@ -97,27 +139,46 @@ fn parse_podman_bytes(s: &str) -> Option<u64> {
     Some((value * multiplier).round() as u64)
 }
 
-/// `cpu_percent`/`mem_usage` from `podman stats --format json`'s first
-/// (and only, since we always ask for exactly one container) array
-/// entry -- e.g. `{"cpu_percent": "0.26%", "mem_usage": "303.1kB / 8.289GB", ...}`.
-/// `cpu_percent` is already relative to one full core (podman/docker's
-/// own long-standing convention: `"100%"` means one core fully
-/// saturated, not "100% of all cores"), so converting to millicores is
-/// a direct `* 10`, not a core-count-dependent calculation.
-fn parse_podman_stats(json: &str) -> Option<(u32, u64)> {
+/// Every entry in `podman stats --format json`'s own array -- e.g.
+/// `[{"name": "x", "cpu_percent": "0.26%", "mem_usage": "303.1kB / 8.289GB", ...}]`.
+/// Zero entries (nothing running yet) is a real, valid outcome, not a
+/// parse failure -- returns an empty `Vec`, not `None`; `None` is
+/// reserved for output that doesn't even look like `podman stats`
+/// JSON at all (garbage, a truncated/failed command). `cpu_percent` is
+/// already relative to one full core (podman/docker's own
+/// long-standing convention: `"100%"` means one core fully saturated,
+/// not "100% of all cores"), so converting to millicores is a direct
+/// `* 10`, not a core-count-dependent calculation. One malformed entry
+/// is skipped rather than failing the whole list -- `filter_map`, not
+/// `collect::<Option<Vec<_>>>()` -- so a transient oddity on one
+/// container doesn't hide every other one's perfectly good data.
+fn parse_podman_stats(json: &str) -> Option<Vec<ContainerSample>> {
     let parsed: serde_json::Value = serde_json::from_str(json).ok()?;
-    let entry = parsed.as_array()?.first()?;
-    let cpu_percent: f64 = entry
-        .get("cpu_percent")?
-        .as_str()?
-        .trim_end_matches('%')
-        .parse()
-        .ok()?;
-    let mem_usage = entry.get("mem_usage")?.as_str()?;
-    let used = mem_usage.split('/').next()?;
-    let memory_usage_bytes = parse_podman_bytes(used)?;
-    let cpu_millicores = (cpu_percent * 10.0).round() as u32;
-    Some((cpu_millicores, memory_usage_bytes))
+    let entries = parsed.as_array()?;
+
+    Some(
+        entries
+            .iter()
+            .filter_map(|entry| {
+                let name = entry.get("name")?.as_str()?.to_string();
+                let cpu_percent: f64 = entry
+                    .get("cpu_percent")?
+                    .as_str()?
+                    .trim_end_matches('%')
+                    .parse()
+                    .ok()?;
+                let mem_usage = entry.get("mem_usage")?.as_str()?;
+                let used = mem_usage.split('/').next()?;
+                let memory_usage_bytes = parse_podman_bytes(used)?;
+                let cpu_millicores = (cpu_percent * 10.0).round() as u32;
+                Some(ContainerSample {
+                    name,
+                    cpu_millicores,
+                    memory_usage_bytes,
+                })
+            })
+            .collect(),
+    )
 }
 
 /// The combined command's own three remaining sections: `free -b`'s
@@ -137,6 +198,12 @@ fn parse_node_health(
     Some((total, used, cpu_count, load1))
 }
 
+/// `containers` being empty is a perfectly valid, recordable outcome
+/// (nothing running yet) -- only a genuinely unparseable
+/// `podman stats` section (`parse_podman_stats` returning `None`, not
+/// `Some(vec![])`) or unparseable node-health fails the *whole*
+/// sample; those two are independent precisely so a job with no
+/// container yet still gets its real node-health recorded.
 fn parse_sample(stdout: &str) -> Option<Sample> {
     let mut sections = stdout.split(SEP);
     let stats_section = sections.next()?.trim();
@@ -144,13 +211,12 @@ fn parse_sample(stdout: &str) -> Option<Sample> {
     let nproc_section = sections.next()?.trim();
     let loadavg_section = sections.next()?.trim();
 
-    let (cpu_millicores, memory_usage_bytes) = parse_podman_stats(stats_section)?;
+    let containers = parse_podman_stats(stats_section)?;
     let (node_memory_total_bytes, node_memory_used_bytes, node_cpu_count, node_load1) =
         parse_node_health(free_section, nproc_section, loadavg_section)?;
 
     Some(Sample {
-        cpu_millicores,
-        memory_usage_bytes,
+        containers,
         node_memory_total_bytes,
         node_memory_used_bytes,
         node_cpu_count,
@@ -158,8 +224,21 @@ fn parse_sample(stdout: &str) -> Option<Sample> {
     })
 }
 
+/// `cpu_millicores`/`memory_usage_bytes` are nullable: `NULL` means
+/// exactly what an empty `sample.containers` means -- no container
+/// running yet, not zero usage. Storage only ever keeps the *first*
+/// container's stats (today, there's never more than one); see this
+/// module's own top-level docs on why `Sample.containers` is still a
+/// `Vec` despite that -- the collection/parsing layer is already
+/// forward-compatible with more than one, storage deliberately isn't,
+/// since actually persisting several would need a real child table,
+/// disproportionate to a feature nothing in this project supports yet.
 async fn upsert_sample(pool: &SqlitePool, job_id: &str, sample: &Sample) -> Result<()> {
     let now = Utc::now().timestamp();
+    let container = sample.containers.first();
+    let cpu_millicores = container.map(|c| c.cpu_millicores);
+    let memory_usage_bytes = container.map(|c| c.memory_usage_bytes as i64);
+
     sqlx::query(
         "INSERT INTO worker_metrics \
          (job_id, cpu_millicores, memory_usage_bytes, node_memory_total_bytes, \
@@ -175,8 +254,8 @@ async fn upsert_sample(pool: &SqlitePool, job_id: &str, sample: &Sample) -> Resu
              sampled_at = excluded.sampled_at",
     )
     .bind(job_id)
-    .bind(sample.cpu_millicores)
-    .bind(sample.memory_usage_bytes as i64)
+    .bind(cpu_millicores)
+    .bind(memory_usage_bytes)
     .bind(sample.node_memory_total_bytes as i64)
     .bind(sample.node_memory_used_bytes as i64)
     .bind(sample.node_cpu_count)
@@ -196,12 +275,30 @@ async fn upsert_sample(pool: &SqlitePool, job_id: &str, sample: &Sample) -> Resu
 /// left `ContainerRunning` between polls is cleaned up within one
 /// `METRICS_POLL_INTERVAL`, not left stale indefinitely.
 async fn forget_stale_samples(pool: &SqlitePool) -> Result<()> {
-    sqlx::query(
-        "DELETE FROM worker_metrics WHERE job_id NOT IN \
-         (SELECT id FROM jobs WHERE status = 'ContainerRunning')",
+    // Filtered in Rust via is_pre_completion_state, same as the SELECT
+    // below, rather than a hardcoded SQL state list that could drift
+    // from it. A LEFT JOIN (not INNER) so a row whose job has somehow
+    // vanished entirely (status is NULL here) is also cleaned up, not
+    // silently kept forever.
+    let rows = sqlx::query(
+        "SELECT worker_metrics.job_id, jobs.status \
+         FROM worker_metrics \
+         LEFT JOIN jobs ON worker_metrics.job_id = jobs.id",
     )
-    .execute(pool)
+    .fetch_all(pool)
     .await?;
+
+    for row in rows {
+        let job_id: String = row.get(0);
+        let status: Option<String> = row.get(1);
+        let still_valid = status.is_some_and(|s| is_pre_completion_state(&s));
+        if !still_valid {
+            sqlx::query("DELETE FROM worker_metrics WHERE job_id = ?")
+                .bind(&job_id)
+                .execute(pool)
+                .await?;
+        }
+    }
     Ok(())
 }
 
@@ -232,17 +329,25 @@ async fn poll_once_with_timeout(
 ) -> Result<usize> {
     forget_stale_samples(pool).await?;
 
-    let rows = sqlx::query(
-        "SELECT id, worker_ssh_ip FROM jobs WHERE status = 'ContainerRunning' AND worker_ssh_ip IS NOT NULL",
-    )
-    .fetch_all(pool)
-    .await?;
+    // worker_ssh_ip IS NOT NULL alone already excludes every state
+    // before VMRunning (it isn't set yet); is_pre_completion_state
+    // excludes the cleanup tail. Together they resolve to exactly
+    // "VMRunning through ContainerRunning" -- see this module's own
+    // top-level docs.
+    let rows =
+        sqlx::query("SELECT id, status, worker_ssh_ip FROM jobs WHERE worker_ssh_ip IS NOT NULL")
+            .fetch_all(pool)
+            .await?;
 
     let command = collection_command();
     let mut updated = 0;
     for row in rows {
         let job_id: String = row.get(0);
-        let ip: String = row.get(1);
+        let status: String = row.get(1);
+        if !is_pre_completion_state(&status) {
+            continue;
+        }
+        let ip: String = row.get(2);
 
         let exec = ssh::exec_once(&ip, ssh_config.port, &ssh_config.private_key, &command);
         let output = match tokio::time::timeout(ssh_timeout, exec).await {
@@ -313,16 +418,19 @@ mod tests {
           "pids": "1"
          }
         ]"#;
-        let (cpu_millicores, memory_usage_bytes) = parse_podman_stats(json).unwrap();
-        assert_eq!(cpu_millicores, 1); // 0.12% * 10, rounded
-        assert_eq!(memory_usage_bytes, 294_900);
+        let containers = parse_podman_stats(json).unwrap();
+        assert_eq!(containers.len(), 1);
+        assert_eq!(containers[0].name, "stats-verify2");
+        assert_eq!(containers[0].cpu_millicores, 1); // 0.12% * 10, rounded
+        assert_eq!(containers[0].memory_usage_bytes, 294_900);
     }
 
     #[test]
-    fn test_parse_podman_stats_empty_array_is_none() {
-        // What a container that no longer exists (or never started)
-        // produces: podman succeeds but reports nothing.
-        assert!(parse_podman_stats("[]").is_none());
+    fn test_parse_podman_stats_empty_array_is_an_empty_vec_not_none() {
+        // What zero running containers produces (nothing started yet) --
+        // a real, valid outcome, not a parse failure: podman succeeded
+        // and correctly reported "nothing running."
+        assert_eq!(parse_podman_stats("[]"), Some(vec![]));
     }
 
     #[test]
@@ -344,17 +452,33 @@ mod tests {
 
     #[test]
     fn test_parse_sample_full_round_trip() {
-        let stats = r#"[{"cpu_percent": "25.00%", "mem_usage": "512.0MB / 1.0GB"}]"#;
+        let stats =
+            r#"[{"name": "main", "cpu_percent": "25.00%", "mem_usage": "512.0MB / 1.0GB"}]"#;
         let stdout = format!(
             "{stats}\n{SEP}\n8000000000 4000000000\n{SEP}\n4\n{SEP}\n1.00 0.90 0.80 1/200 999\n"
         );
         let sample = parse_sample(&stdout).unwrap();
-        assert_eq!(sample.cpu_millicores, 250);
-        assert_eq!(sample.memory_usage_bytes, 512_000_000);
+        assert_eq!(sample.containers.len(), 1);
+        assert_eq!(sample.containers[0].cpu_millicores, 250);
+        assert_eq!(sample.containers[0].memory_usage_bytes, 512_000_000);
         assert_eq!(sample.node_memory_total_bytes, 8_000_000_000);
         assert_eq!(sample.node_memory_used_bytes, 4_000_000_000);
         assert_eq!(sample.node_cpu_count, 4);
         assert_eq!(sample.node_load1, 1.0);
+    }
+
+    #[test]
+    fn test_parse_sample_with_no_containers_still_records_node_health() {
+        // The whole point of decoupling the two halves: a job with no
+        // container running yet (still provisioning) must still get a
+        // real, recordable sample for the machine itself.
+        let stdout = format!(
+            "[]\n{SEP}\n8000000000 4000000000\n{SEP}\n4\n{SEP}\n1.00 0.90 0.80 1/200 999\n"
+        );
+        let sample = parse_sample(&stdout).unwrap();
+        assert!(sample.containers.is_empty());
+        assert_eq!(sample.node_memory_total_bytes, 8_000_000_000);
+        assert_eq!(sample.node_cpu_count, 4);
     }
 
     #[test]
@@ -379,8 +503,9 @@ mod tests {
          0.00 0.00 0.00 1/144 101837\n";
 
         let sample = parse_sample(stdout).unwrap();
-        assert_eq!(sample.cpu_millicores, 0); // 0.02% rounds down to 0m
-        assert_eq!(sample.memory_usage_bytes, 1_839_000);
+        assert_eq!(sample.containers.len(), 1);
+        assert_eq!(sample.containers[0].cpu_millicores, 0); // 0.02% rounds down to 0m
+        assert_eq!(sample.containers[0].memory_usage_bytes, 1_839_000);
         assert_eq!(sample.node_memory_total_bytes, 889_794_560);
         assert_eq!(sample.node_memory_used_bytes, 479_375_360);
         assert_eq!(sample.node_cpu_count, 1);
@@ -393,11 +518,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_poll_once_ignores_jobs_not_container_running() {
+    async fn test_poll_once_ignores_jobs_with_no_worker_ssh_ip_yet() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
         sqlx::query(
-            "INSERT INTO jobs (id, name, namespace, spec, status, worker_ssh_ip, created_at, updated_at, version) \
-             VALUES ('j1', 'job-one', 'default', '{}', 'VMRunning', '127.0.0.1', 0, 0, 1)",
+            "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
+             VALUES ('j1', 'job-one', 'default', '{}', 'VolumeAttaching', 0, 0, 1)",
         )
         .execute(&pool)
         .await
@@ -409,6 +534,88 @@ mod tests {
         };
         let updated = poll_once(&pool, &ssh_config).await.unwrap();
         assert_eq!(updated, 0);
+    }
+
+    /// Spawns a task that accepts exactly one TCP connection on
+    /// `listener` and records whether it happened -- used below to
+    /// distinguish "this job's SSH round-trip was genuinely attempted"
+    /// from "attempted and merely failed," which a bare `updated == 0`
+    /// can't tell apart on its own.
+    fn watch_for_one_connection(
+        listener: std::net::TcpListener,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let connected_clone = connected.clone();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        tokio::spawn(async move {
+            if listener.accept().await.is_ok() {
+                connected_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        connected
+    }
+
+    #[tokio::test]
+    async fn test_poll_once_includes_pre_container_running_states_once_ssh_ip_is_set() {
+        // VolumeAttached: SSH-reachable (worker_ssh_ip set, firewall
+        // already verified earlier in the sequence) but still short of
+        // ContainerRunning -- must be attempted, not skipped, per this
+        // module's own widened collection window.
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, worker_ssh_ip, created_at, updated_at, version) \
+             VALUES ('j1', 'job-one', 'default', '{}', 'VolumeAttached', '127.0.0.1', 0, 0, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connected = watch_for_one_connection(listener);
+
+        let ssh_config = WorkerSshConfig {
+            private_key: crate::ssh::tests::throwaway_private_key_pem(),
+            port,
+        };
+        let _ = poll_once_with_timeout(&pool, &ssh_config, Duration::from_millis(200)).await;
+
+        assert!(
+            connected.load(std::sync::atomic::Ordering::SeqCst),
+            "VolumeAttached must be attempted -- it's SSH-reachable and pre-completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_poll_once_excludes_cleanup_tail_states_despite_worker_ssh_ip_still_set() {
+        // VolumeDetaching: worker_ssh_ip is never cleared once set, but
+        // the worker VM it pointed at is deleted a few states later --
+        // must NOT be attempted, same stale-IP reasoning api::logs
+        // already established for this exact field.
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, worker_ssh_ip, created_at, updated_at, version) \
+             VALUES ('j1', 'job-one', 'default', '{}', 'VolumeDetaching', '127.0.0.1', 0, 0, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connected = watch_for_one_connection(listener);
+
+        let ssh_config = WorkerSshConfig {
+            private_key: crate::ssh::tests::throwaway_private_key_pem(),
+            port,
+        };
+        let _ = poll_once_with_timeout(&pool, &ssh_config, Duration::from_millis(200)).await;
+
+        assert!(
+            !connected.load(std::sync::atomic::Ordering::SeqCst),
+            "VolumeDetaching must not be attempted even though worker_ssh_ip is still set"
+        );
     }
 
     #[tokio::test]
@@ -518,5 +725,39 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_forget_stale_samples_keeps_a_pre_container_running_sample() {
+        // The other half of the test above: a sample for a job still
+        // mid-provisioning (VolumeAttached, pre-ContainerRunning) must
+        // survive pruning, not just a ContainerRunning one -- proving
+        // the prune condition widened in lockstep with the collection
+        // window, not just the SELECT in poll_once_with_timeout.
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
+             VALUES ('j1', 'job-one', 'default', '{}', 'VolumeAttached', 0, 0, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO worker_metrics (job_id, cpu_millicores, memory_usage_bytes, \
+             node_memory_total_bytes, node_memory_used_bytes, node_cpu_count, node_load1, sampled_at) \
+             VALUES ('j1', NULL, NULL, 2000, 1000, 1, 0.1, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        forget_stale_samples(&pool).await.unwrap();
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM worker_metrics WHERE job_id = 'j1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
     }
 }

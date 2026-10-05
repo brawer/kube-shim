@@ -71,14 +71,21 @@ CREATE TABLE IF NOT EXISTS events (
 
 -- Real, measured worker-VM metrics (not estimated from resources.requests
 -- the way api::metrics used to): one row per job, upserted roughly every
--- 30s by reconcile::metrics_collector while the job is ContainerRunning.
--- Deliberately "latest sample" semantics, not a time series -- matching
--- how real Kubernetes metrics-server itself only ever serves the most
--- recent window, not history.
+-- 30s by reconcile::metrics_collector from VMRunning through
+-- ContainerRunning (SSH is reachable from VMRunning onward -- see that
+-- module's own docs). Deliberately "latest sample" semantics, not a time
+-- series -- matching how real Kubernetes metrics-server itself only ever
+-- serves the most recent window, not history.
+--
+-- cpu_millicores/memory_usage_bytes are nullable: NULL means no
+-- container is running yet (still provisioning), not zero usage --
+-- node_* columns are still recorded in that case, independent of
+-- whether a container exists (see reconcile::metrics_collector's own
+-- docs on why Node-level and Pod-level readiness aren't the same gate).
 CREATE TABLE IF NOT EXISTS worker_metrics (
     job_id TEXT PRIMARY KEY,
-    cpu_millicores INTEGER NOT NULL,
-    memory_usage_bytes INTEGER NOT NULL,
+    cpu_millicores INTEGER,
+    memory_usage_bytes INTEGER,
     node_memory_total_bytes INTEGER NOT NULL,
     node_memory_used_bytes INTEGER NOT NULL,
     node_cpu_count INTEGER NOT NULL,
