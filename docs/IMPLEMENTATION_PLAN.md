@@ -759,98 +759,35 @@ cargo test   # 157 lib tests + 19 integration tests, including a real
 
 ---
 
-### Phase 13: Standalone Jobs (`batch/v1`) (Days 13-14)
-**Goal:** Let a `batch/v1` `Job` be created directly, not only ever indirectly via a `CronJob`'s own schedule — a real, user-surfaced need: testing a new workload version/release by hand before it's trusted enough to run unattended as a recurring `CronJob`. Added here, right after Phase 12 and ahead of the originally-next pricing/budget work (Phase 14), since it's small and almost entirely decoupled from everything else still planned — see below.
+### Phase 13: Standalone Jobs (`batch/v1`) (Days 13-14) — ✅ Complete
+**Goal:** Let a `batch/v1` `Job` be created directly, not only ever indirectly via a `CronJob`'s own schedule — a real, user-surfaced need: testing a new workload version/release by hand before it's trusted enough to run unattended as a recurring `CronJob`. Added right after Phase 12 and ahead of the originally-next pricing/budget work (Phase 14), since it's small and almost entirely decoupled from everything else planned.
 
-**Why this slots in cleanly, with almost no new reconciliation logic:** every real mechanism downstream of job creation — `reconcile::job::advance_all`'s state machine, VM provisioning, volume handling, SSH/logs, events, metrics collection — already operates purely on a `jobs` row's own `id`/`status`/`namespace`/`name`, with no branch anywhere on `cronjob_name`. `jobs.cronjob_name` is already nullable in the schema (front-loaded since Phase 1, never enforced `NOT NULL`), and `reconcile::schedule::create_job_run` already stores a CronJob-spawned run's `jobs.spec` as the *unwrapped* `spec.jobTemplate.spec` value — exactly the shape a standalone Job's own top-level `.spec` already is. So a standalone Job is, structurally, just another `jobs` row with `cronjob_name = NULL`; nothing in `reconcile::*` needs to know or care how a row came to exist.
+**What was actually built, essentially matching the plan:**
 
-**The one real wrinkle, found by reading `src/admission.rs` rather than assumed:** `require_active_deadline_seconds`/`validate_ephemeral_volume_storage_classes`/`validate_resource_limits` all hardcode the `/jobTemplate/spec/...` JSON-pointer prefix (and the matching `"spec.jobTemplate.spec...."` string in their own rejection messages), since today they only ever validate a `CronJob`'s top-level `.spec`. A standalone Job's own `.spec` has no `jobTemplate` wrapper at all (`.spec.template.spec...` directly) — calling these functions unmodified on a Job's `.spec` would check the wrong path and silently never reject anything. Fixing this is the one unavoidable shared-code change: each function takes the pod-template-level spec directly (what's today reached via `.pointer("/jobTemplate/spec/...")`) plus the field-path prefix to use in its own error message, so `create_cronjob` passes `req.spec.pointer("/jobTemplate/spec")` + prefix `"spec.jobTemplate.spec"`, and the new Job handler passes `req.spec` + prefix `"spec"` directly — one validation implementation, two thin call sites, not two copies of the same three checks.
+- **A standalone Job really is just another `jobs` row with `cronjob_name = NULL`**, confirmed by implementation: `api::job::create_job` inserts directly, and every real downstream mechanism -- `reconcile::job::advance_all`'s state machine, VM provisioning, volume handling, SSH/logs, events, `reconcile::metrics_collector` -- needed zero changes, exactly as predicted, since none of them branch on `cronjob_name` anywhere.
+- **The one real wrinkle, found by reading `src/admission.rs` rather than assumed:** `require_active_deadline_seconds`/`validate_ephemeral_volume_storage_classes`/`validate_resource_limits` all hardcoded the `/jobTemplate/spec/...` JSON-pointer prefix (and the matching `"spec.jobTemplate.spec...."` string in their own rejection messages), since they only ever validated a `CronJob`'s top-level `.spec` before this. Generalized to take the pod-template-level spec directly plus a `field_prefix` for their own rejection messages -- `api::cronjob::create_cronjob` passes `req.spec.pointer("/jobTemplate/spec")` + `"spec.jobTemplate.spec"`, `api::job::create_job` passes `req.spec` + `"spec"` directly -- one validation implementation, two thin call sites, not two copies of the same three checks. Every existing CronJob admission test still passes unchanged against the generalized functions.
+- `POST`/`GET`/`GET` (list)/`DELETE` on `/apis/batch/v1/namespaces/:namespace/jobs[/:name]`, plus `"jobs"` added to `discovery_batch_v1` alongside `"cronjobs"`.
+- A standalone Job's name is used exactly as given (unlike a CronJob-spawned run's timestamp-suffixed one) -- a new `k8s_status::already_exists` (409 Conflict, `reason: AlreadyExists`) rejects a collision with an existing job in the same namespace.
+- `JobStatus` (`active`/`succeeded`/`failed`/`conditions`) reuses `api::pods::phase_for`'s own state->outcome inference (made `pub(crate)`), just mapped into `batch/v1`'s own shape instead of `Pod`'s single `phase` string -- one inference, two representations.
+- **`DELETE` on a still-running Job routes through `reconcile::job::force_failed`** (made `pub(crate)` for this), the exact same real cleanup path deadline/stuck-state enforcement (Phase 11) already uses, rather than a second teardown mechanism. **One detail the original plan text didn't spell out:** `DELETE` on an *already-finished* Job (`Succeeded`/`Failed`/anywhere in the cleanup tail/`Archived`) instead removes the row immediately -- there's nothing real left to protect by keeping it around, and leaving it would make `kubectl delete` on an old completed Job a silent no-op, unlike real Kubernetes.
+- `list_jobs`/`get_job` show every `jobs` row in the namespace regardless of `cronjob_name`, matching real `kubectl get jobs`: a CronJob-spawned run is still its own real, independently-listed Job there, not hidden just because something else created it.
+- No `WorkloadKind` change, confirmed as the right call during implementation (see `src/workload.rs`'s own updated doc comment): it denotes the *owner*, not the job run's own resource kind (always `Job` trivially) -- a bare Job genuinely has no owner, which is `cronjob_name` being absent, not a `WorkloadKind` value of its own.
 
-**Deliverables:**
-- `POST /apis/batch/v1/namespaces/:namespace/jobs` — same three admission checks `create_cronjob` already runs (`activeDeadlineSeconds` required, known `storageClassName`, valid `resources.limits` quantities), now reusable by both via the `admission.rs` refactor above. Inserts directly into `jobs` with `cronjob_name = NULL`, `spec` = the Job's own `.spec` verbatim (already the right shape, per above) — no new table, no new reconciliation state.
-- A standalone Job's name is used exactly as given (unlike a CronJob-spawned run, which synthesizes `{cronjob_name}-{timestamp}` to disambiguate repeated runs) — rejected with a 409 Conflict + `Status` object if it collides with an existing job in the same namespace, matching real Kubernetes Job-name-uniqueness semantics.
-- `GET /apis/batch/v1/namespaces/:namespace/jobs` (list) and `GET .../jobs/:name` (get) — a real `JobStatus` shape (`active`/`succeeded`/`failed` counts derived from `jobs.status`, plus `conditions`), reusing the same state→phase inference `api::pods::get_pod` (Phase 12) already established rather than a second copy of that mapping.
-- `DELETE /apis/batch/v1/namespaces/:namespace/jobs/:name` on a still-running Job routes it through the exact same `force_failed` cleanup path (`VolumeDetaching` tail) that deadline/stuck-state enforcement (Phase 11) already uses — one teardown mechanism, not a second one built just for user-initiated delete.
-- Add `"jobs"` to `discovery_batch_v1`'s resource list, alongside the existing `"cronjobs"` entry.
-- No `WorkloadKind` change: it stays the *owning-workload* kind (`CronJob` today, `Deployment` later) — a bare Job has no owning workload at all in real Kubernetes either, so "does this job have a `cronjob_name`" is already the right presence check, not a reason to add a `WorkloadKind::Job` variant that would never actually be read anywhere.
-- Budget-guard interaction (Phase 14, once it exists): a standalone Job is estimated/charged exactly like any other job — no special-casing planned, since the budget guard keys off `activeDeadlineSeconds`/actual VM-seconds, not off `cronjob_name`.
+**Verified hands-on against a real local dev server (dry-run), not just unit/integration tests:** created a standalone Job via `curl` with a real ephemeral-volume declaration, watched it advance through the *exact* real state sequence a CronJob-spawned run uses (`Created -> VolumePending -> ... -> ContainerRunning -> Succeeded -> VolumeDetaching -> ... -> Archived`) with no special-casing anywhere in the reconciliation loop; confirmed `GET` showed `status.succeeded: 1`/`conditions: [{type: Complete}]` once finished, and that deleting it afterward actually removed the row (404 on a subsequent `GET`). Separately created a second Job and deleted it mid-`VolumePending`: confirmed it was force-failed (`status = Failed`, `last_error` containing `"Deleted"`) and went on to reach `Archived` through the real cleanup path on its own, rather than vanishing immediately.
 
-**Files to create/modify:**
-- `src/admission.rs` — `require_active_deadline_seconds`/`validate_ephemeral_volume_storage_classes`/`validate_resource_limits` take the pod-template-level spec + an error-message field-path prefix, instead of hardcoding `/jobTemplate/spec/...` and `"spec.jobTemplate.spec..."` internally
-- `src/api/cronjob.rs` — `create_cronjob` updated to pass `req.spec.pointer("/jobTemplate/spec")` + the `"spec.jobTemplate.spec"` prefix into the now-generalized admission functions, preserving its exact current behavior/messages
-- `src/api/job.rs` (new) — `create_job`/`list_jobs`/`get_job`/`delete_job`, the real `Job`/`JobStatus`/`JobList` JSON shapes
+**Files created/modified:**
+- `src/admission.rs` — `require_active_deadline_seconds`/`validate_ephemeral_volume_storage_classes`/`validate_resource_limits` generalized to take the pod-template-level spec + `field_prefix`; 14 tests (one of the original 12 -- testing a bare "no jobTemplate at all" shape no longer meaningful once that unwrapping moved to the caller -- replaced by three new ones proving the Job-style prefix)
+- `src/api/cronjob.rs` — `create_cronjob` updated for the generalized admission calls, behavior/messages unchanged
+- `src/api/job.rs` (new) — `create_job`/`list_jobs`/`get_job`/`delete_job`, `Job`/`JobStatus`/`JobCondition`/`JobList`; 9 tests
+- `src/api/pods.rs` — `phase_for` made `pub(crate)` for `api::job::status_for` to reuse
 - `src/api/mod.rs` — `"jobs"` added to `discovery_batch_v1`
 - `src/app.rs` — routes for the four new handlers
+- `src/reconcile/job.rs` — `force_failed` made `pub(crate)` for `api::job::delete_job` to reuse
+- `src/k8s_status.rs` — new `already_exists` (409); 5 tests (1 new)
 - `src/workload.rs` — doc comment only, clarifying `WorkloadKind` denotes an *owning* workload and a bare Job legitimately has none
+- `tests/job_admission_test.rs` (new) — mirrors `cronjob_admission_test.rs` through the real router; 8 tests
 
-**Testing:**
-```bash
-# Create a standalone Job directly, no CronJob involved
-kubectl apply -f - <<'YAML'
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: hello-world-test
-  namespace: default
-spec:
-  activeDeadlineSeconds: 300
-  template:
-    spec:
-      volumes:
-        - ephemeral:
-            volumeClaimTemplate:
-              spec:
-                resources: {requests: {storage: 1Gi}}
-                storageClassName: kube-shim-standard
-      containers:
-        - name: main
-          image: busybox:latest
-          command: ["sh", "-c"]
-          args: ["echo hello world && touch /scratch/hello.txt"]
-      restartPolicy: Never
-YAML
-# Deliberately the same lightweight busybox/echo/scratch-touch shape
-# reconcile::job's own tests already use (not osmdiffs or any other
-# real multi-hour workload image) -- enough to exercise the full real
-# state machine end-to-end (real volume create+attach, container run,
-# exit-code detection, cleanup) in well under a minute, not hours. The
-# `volumes` entry is what actually provisions a real, separate UpCloud
-# volume for /scratch rather than falling back to the boot disk --
-# cloud-init-template.sh always mounts whatever ends up attached (or
-# nothing) at /scratch unconditionally, no `volumeMounts` needed.
-#
-# Should run through the exact same state machine as a CronJob-spawned
-# run: VolumePending -> ... -> ContainerRunning -> Succeeded -> cleanup
-
-kubectl get jobs
-kubectl describe job hello-world-test
-# Real status, logs, events -- same as any CronJob-spawned run
-
-kubectl logs job/hello-world-test
-# -> hello world
-ssh <worker-ip> cat /scratch/hello.txt   # (while still ContainerRunning)
-# -> confirms the touch landed on the real attached volume, not just
-#    the container's own throwaway filesystem
-
-# Missing activeDeadlineSeconds is rejected the same way a CronJob is:
-kubectl apply -f - <<'YAML'
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: missing-deadline
-spec:
-  template:
-    spec:
-      containers: [{name: main, image: busybox}]
-      restartPolicy: Never
-YAML
-# -> 403 Forbidden, same admission webhook denial message shape,
-#    field path "spec.activeDeadlineSeconds" (not "spec.jobTemplate.spec...")
-
-# Delete while running tears down the worker VM/volume
-kubectl delete job hello-world-test
-# Worker VM and volume gone from the UpCloud control panel shortly after
-```
+**Testing:** 235 lib tests (12 net new) + 29 integration tests (8 new via `job_admission_test.rs`), all passing; `cargo fmt --check`/`cargo clippy --all-targets -- -D warnings` clean; `./smoke-test.sh --skip-build` passing; real local dev-server verification per above.
 
 ---
 

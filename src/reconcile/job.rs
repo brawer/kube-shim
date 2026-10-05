@@ -273,7 +273,12 @@ fn active_deadline_seconds(spec: &JsonValue) -> Option<i64> {
 /// (seconds, not minutes, given `FALLBACK_INTERVAL`) to actually finish
 /// deleting things is an acceptable cost for not duplicating that cleanup
 /// logic a second time here.
-async fn force_failed(
+///
+/// `pub(crate)`: also called directly by `api::job::delete_job` (Phase
+/// 13) when a user deletes a still-running standalone Job -- the exact
+/// same real-cleanup path, rather than a second teardown mechanism built
+/// just for user-initiated delete.
+pub(crate) async fn force_failed(
     pool: &SqlitePool,
     job_id: &str,
     namespace: &str,

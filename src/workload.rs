@@ -4,13 +4,22 @@
 //! -- but both live here now, tested, as the single home later phases
 //! build on rather than improvising their own version of each.
 
-/// What kind of workload owns a job run. Only `CronJob` exists today.
-/// `Deployment` is real Kubernetes' next logical workload type and is
-/// deliberately not built yet (see docs/IMPLEMENTATION_PLAN.md "Future
-/// Work: Deployments") -- this enum exists now purely so the
+/// What kind of workload *owns* a job run, if any. Only `CronJob` exists
+/// today. `Deployment` is real Kubernetes' next logical workload type
+/// and is deliberately not built yet (see docs/IMPLEMENTATION_PLAN.md
+/// "Future Work: Deployments") -- this enum exists now purely so the
 /// reconciliation and VM-provisioning code built on top of it later
 /// (Phase 6+) isn't written in a way that silently assumes CronJob is the
 /// only possible kind.
+///
+/// Deliberately does *not* have a `Job` variant (Phase 13: standalone
+/// `batch/v1` `Job`s, created directly rather than only ever spawned by
+/// a `CronJob`'s schedule): this enum denotes the *owner*, not the job
+/// run's own resource kind (which is always `Job` -- trivially, there's
+/// no other option, so it wouldn't need an enum at all). A standalone
+/// Job genuinely has no owner at all, the same as in real Kubernetes
+/// (Jobs don't own other Jobs) -- that's `jobs.cronjob_name` being
+/// absent, not a `WorkloadKind` value of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkloadKind {
     CronJob,
