@@ -790,23 +790,47 @@ kubectl apply -f - <<'YAML'
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: osmdiffs-test-v2
+  name: hello-world-test
   namespace: default
 spec:
-  activeDeadlineSeconds: 3600
+  activeDeadlineSeconds: 300
   template:
     spec:
+      volumes:
+        - ephemeral:
+            volumeClaimTemplate:
+              spec:
+                resources: {requests: {storage: 1Gi}}
+                storageClassName: kube-shim-standard
       containers:
         - name: main
-          image: ghcr.io/example/osmdiffs:v2
+          image: busybox:latest
+          command: ["sh", "-c"]
+          args: ["echo hello world && touch /scratch/hello.txt"]
       restartPolicy: Never
 YAML
+# Deliberately the same lightweight busybox/echo/scratch-touch shape
+# reconcile::job's own tests already use (not osmdiffs or any other
+# real multi-hour workload image) -- enough to exercise the full real
+# state machine end-to-end (real volume create+attach, container run,
+# exit-code detection, cleanup) in well under a minute, not hours. The
+# `volumes` entry is what actually provisions a real, separate UpCloud
+# volume for /scratch rather than falling back to the boot disk --
+# cloud-init-template.sh always mounts whatever ends up attached (or
+# nothing) at /scratch unconditionally, no `volumeMounts` needed.
+#
 # Should run through the exact same state machine as a CronJob-spawned
 # run: VolumePending -> ... -> ContainerRunning -> Succeeded -> cleanup
 
 kubectl get jobs
-kubectl describe job osmdiffs-test-v2
+kubectl describe job hello-world-test
 # Real status, logs, events -- same as any CronJob-spawned run
+
+kubectl logs job/hello-world-test
+# -> hello world
+ssh <worker-ip> cat /scratch/hello.txt   # (while still ContainerRunning)
+# -> confirms the touch landed on the real attached volume, not just
+#    the container's own throwaway filesystem
 
 # Missing activeDeadlineSeconds is rejected the same way a CronJob is:
 kubectl apply -f - <<'YAML'
@@ -824,7 +848,7 @@ YAML
 #    field path "spec.activeDeadlineSeconds" (not "spec.jobTemplate.spec...")
 
 # Delete while running tears down the worker VM/volume
-kubectl delete job osmdiffs-test-v2
+kubectl delete job hello-world-test
 # Worker VM and volume gone from the UpCloud control panel shortly after
 ```
 
