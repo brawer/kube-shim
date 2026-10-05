@@ -35,7 +35,12 @@ pub struct Pod {
 /// reporting whatever terminal phase the job already reached, inferred
 /// from `last_error` since `status` itself has moved on to a cleanup
 /// state by then and no longer says `Succeeded`/`Failed` directly.
-fn phase_for(status: &str, last_error: &Option<String>) -> &'static str {
+///
+/// `pub(crate)`: also reused by `api::job::status_for` (Phase 13) to
+/// derive a standalone `Job`'s own `active`/`succeeded`/`failed`
+/// status fields -- one state->outcome inference, two representations,
+/// not a second copy of this same three-way mapping.
+pub(crate) fn phase_for(status: &str, last_error: &Option<String>) -> &'static str {
     match status {
         "ContainerRunning" => "Running",
         "Succeeded" => "Succeeded",

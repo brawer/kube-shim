@@ -1,5 +1,6 @@
 pub mod cronjob;
 pub mod events;
+pub mod job;
 pub mod logs;
 pub mod metrics;
 pub mod nodes;
@@ -135,6 +136,18 @@ pub async fn discovery_batch_v1() -> impl IntoResponse {
                 "namespaced": true,
                 "kind": "CronJob",
                 "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "jobs",
+                "singularName": "job",
+                "namespaced": true,
+                "kind": "Job",
+                // No "patch"/"update"/"watch" -- same honesty-about-what's-
+                // implemented convention api::pods's own discovery entry
+                // already established (Phase 12): there's no Job update
+                // handler, and watch needs a long-lived streaming
+                // connection nothing here supports yet.
+                "verbs": ["create", "delete", "deletecollection", "get", "list"]
             }
         ]
     });

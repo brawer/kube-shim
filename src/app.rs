@@ -110,6 +110,16 @@ pub fn build_router(
             "/apis/batch/v1/namespaces/:namespace/cronjobs/:name",
             get(api::cronjob::get_cronjob).delete(api::cronjob::delete_cronjob),
         )
+        // Standalone Jobs API (Phase 13) -- a job run that exists
+        // directly, not only ever spawned indirectly by a CronJob.
+        .route(
+            "/apis/batch/v1/namespaces/:namespace/jobs",
+            post(api::job::create_job).get(api::job::list_jobs),
+        )
+        .route(
+            "/apis/batch/v1/namespaces/:namespace/jobs/:name",
+            get(api::job::get_job).delete(api::job::delete_job),
+        )
         .layer(Extension(notify))
         .layer(Extension(worker_ssh))
         .layer(CorsLayer::permissive())

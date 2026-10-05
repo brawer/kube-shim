@@ -87,6 +87,19 @@ pub fn not_found(kind: &str, name: &str) -> axum::response::Response {
     )
 }
 
+/// 409 Conflict, `reason: AlreadyExists`: a `create` whose name collides
+/// with an existing object in the same namespace -- the same shape a
+/// real cluster returns for this (Phase 13: a standalone `Job`'s name,
+/// unlike a `CronJob`-spawned run's own timestamp-suffixed one, is
+/// whatever the caller gave it, so this can genuinely happen).
+pub fn already_exists(kind: &str, name: &str) -> axum::response::Response {
+    status_error(
+        StatusCode::CONFLICT,
+        "AlreadyExists",
+        format!("{kind} \"{name}\" already exists"),
+    )
+}
+
 /// 422 Unprocessable Entity, `reason: Invalid`: a field's value isn't one
 /// of the values this API supports for it -- the same shape a real cluster
 /// uses for an unsupported enum-style field value (e.g. an unknown
@@ -149,6 +162,22 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("osmdiffs-weekly-123"));
+    }
+
+    #[tokio::test]
+    async fn test_already_exists_shape() {
+        let response = already_exists("Job", "hello-world-test");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["reason"], "AlreadyExists");
+        assert_eq!(json["code"], 409);
+        assert!(json["message"]
+            .as_str()
+            .unwrap()
+            .contains("hello-world-test"));
     }
 
     #[tokio::test]

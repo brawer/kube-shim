@@ -41,16 +41,35 @@ pub async fn create_cronjob(
     // a real cluster's admission chain uses (validate, then persist), and
     // it means neither check needs to worry about cleaning up a
     // half-created row on rejection.
+    //
+    // admission's checks all take the pod-template-level spec directly
+    // (what jobTemplate.spec already is) plus this field-path prefix for
+    // their own rejection messages -- api::job::create_job is the other
+    // caller, passing its own Job's `.spec` (no jobTemplate wrapper) and
+    // "spec" instead. Missing/malformed jobTemplate becomes JsonValue::Null,
+    // which every check already treats as "nothing set" rather than panicking.
+    const FIELD_PREFIX: &str = "spec.jobTemplate.spec";
+    let pod_template_spec = req
+        .spec
+        .pointer("/jobTemplate/spec")
+        .cloned()
+        .unwrap_or(JsonValue::Null);
     let object_description = format!("CronJob \"{}\"", req.metadata.name);
-    if let Some(response) = admission::require_active_deadline_seconds(&req.spec) {
-        return response;
-    }
     if let Some(response) =
-        admission::validate_ephemeral_volume_storage_classes(&object_description, &req.spec)
+        admission::require_active_deadline_seconds(&pod_template_spec, FIELD_PREFIX)
     {
         return response;
     }
-    if let Some(response) = admission::validate_resource_limits(&object_description, &req.spec) {
+    if let Some(response) = admission::validate_ephemeral_volume_storage_classes(
+        &object_description,
+        &pod_template_spec,
+        FIELD_PREFIX,
+    ) {
+        return response;
+    }
+    if let Some(response) =
+        admission::validate_resource_limits(&object_description, &pod_template_spec, FIELD_PREFIX)
+    {
         return response;
     }
 
