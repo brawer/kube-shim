@@ -59,7 +59,7 @@
 **4. Public Status Page + Health Endpoints:** static-ish HTML plus a few standard diagnostic paths, served from `:443` alongside the authenticated API (same listener/certificate, a structurally separate GET-only sub-router kept outside the auth middleware)
    - `/` and a `/statusz` alias (the alias name nods to the informal "zPages" debug-page tradition from gRPC/OpenCensus, not a literal Kubernetes API-server convention the way the health endpoints below are): recent events, currently running jobs ("nodes"/pods), accumulated cost and budget balance in `main_currency`
    - `/healthz`, `/livez`, `/readyz`: genuinely standard, Kubernetes-API-server-defined health endpoints, unauthenticated by the same convention real clusters use for infra health checks
-   - `/metrics` (Prometheus self-instrumentation, plus real worker-VM virtual-memory stats) is a placeholder for later, not built in this round — see Phase 17 — distinct from the already-planned, authenticated `metrics.k8s.io` API (Phase 12), which reports job resource usage, not the shim process's own metrics or VM-level virtual-memory detail
+   - `/metrics` (Prometheus self-instrumentation, plus real worker-VM virtual-memory stats) is a placeholder for later, not built in this round — see Phase 18 — distinct from the already-planned, authenticated `metrics.k8s.io` API (Phase 12), which reports job resource usage, not the shim process's own metrics or VM-level virtual-memory detail
    - Read-only, no auth, no `kubectl`/VPN required for any of the above
 
 ### Data Flow
@@ -154,14 +154,14 @@ sqlite3 db.sqlite "SELECT * FROM jobs"
 - Middleware wrapping the *entire* `:6443` router — every route, reads included, since Secret contents must never be visible without auth — that checks `Authorization: Bearer <token>` against every non-expired entry in the list, using a **constant-time comparison** for each (iterating the whole list unconditionally rather than short-circuiting on the first match, so total response time doesn't leak which entry — or whether any entry — matched).
 - If the configured list is empty, or every entry has expired, **the shim refuses to start** rather than either locking the operator out confusingly at request time or — far worse — failing open and accepting all requests. This is checked once at startup and again whenever the config is reloaded.
 - Missing or wrong token → HTTP 401 Unauthorized, using the standard Kubernetes `Status` object (`reason: Unauthorized`) — distinct from the 403 `Forbidden` used for admission denials (Phase 5): 401 means "I don't know who you are," 403 means "I know who you are and the answer is no," matching real API server semantics.
-- The public status page and health endpoints (Phase 14) are deliberately *not* wrapped by this middleware — even once they end up sharing the same `:443` listener as this API (Phase 4/14), the middleware stays scoped to just the authenticated API's own sub-router rather than blanket-applied to the whole listener, so the public routes stay unauthenticated by design.
+- The public status page and health endpoints (Phase 15) are deliberately *not* wrapped by this middleware — even once they end up sharing the same `:443` listener as this API (Phase 4/15), the middleware stays scoped to just the authenticated API's own sub-router rather than blanket-applied to the whole listener, so the public routes stay unauthenticated by design.
 - No custom client tooling needed: `kubectl config set-credentials ... --token=...` and Terraform's `kubernetes_provider` `token` argument both send exactly this header natively, regardless of how many tokens the shim currently considers valid.
 - **From this phase onward, every `curl` example against the authenticated API elsewhere in this document assumes `-H "Authorization: Bearer $TOKEN"` is included — omitted from later snippets for brevity, not because it's optional.**
 
 **Files to create/modify:**
 - `src/auth.rs` (new) - bearer-token middleware: list iteration, constant-time comparison per entry, expiration check
 - `src/k8s_status.rs` (new) - builds Kubernetes-shaped `Status` error responses (401 here; reused by Phase 5's 403 admission check and any future validation rejection)
-- `src/main.rs` - wrap the authenticated router in the auth middleware, scoped so it doesn't also apply to the public status/health sub-router mounted later on the same listener (Phase 14)
+- `src/main.rs` - wrap the authenticated router in the auth middleware, scoped so it doesn't also apply to the public status/health sub-router mounted later on the same listener (Phase 15)
 - `src/config.rs` - add `api_tokens: Vec<{token, expires_at: Option<DateTime>}>`; refuse to boot if none currently valid
 - `bootstrap/provision.sh` - generate the first token during first-time provisioning, print/save it once for the operator to copy into their kubeconfig/Terraform vars
 
@@ -176,7 +176,7 @@ curl -k -H "Authorization: Bearer wrong-token" https://localhost:6443/api/v1
 curl -k -H "Authorization: Bearer $(cat api-token.txt)" https://localhost:6443/api/v1
 # 200 OK, normal discovery response
 
-# The public status page (once Phase 14 exists) must keep working with no auth at all:
+# The public status page (once Phase 15 exists) must keep working with no auth at all:
 curl http://localhost:8080/
 
 # Rotation:
@@ -206,7 +206,7 @@ Note: the token only protects the connection if TLS is actually used (already sh
   - **SLSA Build Level 3 provenance** is generated for every architecture-specific image and the joined manifest, via `actions/attest` (GitHub's native attestation action) run from a separate reusable workflow (`release-build.yml`) — not `slsa-framework/slsa-github-generator`, which an earlier version of this plan used; switched to match the same pattern already proven out in this project's sibling repos. The separate-workflow isolation (not a step folded into the same job that built the image) is what actually earns Level 3 rather than Level 1/2 either way — see `release-build.yml`'s own header comment.
   - A `verify-version` job cross-checks the pushed tag against `Cargo.toml`'s version before building anything, as a cheap sanity net (normally redundant, since `release-please` keeps them in sync itself, but cheap insurance against a stray manual tag).
 - `bootstrap/provision.sh` rewritten around this: installs rootless podman; drops the earlier `scp` binary + hand-written systemd unit flow.
-- A podman quadlet unit (`deploy/kube-shim.container`) defining: the image reference, bind mounts for persistent state (`/var/lib/kube-shim` on the host → `/data` in the container — holds `db.sqlite`, the TLS certs, and `config.toml`), and port publishing. Ports were originally chosen as `:6443`/`:8080` specifically because both are >1024, letting rootless podman bind them with no special capability or sysctl tweak — **revisited in Phase 4**, where ACME requires standard `:443`/`:80` for the authenticated API and challenge responder respectively; **`:8080` is dropped entirely once Phase 14 lands**, once it turns out the public status page/health endpoints don't need a port of their own either — see Phase 14.
+- A podman quadlet unit (`deploy/kube-shim.container`) defining: the image reference, bind mounts for persistent state (`/var/lib/kube-shim` on the host → `/data` in the container — holds `db.sqlite`, the TLS certs, and `config.toml`), and port publishing. Ports were originally chosen as `:6443`/`:8080` specifically because both are >1024, letting rootless podman bind them with no special capability or sysctl tweak — **revisited in Phase 4**, where ACME requires standard `:443`/`:80` for the authenticated API and challenge responder respectively; **`:8080` is dropped entirely once Phase 15 lands**, once it turns out the public status page/health endpoints don't need a port of their own either — see Phase 15.
 - Because job/volume/VM/budget state lives entirely in SQLite (not in-process memory) and worker VMs run independently of the shim process, restarting the container for an update is safe even with jobs in flight — the reconciliation loop just resumes on its next tick, using the schema migrations that already run automatically on startup (Phase 1).
 - **Updating: two supported modes, not one.** The quadlet unit as checked in tracks `:latest` with `AutoUpdate=registry`, and `podman-auto-update.timer` (a systemd `--user` timer, enabled once during provisioning) polls the registry and restarts the container whenever a new image lands — so the actual `kube-shim.brawer.ch` instance rolls forward automatically on every release, with no SSH session required. This is a deliberate trade for development-loop speed while the project is young, not a general recommendation: an unattended rollout of an untested release is a real risk given the shim spends real money orchestrating cloud resources. It's judged acceptable here specifically because UpCloud's billing is prepaid with no auto-recharge — a bad release that misbehaves can burn at most the current prepaid balance, not an unbounded card charge, which bounds the downside of "wrong code ran unattended" to something already priced in. A deployment that doesn't have that backstop (a different provider with postpaid/card-on-file billing, or once this moves past personal-project status) should instead pin an explicit `vX.Y.Z` tag, drop the `AutoUpdate=registry` label, and go back to the deliberate `podman pull` + `systemctl --user restart kube-shim` flow — both modes are just a one-line edit to the same quadlet unit, not different infrastructure.
 
@@ -249,7 +249,7 @@ systemctl --user restart kube-shim
   - **Verified hands-on** (not assumed) by standing up `kube-shim.brawer.ch` for real on UpCloud, ahead of this phase's actual code: rootless podman *can* publish a host port `<1024` with no special capability, once the host's `net.ipv4.ip_unprivileged_port_start` sysctl is lowered to `80` (`bootstrap/provision.sh` has a step for this via `/etc/sysctl.d/`) — that governs `rootlessport`, which does the actual low-port bind *in the host's own network namespace*. **First shipped this wrong**, set to `443` rather than `80`: the sysctl is a floor, not a specific-port allowlist, so `=443` still left `80` itself blocked, which broke only the ACME challenge responder specifically (the `:443` API kept working, making it easy to miss) — caught by actually attempting a real ACME issuance against the live box, not by code review. But that sysctl does **not** extend into the *container's* own network namespace either way: the shim process itself, running as non-root UID 1000 inside the container (Phase 3), still cannot bind `<1024` there, and fails at startup with a plain `Permission denied` if `config.toml`'s `server.port` is set to `443` directly. The fix isn't a capability grant (`--cap-add=CAP_NET_BIND_SERVICE`) — it's simpler: publish asymmetrically, host `443`/`80` → container-internal unprivileged ports (`PublishPort=443:8443` and `PublishPort=80:8080` in the quadlet unit, matching `server.port`/`acme_challenge_port` in `config.toml`). The binary never needs to bind a privileged port at all; only `rootlessport`, on the host side, does.
   - **A second real bug, also only found by attempting real issuance**: the first implementation had `main.rs` await `acme::setup()`'s entire cold-start wait — including Let's Encrypt actually validating the HTTP-01 challenge — *before* ever starting the `:80` listener that validation depends on. A straightforward deadlock: every attempt failed with "Connection reset by peer" (`rootlessport` accepted the connection host-side, nothing was listening container-side yet). Fixed by having `acme::setup()` start the challenge responder itself, as a background task, *before* entering the cold-start wait — `main.rs` no longer touches the challenge router at all, `setup()` just returns the acceptor.
 - ACME client logic (issuance + automatic renewal) built on `rustls-acme` or equivalent, integrated with the existing `axum-server`/`rustls` TLS setup from Phase 1/3 rather than replacing it — `rustls-acme` in particular is designed to plug into exactly that stack (hands the TLS acceptor a certificate resolver that swaps in fresh certs on renewal, no listener restart needed).
-- `:80` serves *only* `/.well-known/acme-challenge/{token}` — the same "explicit allowlist, not just an auth gate" pattern later used for the public status page/health endpoints on `:443` (Phase 14): every other path 404s, by construction, not by convention.
+- `:80` serves *only* `/.well-known/acme-challenge/{token}` — the same "explicit allowlist, not just an auth gate" pattern later used for the public status page/health endpoints on `:443` (Phase 15): every other path 404s, by construction, not by convention.
 - Config: `hostname: Option<String>` (the real public DNS name to request a certificate for) and `acme_directory: String` — `"staging"` or `"production"` select Let's Encrypt's own two environments (staging has much higher rate limits but issues a certificate chain that isn't publicly trusted); any other value is used verbatim as a custom ACME directory URL (e.g. a local Pebble test server), rather than a closed enum, since that's one less thing to extend later for a case this cheap to support generically. Plus `acme_contact_email: Option<String>` (optional, Let's Encrypt only uses it for expiry/problem notifications), `acme_challenge_port: u16` (default `8080`), and `acme_cache_dir: String` (default `"acme-cache"`, but any real deployment sets it to `/data/acme-cache` — see below). All four are `#[serde(default)]`, so the config schema change is purely additive: the already-deployed `kube-shim.brawer.ch` `config.toml`, which predates all of this, keeps parsing and keeps behaving exactly as before (self-signed fallback) with zero edits required. `config-dev.toml` is left with no `hostname` at all (self-signed, as always); the real deployment's `config.toml` gets `hostname`/`acme_directory` uncommented deliberately, later, once DNS is confirmed ready — not automatically by `provision.sh`, since a cold-start ACME failure refusing to start would otherwise trigger on a box whose DNS isn't live yet.
 - **Cold start vs. renewal failure handled differently, on purpose:** if the shim has no cached certificate yet (first boot, or a wiped `/data`) and ACME issuance fails, it retries (bounded by a 5-minute wall-clock `tokio::time::timeout`, not a fixed attempt count — `rustls-acme`'s own state machine paces retries with its own internal backoff, so the timeout is a ceiling on top of that rather than a reimplementation of it) and then **fails to start** rather than serving broken or absent TLS — an operator needs to know immediately that DNS/networking/rate-limits are misconfigured, not discover it when a client's TLS handshake mysteriously fails. A **renewal** failure for a certificate that's still valid, by contrast, is handed off to a background `tokio::spawn` task that only ever logs — the certificate already deployed keeps serving traffic regardless, since the acceptor's resolver only updates on a successful renewal event. A transient Let's Encrypt outage or rate-limit bump is a log line, not a self-inflicted outage.
 - **Local dev/CI fallback:** when `hostname` is unset, ACME is skipped entirely and the shim falls back to the self-signed certificate at `tls_cert_path`/`tls_key_path` — exactly Phase 1's original (and until now, only) behavior, unchanged in `tls.rs`, now just demoted to "the fallback" rather than "the only option," selected by a `match &cfg.server.hostname` in `main.rs`.
@@ -305,9 +305,9 @@ curl --cacert <(curl -s https://letsencrypt.org/certs/staging/letsencrypt-stg-ro
 - `spec.storageClassName` is repurposed from the original plan: since nothing is ever retained, it no longer selects a reclaim policy. Instead it selects a **performance tier** — two built-in, hardcoded class names, `kube-shim-standard` (the default when omitted) and `kube-shim-fast` — mapped internally, per cloud provider, to that provider's closest matching storage tier (UpCloud: `standard` / `maxiops`). No real `StorageClass` resource or general CSI-style pluggable parameters: providers in this space (UpCloud, and likely Infomaniak/Hetzner too) offer a small number of discrete storage tiers, not a continuously tunable IOPS number, and even real Kubernetes doesn't standardize IOPS as a portable parameter — that's left entirely to whichever CSI driver is bound. A small, fixed, hardcoded per-provider lookup table (`match classname { ... }` inside each `CloudProvider` implementation) is both simpler and more honest about what these providers actually offer than inventing a numeric abstraction they can't precisely honor. An unknown class name is rejected the standard way: HTTP 422, `Status` object, `reason: Invalid`, `causes: [{reason: FieldValueNotSupported, field: "...storageClassName"}]` — built via `src/k8s_status.rs` (Phase 2), same as every other structured error in this API.
 - Database: `job_volumes` table (job_id, size_gb, storage_class_name, provider_volume_id, mount_point) — one row per job *run*, not a durable row reused across runs, since nothing here persists between runs. **Reserved schema only in this phase**: nothing writes to it yet, since there's no reconciliation loop (Phase 6) turning a CronJob's schedule into actual job runs for a row to represent.
 - Per-job VM sizing: read `resources.requests.cpu` / `.memory` from the CronJob's pod template and map to a cloud-provider server size (small lookup table), instead of a fixed single size — needed now that the shim runs more than one workload shape. **Built as a standalone, tested `src/workload.rs` function** (`smallest_fitting_server_plan`), using real UpCloud plan names/specs confirmed against the actual API (Phase 7's own research) rather than placeholders — but deliberately a small, incomplete starting table: osmdiffs' real profile (6 CPU/8GB) already exceeds every plan listed, and finding its actual match is left to Phase 9 (VM provisioning), the same way every other provider-specific sizing decision in this plan gets settled hands-on rather than guessed in advance. Not wired into any live request path yet — nothing provisions VMs until Phase 9.
-- Config: `resource_prefix` (default `"kube-shim"`), reserved here since this is the first phase that gives cloud resources shim-managed names — actually threaded through naming and orphan-scan matching in Phase 15. Also reserves the rolling-budget parameters (`budget_daily_rate`, `budget_rollover_cap_days`, in `main_currency` — see Phase 13) and `main_currency` itself — this just reserves the config shape; the accrual/enforcement/conversion logic is built in Phase 13, once cost calculation and ECB-rate sync exist. **Landed as a new top-level `[shim]` config section** (not nested under `[server]` or any provider section, since none of these four fields is specific to the HTTP listener or to UpCloud) — `#[serde(default)]` throughout, so the already-deployed `kube-shim.brawer.ch` config.toml (which predates this section entirely) keeps parsing unchanged.
+- Config: `resource_prefix` (default `"kube-shim"`), reserved here since this is the first phase that gives cloud resources shim-managed names — actually threaded through naming and orphan-scan matching in Phase 16. Also reserves the rolling-budget parameters (`budget_daily_rate`, `budget_rollover_cap_days`, in `main_currency` — see Phase 14) and `main_currency` itself — this just reserves the config shape; the accrual/enforcement/conversion logic is built in Phase 14, once cost calculation and ECB-rate sync exist. **Landed as a new top-level `[shim]` config section** (not nested under `[server]` or any provider section, since none of these four fields is specific to the HTTP listener or to UpCloud) — `#[serde(default)]` throughout, so the already-deployed `kube-shim.brawer.ch` config.toml (which predates this section entirely) keeps parsing unchanged.
 - Internal `WorkloadKind` enum (`CronJob` for now), in `src/workload.rs`. Purely an internal abstraction — no new API surface, and not yet referenced by any reconciliation code (there isn't any until Phase 6) — done now so the future Deployment support (see "Future Work") doesn't require rewriting this layer once it exists.
-- **Admission check on CronJob create/update: `spec.jobTemplate.spec.activeDeadlineSeconds` must be set.** `activeDeadlineSeconds` is optional in the real Kubernetes API, but the shim needs a hard worst-case runtime bound for every job to make the budget guard (Phase 13) and deadline enforcement (Phase 11) meaningful, so it requires it via policy the same way a real cluster's `ValidatingAdmissionPolicy`/webhook would. A CronJob submitted without it is rejected with the same response shape a real admission webhook denial produces: HTTP 403, a `Status` object (`kind: Status`, `reason: Forbidden`, built via Phase 2's `src/k8s_status.rs`), message `admission webhook "kube-shim.io/require-active-deadline" denied the request: spec.jobTemplate.spec.activeDeadlineSeconds must be set (bounds the job's worst-case cost against the budget guard)`. `kubectl`/Terraform surface this exactly like any real admission denial — resolves Open Question 9. **Only wired into `create_cronjob`**: there's no update/PATCH handler yet for CronJobs (Phase 1 only ever built create/read/list/delete), so "on update" is aspirational until that exists.
+- **Admission check on CronJob create/update: `spec.jobTemplate.spec.activeDeadlineSeconds` must be set.** `activeDeadlineSeconds` is optional in the real Kubernetes API, but the shim needs a hard worst-case runtime bound for every job to make the budget guard (Phase 14) and deadline enforcement (Phase 11) meaningful, so it requires it via policy the same way a real cluster's `ValidatingAdmissionPolicy`/webhook would. A CronJob submitted without it is rejected with the same response shape a real admission webhook denial produces: HTTP 403, a `Status` object (`kind: Status`, `reason: Forbidden`, built via Phase 2's `src/k8s_status.rs`), message `admission webhook "kube-shim.io/require-active-deadline" denied the request: spec.jobTemplate.spec.activeDeadlineSeconds must be set (bounds the job's worst-case cost against the budget guard)`. `kubectl`/Terraform surface this exactly like any real admission denial — resolves Open Question 9. **Only wired into `create_cronjob`**: there's no update/PATCH handler yet for CronJobs (Phase 1 only ever built create/read/list/delete), so "on update" is aspirational until that exists.
 - `src/k8s_status.rs` (Phase 2) gained a second builder, `invalid_field_value()`, alongside the existing `status_error()` — produces the full real-Kubernetes shape for a field-validation failure (`Status.details.causes[]`, `reason: FieldValueNotSupported`), not just the message string, so a programmatic consumer can find exactly which field was wrong.
 
 **Files created/modified:**
@@ -350,9 +350,9 @@ curl -X POST .../cronjobs -d '{"spec": {"jobTemplate": {"spec": {
 **Goal:** Build the state machine that will drive all orchestration.
 
 **Deliverables:**
-- Reconciliation loop: `tokio::time::interval` every 10 seconds as the **fallback** cadence — not the only trigger. A `tokio::sync::Notify` lets specific events wake the loop immediately instead of waiting up to 10s: a new `CronJob` submitted via the API, and (once Phase 13 exists) the budget balance crossing a job out of `BudgetWait`. The 10s poll stays in place regardless, since it's still what catches external state changes the shim wouldn't otherwise hear about (e.g. a provider-side VM failure) — the `Notify` is purely a responsiveness improvement for the cases the shim already knows about immediately, not a replacement for polling. `tokio::time::interval`'s *first* tick fires immediately by design, so the loop's very first pass also happens right at startup, not after the first 10s — a genuine feature (reconcile immediately on boot), not something worked around.
+- Reconciliation loop: `tokio::time::interval` every 10 seconds as the **fallback** cadence — not the only trigger. A `tokio::sync::Notify` lets specific events wake the loop immediately instead of waiting up to 10s: a new `CronJob` submitted via the API, and (once Phase 14 exists) the budget balance crossing a job out of `BudgetWait`. The 10s poll stays in place regardless, since it's still what catches external state changes the shim wouldn't otherwise hear about (e.g. a provider-side VM failure) — the `Notify` is purely a responsiveness improvement for the cases the shim already knows about immediately, not a replacement for polling. `tokio::time::interval`'s *first* tick fires immediately by design, so the loop's very first pass also happens right at startup, not after the first 10s — a genuine feature (reconcile immediately on boot), not something worked around.
 - **A piece the original plan text didn't spell out but turned out to be load-bearing: something has to turn a `CronJob`'s schedule into actual job runs** — otherwise the `jobs` table (which the rest of this phase reconciles) would only ever have zero rows. Built as `src/reconcile/schedule.rs`, the shim-internal equivalent of real Kubernetes' cronjob controller: parses `spec.schedule` (standard 5-field POSIX cron, via the `cron` crate — prepending a fixed `"0 "` seconds field to bridge to the 6-field form that crate expects) and creates a new `jobs` row whenever at least one scheduled instant has passed since the last run (or since the `CronJob`'s own creation, if it's never run) — coalescing any missed instants into a single catch-up run rather than bursting one per missed minute, the same way real `Allow`-policy CronJobs behave. There's no `concurrencyPolicy` support (`Forbid`/`Replace`) — nothing in this plan needs it.
-- Job state machine: the full pipeline from "Reconciliation Loop State Machine" under Key Implementation Details (minus `BudgetWait`, which needs Phase 13's budget guard to mean anything) — one state per reconciliation tick, mocked (no real work happens, `Succeeded`/`Failed` collapses to always `Succeeded` since there's no real container execution yet to have an outcome).
+- Job state machine: the full pipeline from "Reconciliation Loop State Machine" under Key Implementation Details (minus `BudgetWait`, which needs Phase 14's budget guard to mean anything) — one state per reconciliation tick, mocked (no real work happens, `Succeeded`/`Failed` collapses to always `Succeeded` since there's no real container execution yet to have an outcome).
 - Database updates for job status, volume_id, worker_vm_id, etc.
 - Error handling + retry tracking per job — deferred in substance to Phase 10 (nothing can actually *fail* yet, since every transition is mocked); this phase just makes sure `retry_count`/`version`/`last_transition_time` get touched correctly on every advance, so Phase 10 has real bookkeeping to build retry logic on top of rather than adding it from scratch.
 - Startup reconciliation (detect orphaned jobs from crashed shim) — `src/reconcile/startup.rs` logs every non-terminal job found at boot and confirms it resumes reconciling normally on the very next tick. No actual cleanup logic yet (nothing external exists to clean up) — that's Phase 10.
@@ -406,7 +406,7 @@ sqlite3 db.sqlite "SELECT name, cronjob_name, status FROM jobs"
   - `POST /1.3/server` (create) is **asynchronous** — the response returns before the server is actually ready, so a `VMCreating` → `VMRunning` transition needs an explicit poll/wait step, not a synchronous "create returns a ready server" assumption.
   - `POST /1.3/storage` (create volume) is synchronous; attach/detach go through their own dedicated endpoints and are also synchronous, and can run against a live (already-running) server.
   - Firewall rules (`POST`/`PUT /1.3/server/{uuid}/firewall_rule`) are **asynchronous in effect**: the API call returns immediately, but the rule takes roughly 1-2 minutes to actually apply. This matters for a security-relevant guarantee ("worker VM is unreachable inbound") — the reconciliation loop must not consider a worker VM's network isolation established the instant the firewall API call returns; it needs its own explicit wait/verify step before the VM is treated as safe to leave running unattended (see Phase 9).
-  - `GET /1.3/price` returns prices in the account's own billing currency — for this project's UpCloud account, that's EUR (UpCloud doesn't offer CHF billing), which is exactly why Phase 13's `main_currency` conversion exists.
+  - `GET /1.3/price` returns prices in the account's own billing currency — for this project's UpCloud account, that's EUR (UpCloud doesn't offer CHF billing), which is exactly why Phase 14's `main_currency` conversion exists.
 - `dry_run` config flag (already existed on `UpCloudConfig` since Phase 1's original scaffold — this phase is the first to actually read it). New `[upcloud] zone` field alongside it (default `"de-fra1"`, the zone `kube-shim.brawer.ch` itself runs in) — real multi-zone/`nodeSelector` support stays deferred (see "Future Work"), so this is one shim-wide default, not per-job, for now.
 - Reconciliation step: `VolumePending` → attempt volume creation (logged, not executed) — implemented in `src/reconcile/job.rs`, extracting the requested size/tier from the job's own stored pod-template spec (via `src/volumes.rs`'s `parse_storage_quantity_gb`/`StorageTier`, both built in Phase 5 and getting their first real caller here).
 - Reconciliation step: `VMPending` → attempt VM creation (logged, not executed) — same pattern, extracting `resources.requests.cpu`/`.memory` and resolving them via `src/workload.rs`'s `smallest_fitting_server_plan` (Phase 5) plus a new `parse_cpu_cores` helper (CPU quantities use their own `"2"`/`"500m"` format, distinct from the `Ki`/`Mi`/`Gi` format memory shares with storage).
@@ -466,7 +466,7 @@ terraform apply
 - Error handling + retry logic with timeouts (5 min for volume creation) — implemented as escalating log levels (see above), not a new terminal state or automatic cleanup.
 - Orphan detection (`src/reconcile/orphan_scan.rs`, new): runs on its own independent 5-minute cadence (`reconcile::run_orphan_scan_loop`/`ORPHAN_SCAN_INTERVAL`), deliberately decoupled from the job-tick loop's own `Notify`-driven wake-ups — a job-creating API call can wake that loop far more often than every 10s, and there's no reason to re-list the whole account's volumes at that rate just to look for a leak. Volumes only, matched by a `{resource_prefix}-vol-` title prefix against what's tracked in `job_volumes`; server orphan scanning joins this same scan in Phase 9.
 - `CloudProvider` gained `list_volumes()` (not in Phase 7's original trait) — orphan scanning can't find an *untracked* resource without first being able to list what actually exists.
-- Real per-job volume naming: `{resource_prefix}-vol-{job_name}` — not Phase 14/15's eventual full naming convention, just enough for a real UpCloud volume to have *some* real title and for orphan scanning to recognize it.
+- Real per-job volume naming: `{resource_prefix}-vol-{job_name}` — not Phase 16's eventual full naming convention, just enough for a real UpCloud volume to have *some* real title and for orphan scanning to recognize it.
 - Database: `job_volumes` (Phase 5's reserved table) now genuinely populated on create and deleted on cleanup — a job never keeps a stale row once its volume is gone. `jobs.volume_device`/`.mount_point` remain unused (they're for a real *attachment*, which doesn't exist yet).
 
 **Files created/modified:**
@@ -574,7 +574,7 @@ cargo test   # 143 lib tests + 19 integration tests, incl. mock-HTTP-server
 #    schedule, not a realistic production cadence) queued the rest behind
 #    that quota, exactly as the existing one-shot retry logic is designed
 #    to handle; nothing was lost, everything eventually ran. Real
-#    concurrency/budget control is Phase 13's job.
+#    concurrency/budget control is Phase 14's job.
 #  - The orphan scanner's 5-minute tick can race a job's own
 #    create-volume-then-record-it-locally window, seeing a legitimately
 #    in-progress volume as "untracked" before its `job_volumes` row
@@ -705,7 +705,7 @@ cargo test   # 157 lib tests + 19 integration tests, including a real
 
 **What was actually built:**
 
-- **Events, emitted generically from one choke point, not sprinkled per-handler.** `events` (the table itself was front-loaded since Phase 1, like `job_volumes`/`last_transition_time` — nothing new to migrate). `reconcile::job::record_event` is called from exactly two places: once in `advance_all`'s own shared `UPDATE jobs ... ` block, right after *any* real transition commits (reason = the new `target_status` itself — `"VolumeCreated"`, `"FirewallVerified"`, `"ContainerRunning"`, etc., already exactly matching the plan's own example reasons, verbatim, since they're literally this project's own state names), and once in `force_failed` (reason `"Failed"`, message = the existing `DeadlineExceeded`/`StateTimeout` detail string, type `Warning`). Every other transition is `Normal`. This covers every example reason the plan named except `"BudgetWait"`, which doesn't exist as a state yet (Phase 13).
+- **Events, emitted generically from one choke point, not sprinkled per-handler.** `events` (the table itself was front-loaded since Phase 1, like `job_volumes`/`last_transition_time` — nothing new to migrate). `reconcile::job::record_event` is called from exactly two places: once in `advance_all`'s own shared `UPDATE jobs ... ` block, right after *any* real transition commits (reason = the new `target_status` itself — `"VolumeCreated"`, `"FirewallVerified"`, `"ContainerRunning"`, etc., already exactly matching the plan's own example reasons, verbatim, since they're literally this project's own state names), and once in `force_failed` (reason `"Failed"`, message = the existing `DeadlineExceeded`/`StateTimeout` detail string, type `Warning`). Every other transition is `Normal`. This covers every example reason the plan named except `"BudgetWait"`, which doesn't exist as a state yet (Phase 14).
 - **`api::events::list_events`** (`GET /api/v1/namespaces/:namespace/events`) — joins `events` against `jobs` to resolve `job_id` back to a name (events don't know a job's user-facing name directly), and parses the real `fieldSelector=involvedObject.name=...` query parameter `kubectl describe pod` actually sends, not just an unfiltered dump.
 - **`api::metrics`** (`GET /apis/metrics.k8s.io/v1beta1/nodes` and `/pods`, plus the namespaced `/namespaces/:namespace/pods` real metrics-server also exposes) — every number is an estimate from each job's own `resources.requests` (the same values `handle_vm_pending` already uses to size the worker VM), not a real measurement; there's no cAdvisor or SSH-based sampling anywhere.
 - **"Node" is not a fiction here, on reflection.** A first version of this reported one synthetic aggregate node summing every job's request, reasoning that this project has no node pool. User feedback during review: a worker VM genuinely *is* a node in the real Kubernetes sense — a machine running exactly one pod — it just doesn't live in a long-lived static pool the way a real cluster's nodes do; it's created and destroyed together with the one job it exists for. Reworked to report one `NodeMetrics` entry per currently-*allocated* worker VM (a job gets one only once `handle_vm_pending` has actually recorded a `worker_vm_name` for it) — a faithful mapping, not a fiction layered on top of one. `api::nodes::list_nodes` (`GET /api/v1/nodes`, new, cluster-scoped) reports the matching core v1 `Node` objects by the same name, with `status.capacity`/`allocatable` set to the worker's *actual* provisioned plan size (`workload::smallest_fitting_server_plan`'s own rounded-up answer, not an echo of the raw request) — verified live that this is what makes `kubectl top nodes` show correct capacity-relative percentages, not just raw numbers.
@@ -759,7 +759,78 @@ cargo test   # 157 lib tests + 19 integration tests, including a real
 
 ---
 
-### Phase 13: Pricing + Cost Tracking + Budget Guard + Cost Report (Days 13-15)
+### Phase 13: Standalone Jobs (`batch/v1`) (Days 13-14)
+**Goal:** Let a `batch/v1` `Job` be created directly, not only ever indirectly via a `CronJob`'s own schedule — a real, user-surfaced need: testing a new workload version/release by hand before it's trusted enough to run unattended as a recurring `CronJob`. Added here, right after Phase 12 and ahead of the originally-next pricing/budget work (Phase 14), since it's small and almost entirely decoupled from everything else still planned — see below.
+
+**Why this slots in cleanly, with almost no new reconciliation logic:** every real mechanism downstream of job creation — `reconcile::job::advance_all`'s state machine, VM provisioning, volume handling, SSH/logs, events, metrics collection — already operates purely on a `jobs` row's own `id`/`status`/`namespace`/`name`, with no branch anywhere on `cronjob_name`. `jobs.cronjob_name` is already nullable in the schema (front-loaded since Phase 1, never enforced `NOT NULL`), and `reconcile::schedule::create_job_run` already stores a CronJob-spawned run's `jobs.spec` as the *unwrapped* `spec.jobTemplate.spec` value — exactly the shape a standalone Job's own top-level `.spec` already is. So a standalone Job is, structurally, just another `jobs` row with `cronjob_name = NULL`; nothing in `reconcile::*` needs to know or care how a row came to exist.
+
+**The one real wrinkle, found by reading `src/admission.rs` rather than assumed:** `require_active_deadline_seconds`/`validate_ephemeral_volume_storage_classes`/`validate_resource_limits` all hardcode the `/jobTemplate/spec/...` JSON-pointer prefix (and the matching `"spec.jobTemplate.spec...."` string in their own rejection messages), since today they only ever validate a `CronJob`'s top-level `.spec`. A standalone Job's own `.spec` has no `jobTemplate` wrapper at all (`.spec.template.spec...` directly) — calling these functions unmodified on a Job's `.spec` would check the wrong path and silently never reject anything. Fixing this is the one unavoidable shared-code change: each function takes the pod-template-level spec directly (what's today reached via `.pointer("/jobTemplate/spec/...")`) plus the field-path prefix to use in its own error message, so `create_cronjob` passes `req.spec.pointer("/jobTemplate/spec")` + prefix `"spec.jobTemplate.spec"`, and the new Job handler passes `req.spec` + prefix `"spec"` directly — one validation implementation, two thin call sites, not two copies of the same three checks.
+
+**Deliverables:**
+- `POST /apis/batch/v1/namespaces/:namespace/jobs` — same three admission checks `create_cronjob` already runs (`activeDeadlineSeconds` required, known `storageClassName`, valid `resources.limits` quantities), now reusable by both via the `admission.rs` refactor above. Inserts directly into `jobs` with `cronjob_name = NULL`, `spec` = the Job's own `.spec` verbatim (already the right shape, per above) — no new table, no new reconciliation state.
+- A standalone Job's name is used exactly as given (unlike a CronJob-spawned run, which synthesizes `{cronjob_name}-{timestamp}` to disambiguate repeated runs) — rejected with a 409 Conflict + `Status` object if it collides with an existing job in the same namespace, matching real Kubernetes Job-name-uniqueness semantics.
+- `GET /apis/batch/v1/namespaces/:namespace/jobs` (list) and `GET .../jobs/:name` (get) — a real `JobStatus` shape (`active`/`succeeded`/`failed` counts derived from `jobs.status`, plus `conditions`), reusing the same state→phase inference `api::pods::get_pod` (Phase 12) already established rather than a second copy of that mapping.
+- `DELETE /apis/batch/v1/namespaces/:namespace/jobs/:name` on a still-running Job routes it through the exact same `force_failed` cleanup path (`VolumeDetaching` tail) that deadline/stuck-state enforcement (Phase 11) already uses — one teardown mechanism, not a second one built just for user-initiated delete.
+- Add `"jobs"` to `discovery_batch_v1`'s resource list, alongside the existing `"cronjobs"` entry.
+- No `WorkloadKind` change: it stays the *owning-workload* kind (`CronJob` today, `Deployment` later) — a bare Job has no owning workload at all in real Kubernetes either, so "does this job have a `cronjob_name`" is already the right presence check, not a reason to add a `WorkloadKind::Job` variant that would never actually be read anywhere.
+- Budget-guard interaction (Phase 14, once it exists): a standalone Job is estimated/charged exactly like any other job — no special-casing planned, since the budget guard keys off `activeDeadlineSeconds`/actual VM-seconds, not off `cronjob_name`.
+
+**Files to create/modify:**
+- `src/admission.rs` — `require_active_deadline_seconds`/`validate_ephemeral_volume_storage_classes`/`validate_resource_limits` take the pod-template-level spec + an error-message field-path prefix, instead of hardcoding `/jobTemplate/spec/...` and `"spec.jobTemplate.spec..."` internally
+- `src/api/cronjob.rs` — `create_cronjob` updated to pass `req.spec.pointer("/jobTemplate/spec")` + the `"spec.jobTemplate.spec"` prefix into the now-generalized admission functions, preserving its exact current behavior/messages
+- `src/api/job.rs` (new) — `create_job`/`list_jobs`/`get_job`/`delete_job`, the real `Job`/`JobStatus`/`JobList` JSON shapes
+- `src/api/mod.rs` — `"jobs"` added to `discovery_batch_v1`
+- `src/app.rs` — routes for the four new handlers
+- `src/workload.rs` — doc comment only, clarifying `WorkloadKind` denotes an *owning* workload and a bare Job legitimately has none
+
+**Testing:**
+```bash
+# Create a standalone Job directly, no CronJob involved
+kubectl apply -f - <<'YAML'
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: osmdiffs-test-v2
+  namespace: default
+spec:
+  activeDeadlineSeconds: 3600
+  template:
+    spec:
+      containers:
+        - name: main
+          image: ghcr.io/example/osmdiffs:v2
+      restartPolicy: Never
+YAML
+# Should run through the exact same state machine as a CronJob-spawned
+# run: VolumePending -> ... -> ContainerRunning -> Succeeded -> cleanup
+
+kubectl get jobs
+kubectl describe job osmdiffs-test-v2
+# Real status, logs, events -- same as any CronJob-spawned run
+
+# Missing activeDeadlineSeconds is rejected the same way a CronJob is:
+kubectl apply -f - <<'YAML'
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: missing-deadline
+spec:
+  template:
+    spec:
+      containers: [{name: main, image: busybox}]
+      restartPolicy: Never
+YAML
+# -> 403 Forbidden, same admission webhook denial message shape,
+#    field path "spec.activeDeadlineSeconds" (not "spec.jobTemplate.spec...")
+
+# Delete while running tears down the worker VM/volume
+kubectl delete job osmdiffs-test-v2
+# Worker VM and volume gone from the UpCloud control panel shortly after
+```
+
+---
+
+### Phase 14: Pricing + Cost Tracking + Budget Guard + Cost Report (Days 13-15)
 **Goal:** Track pricing, calculate job costs in the operator's own currency, enforce a *rolling* budget guard, and expose a per-project cost breakdown.
 
 **Deliverables:**
@@ -776,7 +847,7 @@ cargo test   # 157 lib tests + 19 integration tests, including a real
   - The balance decrements by the job's *actual* cost once it completes (not the conservative estimate), so a job that finishes early returns its unused margin to the balance for the next one.
   - New `budget_state` table: a single row with `balance`, `last_accrual_at`.
 - **CSV cost report**, `GET /apis/cost.kube-shim.io/v1/report?from=...&to=...`, grouped by a Kubernetes label on the job (e.g. `app.kubernetes.io/name`, or a custom `kube-shim.io/project` label) — answering "which project ate how much budget," not just an aggregate total. Column naming is loosely inspired by the [FOCUS](https://focus.finops.org/) (FinOps Open Cost and Usage Specification) convention — `ServiceCategory`, `ChargeCategory`, `BilledCost`, `BillingCurrency`, `ChargePeriodStart`/`End`, a project/label grouping column — without implementing FOCUS itself: FOCUS is designed for cloud-billing exports at AWS-CUR/Azure-Cost-Management scale, far more machinery than a one-provider, handful-of-jobs report needs. Borrowing its column vocabulary just means the CSV opens sensibly in a spreadsheet and means roughly what a FinOps-familiar reader expects, nothing more.
-- Expose cost and budget balance via the metrics API, events, and the public status page (Phase 14)
+- Expose cost and budget balance via the metrics API, events, and the public status page (Phase 15)
 - Hardcoded fallback pricing (and a fallback fixed exchange rate) if either sync fails
 
 **Files to create/modify:**
@@ -816,7 +887,7 @@ curl -k https://localhost:443/apis/cost.kube-shim.io/v1/report?from=2026-09-01&t
 
 ---
 
-### Phase 14: Public Status Page + Health Endpoints (Days 15-16)
+### Phase 15: Public Status Page + Health Endpoints (Days 15-16)
 **Goal:** A simple, always-reachable, read-only landing page plus standard Kubernetes-style health endpoints — no VPN or `kubectl` needed — all served from the same `:443` listener and ACME certificate as the authenticated API, not a separate plaintext port.
 
 **Deliverables:**
@@ -824,9 +895,9 @@ curl -k https://localhost:443/apis/cost.kube-shim.io/v1/report?from=2026-09-01&t
 - `/` and a `/statusz` alias (nodding to the informal "zPages" debug-page tradition from gRPC/OpenCensus, not a literal Kubernetes API-server convention): single server-rendered HTML page, auto-refreshing (`<meta http-equiv="refresh">` or a few lines of polling JS), showing:
   - Recent events (Phase 12)
   - Currently running jobs ("nodes"/pods): name, job type, elapsed time, VM size
-  - Accumulated cost and current budget balance / rollover cap, in `main_currency` (Phase 13)
+  - Accumulated cost and current budget balance / rollover cap, in `main_currency` (Phase 14)
 - `/healthz`, `/livez`, `/readyz`: standard, genuinely Kubernetes-API-server-defined health-check endpoints, unauthenticated by the same convention real clusters use (infra health checks — load balancers, monitoring — can't always present a token). `/livez` reflects whether the process itself is up; `/readyz` additionally reflects whether the reconciliation loop and DB are actually functioning; `/healthz` mirrors `/readyz`, kept for compatibility with tooling that only knows the older combined name.
-- `/metrics` (a Prometheus self-instrumentation endpoint) is explicitly *not* built in this phase — deferred to Phase 17, which also adds real worker-VM virtual-memory instrumentation. Not to be confused with the already-planned, authenticated `metrics.k8s.io` API (Phase 12), which reports job/pod resource usage for `kubectl top`, a different concern with a different audience.
+- `/metrics` (a Prometheus self-instrumentation endpoint) is explicitly *not* built in this phase — deferred to Phase 18, which also adds real worker-VM virtual-memory instrumentation. Not to be confused with the already-planned, authenticated `metrics.k8s.io` API (Phase 12), which reports job/pod resource usage for `kubectl top`, a different concern with a different audience.
 - An explicit allowlist of what's rendered on `/`/`/statusz` — job names, timestamps, event reasons/messages, cost figures. Secret values, S3 credentials, SSH details, and worker VM IPs must never appear here, since these routes have no authentication at all.
 - `deploy/kube-shim.container`'s `:8080` port publish, left in place since Phase 3, is removed — nothing built across this whole plan ends up needing a port of its own beyond `:443`/`:80` (Phase 4).
 
@@ -857,7 +928,7 @@ curl -k https://kube-shim.brawer.ch/api/v1
 
 ---
 
-### Phase 15: Resource Naming + Cleanup (Days 16-17)
+### Phase 16: Resource Naming + Cleanup (Days 16-17)
 **Goal:** Identify resources created by this shim instance specifically, and enable manual cleanup.
 
 **Deliverables:**
@@ -889,7 +960,7 @@ curl -H "Authorization: Bearer $TOKEN" https://api.upcloud.com/1.3/storage | jq 
 
 ---
 
-### Phase 16: Testing + Hardening (Days 17-18)
+### Phase 17: Testing + Hardening (Days 17-18)
 **Goal:** Run real workloads from the cronjob family end-to-end, verify end-to-end, monitor for 1 week.
 
 **Deliverables:**
@@ -920,16 +991,16 @@ curl -k https://localhost:443/debug/status | jq '.total_cost, .budget_balance'
 
 ---
 
-### Phase 17: Prometheus `/metrics` — Shim Self-Instrumentation + Worker VM Virtual-Memory Stats (Days 18-19)
-**Goal:** One unauthenticated `/metrics` endpoint serving two distinct audiences: the operator's own Prometheus scraping kube-shim's own process health (the placeholder deferred since Phase 14), and — a real, user-requested need — **actual virtual-memory instrumentation for each job's worker VM**, specifically page-fault/eviction activity and file-backed-vs-anonymous memory breakdown, for workloads that `mmap()` scratch files far larger than physical RAM.
+### Phase 18: Prometheus `/metrics` — Shim Self-Instrumentation + Worker VM Virtual-Memory Stats (Days 18-19)
+**Goal:** One unauthenticated `/metrics` endpoint serving two distinct audiences: the operator's own Prometheus scraping kube-shim's own process health (the placeholder deferred since Phase 15), and — a real, user-requested need — **actual virtual-memory instrumentation for each job's worker VM**, specifically page-fault/eviction activity and file-backed-vs-anonymous memory breakdown, for workloads that `mmap()` scratch files far larger than physical RAM.
 
 **Why this is its own phase, not folded into Phase 12's follow-up (the real-metrics-over-SSH work):** that work deliberately stayed within `metrics.k8s.io`'s own fixed schema (`usage.cpu`/`usage.memory` only — that's all the real Kubernetes Metrics API spec has room for). Virtual-memory detail has no home there and never will; it needs a different, genuinely extensible channel. There is no Kubernetes-API-level standard for this (`custom.metrics.k8s.io` is generic HPA plumbing with no blessed metric-name vocabulary) — the actual community convention is Prometheus's own naming scheme, via cAdvisor (`container_memory_mapped_file`, `container_memory_failures_total{type="pgfault"|"pgmajfault"}`) and node-exporter (`node_vmstat_pgfault`, `node_vmstat_pgmajfault`, `node_vmstat_pswpin`/`pswpout`, `node_memory_Mapped_bytes`/`AnonPages_bytes`/`Cached_bytes`, all `/proc/vmstat`/`/proc/meminfo`-derived). This phase mimics *that* vocabulary exactly, not a kube-shim-invented one — the same de-risk-migration reasoning as Phase 9's `resources.limits` follow-up: a Grafana dashboard or alerting rule built against kube-shim's own `/metrics` should port unchanged to a real cluster's cAdvisor/node-exporter later, not need rewriting.
 
 **Deliverables:**
 
-1. **Shim self-instrumentation** (the original Phase 14 placeholder, finally built):
-   - `/metrics`, unauthenticated, registered on the existing public GET-only sub-router (Phase 14) alongside `/healthz`/`/livez`/`/readyz` — same reasoning: infra scrapers can't always present a bearer token.
-   - Metrics: process uptime, reconciliation-tick count/duration, orphan-scan and metrics-poll loop last-run timestamp + success/failure counters, a `jobs_by_state` gauge (one series per `STATE_SEQUENCE` value, from a single `SELECT status, COUNT(*) FROM jobs GROUP BY status`), current budget balance (Phase 13, once it exists).
+1. **Shim self-instrumentation** (the original Phase 15 placeholder, finally built):
+   - `/metrics`, unauthenticated, registered on the existing public GET-only sub-router (Phase 15) alongside `/healthz`/`/livez`/`/readyz` — same reasoning: infra scrapers can't always present a bearer token.
+   - Metrics: process uptime, reconciliation-tick count/duration, orphan-scan and metrics-poll loop last-run timestamp + success/failure counters, a `jobs_by_state` gauge (one series per `STATE_SEQUENCE` value, from a single `SELECT status, COUNT(*) FROM jobs GROUP BY status`), current budget balance (Phase 14, once it exists).
    - Prometheus text exposition format. Hand-rolled vs. a crate (`prometheus`, `metrics` + `metrics-exporter-prometheus`) is a real decision for this phase to make, not pre-guessed here: the format itself is simple enough (`# HELP`/`# TYPE` comments + `name{labels} value` lines) that hand-rolling costs little and adds zero new dependencies, matching this project's existing preference (e.g. plain `chrono` over a heavier scheduling crate) — but a crate buys correctness/boilerplate for not many metrics either way, so this is worth a real look at both before picking.
 
 2. **Worker VM virtual-memory stats** — extends `reconcile::metrics_collector`'s existing combined SSH poll (the Phase 12 follow-up), not a second collection mechanism:
@@ -939,11 +1010,11 @@ curl -k https://localhost:443/debug/status | jq '.total_cost, .budget_balance'
    - **Per-job container-level breakdown (cAdvisor's own `container_memory_mapped_file`/`container_memory_failures_total{type="pgfault"}`) is a stretch goal, not a committed deliverable.** It needs the container's own cgroup `memory.stat`, whose path depends on podman's cgroup driver and cgroup v1-vs-v2 (Ubuntu 24.04's actual default needs verifying hands-on against a real worker, not assumed) — real added fragility, for a number that, given this project's own one-container-per-worker-VM architecture, already sits very close to the node-level figure anyway. Node-level is the real deliverable; container-level is only attempted if the cgroup-path plumbing turns out cheap once it exists.
    - A job with no sample yet is simply absent, matching Phase 12's own established precedent (the real warm-up gap), not a fallback/zeroed reading.
 
-3. **Access**: unauthenticated for both families — matching the original placeholder's own decision for self-instrumentation, and consistent with Phase 14's existing precedent of showing job names/namespaces on the unauthenticated public status page already (this isn't a new exposure category, just a new format for data already shown unauthenticated elsewhere).
+3. **Access**: unauthenticated for both families — matching the original placeholder's own decision for self-instrumentation, and consistent with Phase 15's existing precedent of showing job names/namespaces on the unauthenticated public status page already (this isn't a new exposure category, just a new format for data already shown unauthenticated elsewhere).
 
 **Files to create/modify:**
 - `src/metrics_export.rs` (new) — Prometheus text-exposition rendering for both metric families
-- `src/status_page.rs` (Phase 14) — registers `GET /metrics` on the existing public sub-router
+- `src/status_page.rs` (Phase 15) — registers `GET /metrics` on the existing public sub-router
 - `src/reconcile/metrics_collector.rs` (Phase 12 follow-up) — extends the combined SSH command and `Sample`/`worker_metrics` with the new `/proc/vmstat`/`/proc/meminfo` fields
 - `src/db/migrations.rs` — new `worker_metrics` columns
 - `src/reconcile/mod.rs` — tick-count/duration instrumentation hooks (if not folded directly into the existing loop functions)
@@ -977,42 +1048,42 @@ curl -k https://localhost:443/metrics | grep node_vmstat
 | File | Purpose | Status |
 |------|---------|--------|
 | `Cargo.toml` | Rust dependencies | Phases 1, 3 |
-| `src/main.rs` | Server entry point, both listeners (`:443`, `:80`) | Phases 1-4, 14 |
+| `src/main.rs` | Server entry point, both listeners (`:443`, `:80`) | Phases 1-4, 15 |
 | `src/auth.rs` | Bearer-token authentication middleware for the API | Create (Phase 2) |
 | `src/k8s_status.rs` | Kubernetes-shaped `Status` error responses (401 here, reused for 403/422) | Create (Phase 2) |
 | `.github/workflows/release.yml` | CI: build musl binary, publish OCI image to ghcr.io | Create (Phase 3) |
 | `Containerfile` | Multi-stage build → `FROM scratch` image | Create (Phase 3) |
-| `deploy/kube-shim.container` | Podman quadlet unit (image ref, bind mounts, ports) | Phases 3, 4, 14 |
+| `deploy/kube-shim.container` | Podman quadlet unit (image ref, bind mounts, ports) | Phases 3, 4, 15 |
 | `src/tls.rs` | TLS config: self-signed bootstrap/fallback (Phase 1, unchanged since) | Phase 1 |
 | `src/acme.rs` | ACME (Let's Encrypt) issuance/renewal + `:80` HTTP-01 challenge router | Create (Phase 4) |
-| `src/api/*.rs` | Kubernetes API handlers | Phases 1, 5, 10, 12 |
+| `src/api/*.rs` | Kubernetes API handlers | Phases 1, 5, 10, 12-13 |
 | `src/volumes.rs` | `storageClassName` → provider storage-tier lookup | Create (Phase 5) |
-| `src/workload.rs` | `WorkloadKind` abstraction (CronJob now, Deployment later) | Create (Phase 5) |
-| `src/admission.rs` | `activeDeadlineSeconds`-required policy check; `resources.limits` quantity validation | Create (Phase 5); Phase 9 follow-up |
-| `src/db/schema.sql` | SQLite schema | Phases 1, 5-6, 8-9, 13 |
-| `src/db/migrations.rs` | `ALTER TABLE`-based column migrations for already-existing tables | Create (Phase 6); first real use (Phase 10); second use (Phase 17, `worker_metrics` vmstat columns) |
-| `src/reconcile/*.rs` | State machine loop, `Notify`-based wake-up, `activeDeadlineSeconds` enforcement, event recording | Create (Phases 6, 8-12, 13) |
-| `src/providers/*.rs` | `CloudProvider` trait + UpCloud implementation, request timeout (Phase 11) | Create (Phases 7-9, 11, 13) |
+| `src/workload.rs` | `WorkloadKind` abstraction (CronJob now, Deployment later) | Create (Phase 5); Phase 13 doc clarification |
+| `src/admission.rs` | `activeDeadlineSeconds`-required policy check; `resources.limits` quantity validation | Create (Phase 5); Phase 9 follow-up; generalized for reuse by standalone Jobs (Phase 13) |
+| `src/db/schema.sql` | SQLite schema | Phases 1, 5-6, 8-9, 13-14 |
+| `src/db/migrations.rs` | `ALTER TABLE`-based column migrations for already-existing tables | Create (Phase 6); first real use (Phase 10); second use (Phase 18, `worker_metrics` vmstat columns) |
+| `src/reconcile/*.rs` | State machine loop, `Notify`-based wake-up, `activeDeadlineSeconds` enforcement, event recording | Create (Phases 6, 8-12, 14) |
+| `src/providers/*.rs` | `CloudProvider` trait + UpCloud implementation, request timeout (Phase 11) | Create (Phases 7-9, 11, 14) |
 | `src/providers/upcloud/firewall.rs` | Firewall rules for worker VMs (create + list, both real since Phase 7; poll-until-applied logic itself is Phase 9) | Create (Phase 7) |
-| `src/currency.rs` | ECB daily exchange-rate sync + conversion to `main_currency` | Create (Phase 13) |
-| `src/pricing/*.rs` | Cost tracking + rolling budget guard, in `main_currency` | Create (Phase 13) |
-| `src/api/cost_report.rs` | CSV cost report, grouped by job label | Create (Phase 13) |
+| `src/currency.rs` | ECB daily exchange-rate sync + conversion to `main_currency` | Create (Phase 14) |
+| `src/pricing/*.rs` | Cost tracking + rolling budget guard, in `main_currency` | Create (Phase 14) |
+| `src/api/cost_report.rs` | CSV cost report, grouped by job label | Create (Phase 14) |
 | `src/ssh.rs` | SSH client built on `russh` (`exec_once`/`exec_stream`), no host-key verification (by design); connect/inactivity timeouts (Phase 11) | Create (Phase 10); Phase 11 |
 | `src/api/logs.rs` | `kubectl logs`/`-f`: live SSH while `ContainerRunning`, `jobs.cached_logs` fallback otherwise | Create (Phase 10) |
 | `src/api/events.rs` | `kubectl describe pod`'s Events table: lists `events`, joined against `jobs`, with real `fieldSelector` support | Create (Phase 12) |
 | `src/api/metrics.rs` | `kubectl top nodes`/`kubectl top pods`: CPU/memory estimated from each job's own resource requests | Create (Phase 12) |
 | `src/api/pods.rs` | Minimal synthetic Pod `GET`, needed for `kubectl describe pod` to have a base object to fetch | Create (Phase 12) |
 | `src/api/nodes.rs` | Synthetic core v1 `Node` per allocated worker VM, needed for `kubectl top nodes` to correlate against `metrics.k8s.io` | Create (Phase 12) |
-| `src/status_page.rs` | Public status page + `/healthz`/`/livez`/`/readyz`, served on `:443`; `GET /metrics` registration (Phase 17) | Create (Phase 14); Phase 17 |
-| `src/metrics_export.rs` | Prometheus text-exposition rendering: shim self-instrumentation + worker-VM virtual-memory stats (node-exporter-compatible names) | Create (Phase 17) |
-| `src/naming.rs` | `resource_prefix`-aware resource name generation | Create (Phase 15) |
+| `src/status_page.rs` | Public status page + `/healthz`/`/livez`/`/readyz`, served on `:443`; `GET /metrics` registration (Phase 18) | Create (Phase 15); Phase 18 |
+| `src/metrics_export.rs` | Prometheus text-exposition rendering: shim self-instrumentation + worker-VM virtual-memory stats (node-exporter-compatible names) | Create (Phase 18) |
+| `src/naming.rs` | `resource_prefix`-aware resource name generation | Create (Phase 16) |
 | `src/config.rs` | Configuration parsing | Phases 1-2, 4-5, 7, 9 |
 | `src/cloud_init.rs` | Worker VM `user_data` generation (base64-escaped job values); `resources.limits` → `podman run --cpus`/`--memory` | Create (Phase 9); Phase 9 follow-up |
 | `src/metadata.rs` | Shim's own public IPv4, via UpCloud's metadata service | Create (Phase 9) |
 | `config.toml` | Runtime config template | Create (Phase 1) |
 | `bootstrap/provision.sh` | One-time VPS setup | Phases 1-4, 9 (small `cd /` fix) |
 | `bootstrap/cloud-init-template.sh` | VM startup script | Create (Phase 9) |
-| `bootstrap/cleanup-orphans.sh` | Manual cleanup script | Create (Phase 15) |
+| `bootstrap/cleanup-orphans.sh` | Manual cleanup script | Create (Phase 16) |
 
 ---
 
@@ -1039,7 +1110,7 @@ russh = "0.45"
 rustls-acme = "0.15"      # Phase 4 (shipped): ACME issuance/renewal against axum-server's rustls stack -- default-features disabled, "ring" re-enabled explicitly to match tls.rs's own provider choice
 tokio-stream = "0.1"      # Phase 4 (shipped): drives rustls-acme's event stream
 cron = "0.17"             # Phase 6 (shipped): parses CronJob schedules to trigger job runs
-quick-xml = "0.36"        # Phase 13: parsing the ECB's daily exchange-rate feed
+quick-xml = "0.36"        # Phase 14: parsing the ECB's daily exchange-rate feed
 ```
 No dedicated cloud-provider crate: UpCloud has no official Rust SDK, so `src/providers/upcloud/` is a hand-rolled REST client on `reqwest` (Phase 7) rather than an `hcloud`-style dependency.
 
@@ -1062,14 +1133,14 @@ Each state has:
 - Timeout (how long before failing?)
 - Retry logic (backoff on failure)
 
-A job passes through `BudgetWait` before `VolumePending` if its estimated cost exceeds the current rolling budget balance (Phase 13); it's woken immediately when the balance changes (Phase 6's `Notify`), or retried on the fallback tick otherwise, rather than failed.
+A job passes through `BudgetWait` before `VolumePending` if its estimated cost exceeds the current rolling budget balance (Phase 14); it's woken immediately when the balance changes (Phase 6's `Notify`), or retried on the fallback tick otherwise, rather than failed.
 
 `FirewallApplying → FirewallVerified`, `VMCreating → VMRunning`, and `ContainerRunning → Succeeded`/`Failed` are all explicit poll-until-true steps, not assumed-synchronous transitions. The first two poll UpCloud's own API (Phase 7: firewall-rule-apply and server-create calls both return before the underlying state is actually true). The third polls the worker over SSH for `/tmp/exit-code` (Phase 10) — cloud-init writes it as the very last thing it does, and the shim fetches the real exit code plus the full container logs (cached to `jobs.cached_logs`, since the worker is deleted a few states later) the moment it appears. A resource that never reaches its target state no longer polls forever: Phase 11 added a uniform 5-minute stuck-in-this-state timeout covering every polling state (and every one-shot state, same gap Phase 8 left there) via a single check in `advance_all`, rather than three separately-tracked per-resource-type timeouts.
 
 A running job that exceeds its `activeDeadlineSeconds` (Phase 11) is force-killed and transitions to `Failed` with reason `DeadlineExceeded` — the same terminology real Kubernetes Jobs use for this exact situation.
 
 ### Authentication
-The authenticated API (`:443`, Phase 4) requires `Authorization: Bearer <token>` on every request (Phase 2), checked against every non-expired entry in `api_tokens` with a constant-time comparison. A missing or wrong token gets a standard Kubernetes `Status` object with `reason: Unauthorized` (HTTP 401) — separate from the `reason: Forbidden` (HTTP 403) used for admission denials below, matching real API server conventions. `:80` (ACME challenges, Phase 4) and the public status/health sub-router mounted on `:443` (Phase 14) are both deliberately excluded from this middleware; they're meant to be public — the latter via scoping the middleware to just the authenticated API's own sub-router, not a separate listener. Supporting a *list* of tokens (each with an optional expiry) rather than a single one is what makes rotation possible: add a new token, migrate clients, then remove the old one — never a single atomic cutover with no overlap window.
+The authenticated API (`:443`, Phase 4) requires `Authorization: Bearer <token>` on every request (Phase 2), checked against every non-expired entry in `api_tokens` with a constant-time comparison. A missing or wrong token gets a standard Kubernetes `Status` object with `reason: Unauthorized` (HTTP 401) — separate from the `reason: Forbidden` (HTTP 403) used for admission denials below, matching real API server conventions. `:80` (ACME challenges, Phase 4) and the public status/health sub-router mounted on `:443` (Phase 15) are both deliberately excluded from this middleware; they're meant to be public — the latter via scoping the middleware to just the authenticated API's own sub-router, not a separate listener. Supporting a *list* of tokens (each with an optional expiry) rather than a single one is what makes rotation possible: add a new token, migrate clients, then remove the old one — never a single atomic cutover with no overlap window.
 
 Secrets (this project's own `api_tokens`, cloud-provider credentials, and K8s `Secret` object contents) are stored in SQLite/`config.toml` **in plaintext, not encrypted at rest** — a deliberate decision, not an oversight. The only realistic threat model where DB-file encryption would help is an attacker who already has filesystem read access to the VPS; at that point they can also read `config.toml` (which holds the bearer tokens and cloud-provider API token in plaintext regardless) and, on a single-tenant personal VPS with no external KMS/HSM, would likely be able to recover whatever key the shim itself would need at startup to decrypt anything anyway. Encrypting the database would add real complexity (key management, migration risk) against a threat model it doesn't actually close off. TLS-in-transit (Phase 2/4) and ordinary OS file permissions on `db.sqlite`/`config.toml` are the controls that actually matter here.
 
@@ -1089,10 +1160,10 @@ The reconciliation and VM-provisioning code is written against a `WorkloadKind` 
 All cloud calls go through a `CloudProvider` trait (Phase 7) — `create_volume`, `delete_volume`, `attach_volume`, `create_server`, `delete_server`, `create_firewall_rules`, `get_pricing`, etc. `UpCloudProvider` is the only implementation initially. This is a lightweight seam, not a finished multi-cloud abstraction: its exact method signatures should be expected to change once a second provider (see "Future Work: Additional VPS Providers") is actually implemented against it — Infomaniak's OpenStack API in particular has a materially different shape (Keystone token auth instead of a static bearer token, Cinder volumes, Nova server "flavors", per-project quotas), and it's not worth guessing that shape correctly in advance.
 - Dry-run mode for testing (logs API calls, doesn't execute)
 - API token/credentials from config file (not K8s Secret, due to bootstrap problem)
-- Resource naming (`resource_prefix`-based, Phase 15) for identification and cleanup
+- Resource naming (`resource_prefix`-based, Phase 16) for identification and cleanup
 
 ### Rolling Budget Model
-A token bucket, not a fixed daily reset: `balance` (in `main_currency`) increases by `budget_daily_rate` for every day (fractionally, per reconciliation tick) that passes, capped at `budget_daily_rate × budget_rollover_cap_days`. Spending decrements the balance; a job that would exceed it waits in `BudgetWait` instead of being launched. Example: at CHF 2/day with a 7-day cap, 3 idle days accrue CHF 6 of balance — enough for one job estimated at CHF 5, even though no single day's rate alone would cover it. The underlying provider cost is always computed in EUR (UpCloud's own billing currency) and converted via the ECB's daily reference rate (Phase 13) before being compared against or subtracted from the balance.
+A token bucket, not a fixed daily reset: `balance` (in `main_currency`) increases by `budget_daily_rate` for every day (fractionally, per reconciliation tick) that passes, capped at `budget_daily_rate × budget_rollover_cap_days`. Spending decrements the balance; a job that would exceed it waits in `BudgetWait` instead of being launched. Example: at CHF 2/day with a 7-day cap, 3 idle days accrue CHF 6 of balance — enough for one job estimated at CHF 5, even though no single day's rate alone would cover it. The underlying provider cost is always computed in EUR (UpCloud's own billing currency) and converted via the ECB's daily reference rate (Phase 14) before being compared against or subtracted from the balance.
 
 ### Deployment Model
 The shim ships as a `FROM scratch` OCI image (Phase 3): a statically-linked musl binary with embedded TLS roots and no external process dependencies (SSH goes through `russh`, not a subprocess), run rootless via a podman quadlet unit. Persistent state (`db.sqlite`, TLS certs — including the ACME account key and issued certificate, Phase 4 — and `config.toml`) lives on a host bind mount, so a container restart — whether from a crash or an update — never loses job/volume/VM/budget state, and any in-flight job's worker VM is unaffected since it runs independently on the cloud provider. The `kube-shim.brawer.ch` instance updates itself unattended via `podman-auto-update.timer` tracking `:latest` (see Phase 3), a deliberate trade of update-safety for development-loop speed, bounded by UpCloud's prepaid no-auto-recharge billing; a deployment without that backstop should pin a `vX.Y.Z` tag instead and update manually.
@@ -1109,7 +1180,7 @@ The shim ships as a `FROM scratch` OCI image (Phase 3): a statically-linked musl
 
 ### Per-Phase Checklist
 - Phase 1: terraform apply/destroy works, resources stored in SQLite
-- Phase 2: the authenticated API rejects requests with no/wrong bearer token (401, standard `Status` object, constant-time comparison); multiple tokens can be valid simultaneously (rotation), expired tokens are rejected, and the shim refuses to start with zero valid tokens configured; the public status page (once it exists in Phase 14) stays unauthenticated
+- Phase 2: the authenticated API rejects requests with no/wrong bearer token (401, standard `Status` object, constant-time comparison); multiple tokens can be valid simultaneously (rotation), expired tokens are rejected, and the shim refuses to start with zero valid tokens configured; the public status page (once it exists in Phase 15) stays unauthenticated
 - Phase 3: `FROM scratch` image builds and starts (static musl binary, no libc); `podman pull` + `systemctl --user restart` picks up a new version with `db.sqlite` and in-flight jobs unaffected; ghcr.io package requires no pull credentials
 - Phase 4: a real hostname gets a CA-trusted certificate with no manual steps; local dev with no hostname configured falls back to self-signed; a cold-start issuance failure makes the shim refuse to start; a renewal failure for an existing valid cert doesn't interrupt service; `:80` serves only the ACME challenge path
 - Phase 5: a CronJob's inline ephemeral volume is provisioned/destroyed with the job run; a second differently-sized cronjob coexists without naming collisions; an unknown `storageClassName` is rejected with a 422 `Status` response; a CronJob without `activeDeadlineSeconds` is rejected with a standard Kubernetes 403 `Status` response, surfaced cleanly by both `kubectl` and Terraform
@@ -1120,10 +1191,11 @@ The shim ships as a `FROM scratch` OCI image (Phase 3): a statically-linked musl
 - Phase 10: kubectl logs -f works while container running, via `russh` (no `ssh` subprocess spawned by the shim) — verified against a real OpenSSH server (kube-shim.brawer.ch's own sshd); real exit code populates `jobs.exit_code` and splits `Succeeded`/`Failed`; logs remain fetchable via `jobs.cached_logs` after the worker VM is gone
 - Phase 11: idempotency-reuse and deadline/stuck-state force-fail all verified against mock UpCloud servers exercising the real response shapes (8 dedicated tests); real hands-on chaos/deadline verification against live UpCloud deferred to the post-merge deploy-and-verify step against `kube-shim.brawer.ch`, same as every other phase's live check — see that phase's own section for the result
 - Phase 12: verified against a real `kubectl` v1.37 client, not just mocks — `kubectl describe pod` shows the full, correctly-ordered Events table with working Age; `kubectl top pods` and `kubectl top nodes` both show correct, capacity-relative CPU/memory (one Node/NodeMetrics entry per currently-allocated worker VM, matched by name)
-- Phase 13: costs calculated per job and per family in `main_currency`; a job whose estimate exceeds the budget balance waits in `BudgetWait` and launches once enough has accrued; a job that finishes early returns its unused margin to the balance; the CSV cost report groups correctly by label
-- Phase 14: status page and `/healthz`/`/livez`/`/readyz` reachable with no auth on `:443` (same listener/cert as the authenticated API), show events/jobs/cost, never leak secrets, reject all non-GET requests, and don't widen the authenticated API's own auth requirement
-- Phase 15: all resources named with the configured `resource_prefix`, cleanup script works, two instances with different prefixes don't interfere with each other's orphan scans
-- Phase 16: real osmdiffs job and at least one other cronjob complete successfully, concurrently at least once, cost accurate
+- Phase 13: `kubectl create -f` (or `kubectl run --restart=Never`) a standalone `batch/v1` Job runs end-to-end through the exact same reconciliation/VM-provisioning/cleanup path a CronJob-spawned run already does, with no `cronjob_name`; rejected with the same admission errors (missing `activeDeadlineSeconds`, unknown `storageClassName`) a CronJob submission already gets; `kubectl get jobs`/`kubectl describe job` show real status; deleting a still-running one tears down its worker VM/volume the same way a force-failed CronJob run already does
+- Phase 14: costs calculated per job and per family in `main_currency`; a job whose estimate exceeds the budget balance waits in `BudgetWait` and launches once enough has accrued; a job that finishes early returns its unused margin to the balance; the CSV cost report groups correctly by label
+- Phase 15: status page and `/healthz`/`/livez`/`/readyz` reachable with no auth on `:443` (same listener/cert as the authenticated API), show events/jobs/cost, never leak secrets, reject all non-GET requests, and don't widen the authenticated API's own auth requirement
+- Phase 16: all resources named with the configured `resource_prefix`, cleanup script works, two instances with different prefixes don't interfere with each other's orphan scans
+- Phase 17: real osmdiffs job and at least one other cronjob complete successfully, concurrently at least once, cost accurate
 
 ### End-to-End Test
 ```bash
@@ -1159,11 +1231,11 @@ All questions below are resolved or deliberately deferred — none block startin
 
 4. **Monitoring / alerting**: deliberately deferred, not implemented in the initial scope. There's no single established generic webhook standard for arbitrary Kubernetes events — the closest ecosystem convention is Prometheus Alertmanager's webhook receiver (built on metrics + alerting rules) or ad hoc event-forwarders like `eventrouter`, both of which are downstream tooling the cluster operator adds, not something the API server defines. OpenTelemetry itself is a telemetry *data pipeline* (traces/metrics/logs), not an alerting system — alerting is a separate concern layered on top of an OTel-fed backend (Grafana, Prometheus, or a vendor). None of that infrastructure is warranted for a single-VPS personal project. If this gets built later, the lightest-weight fit is a simple outbound webhook POST (a JSON payload) on specific events — job `Failed`/`DeadlineExceeded`, budget balance running low — to a user-configured URL (a Slack incoming webhook, `ntfy.sh`, `healthchecks.io`, etc.), no Prometheus/OTel Collector required. For now: journalctl + the status page only.
 
-5. **RBAC/AuthN**: resolved for the initial scope. Full RBAC is still out of scope (single-user trusted setup), but Phase 2 requires a bearer token — mirroring Kubernetes' own built-in static-token-file authenticator — on every request to the authenticated API, closing the "must stay bound to VPN" gap without needing a VPN or any special networking. The public status page and health endpoints remain deliberately unauthenticated by design (read-only, structurally unable to mutate state) even after they move onto the same `:443` listener as the authenticated API — see Phase 14.
+5. **RBAC/AuthN**: resolved for the initial scope. Full RBAC is still out of scope (single-user trusted setup), but Phase 2 requires a bearer token — mirroring Kubernetes' own built-in static-token-file authenticator — on every request to the authenticated API, closing the "must stay bound to VPN" gap without needing a VPN or any special networking. The public status page and health endpoints remain deliberately unauthenticated by design (read-only, structurally unable to mutate state) even after they move onto the same `:443` listener as the authenticated API — see Phase 15.
 
 6. **Volume model — reclaim policy vs. tier**: resolved, and revised from the original plan. Implementing full standard Kubernetes dynamic provisioning (a real `StorageClass` + `PersistentVolume` resource pair, with a Retain option) would be meaningfully more work for no practical benefit at this scale and for workloads that are, in practice, always genuinely ephemeral — so the shim uses real Kubernetes **generic ephemeral volumes** (inline in the pod template) instead of standalone PVCs, and repurposes the PVC's `spec.storageClassName` field to select a *performance tier* (`kube-shim-standard`/`kube-shim-fast`) rather than a reclaim policy, since nothing is ever retained across runs at all. See Phase 5 and "Generic Ephemeral Volumes / Storage Tiers" under Key Implementation Details. Standalone `PersistentVolumeClaim` support for data that genuinely needs to survive across runs is deferred — see "Future Work."
 
-7. **Concurrency guard scope**: resolved — dropped entirely, no separate `max_concurrent_jobs`. The rolling budget guard (Phase 13) is the only limiter: at the budget levels this project runs at, it already prevents more than one job's worth of concurrent spend in practice, so a second, separate job-count cap would just be redundant bookkeeping.
+7. **Concurrency guard scope**: resolved — dropped entirely, no separate `max_concurrent_jobs`. The rolling budget guard (Phase 14) is the only limiter: at the budget levels this project runs at, it already prevents more than one job's worth of concurrent spend in practice, so a second, separate job-count cap would just be redundant bookkeeping.
 
 8. **Worker VM networking**: resolved for the initial scope. Every worker VM is unreachable from the internet inbound (UpCloud firewall rules permit nothing but SSH from the shim's own VPS IP, verified applied before any container starts — see Phase 9) while remaining free to reach the internet outbound for downloading input data and uploading results. Exposing any of this *inbound*, e.g. running the shim itself as a configurable reverse proxy driven by a Kubernetes `Ingress` resource, is explicitly out of scope for a long time — see "Future Work: Ingress Proxy" below.
 
@@ -1179,11 +1251,11 @@ All questions below are resolved or deliberately deferred — none block startin
 
 14. **CNCF conformance testing**: resolved — not pursued. The [CNCF `k8s-conformance`](https://github.com/cncf/k8s-conformance) program certifies distributions that run the *entire* Sonobuoy/`[Conformance]`-tagged e2e test suite against a real kubelet/controller-manager/scheduler — built for certifying "this is a real, complete Kubernetes," which this project deliberately isn't (a handful of resource types, no scheduler, no kubelet). Pursuing it would be wildly out of proportion to a single-VPS personal project with an intentionally partial API surface. Reliance instead: hewing to the same real Kubernetes API *conventions* already threaded through this plan (`Status` object shapes, admission-denial semantics, discovery endpoints), verified the way every phase above already is — real `kubectl`/Terraform smoke tests against each phase's actual surface, not a conformance certificate.
 
-15. **Naming for multiple concurrent instances**: resolved. `resource_prefix` (default `"kube-shim"`, Phase 5/15) replaces a hardcoded literal in both resource naming and orphan-scan matching, so more than one independent kube-shim instance can run against the same cloud account without collisions or cross-instance interference.
+15. **Naming for multiple concurrent instances**: resolved. `resource_prefix` (default `"kube-shim"`, Phase 5/16) replaces a hardcoded literal in both resource naming and orphan-scan matching, so more than one independent kube-shim instance can run against the same cloud account without collisions or cross-instance interference.
 
 16. **Volume performance tiers / IOPS**: resolved. See item 6 above and "Generic Ephemeral Volumes / Storage Tiers" under Key Implementation Details — `storageClassName` selects from a small, fixed, per-provider-mapped set of tier names rather than a portable numeric IOPS target, since even real Kubernetes/CSI doesn't standardize IOPS as a cross-provider parameter, and these providers offer discrete tiers, not a continuously dialable number.
 
-17. **Public status page port, once ACME exists**: resolved. Once Phase 4 gives kube-shim a real, CA-trusted certificate, keeping the status page on a separate plaintext `:8080` stopped making sense — it moves onto the same `:443` listener as the authenticated API instead (Phase 14), as a structurally separate GET-only sub-router kept outside the bearer-token middleware's scope, rather than a physically separate port. Along the way, added `/healthz`/`/livez`/`/readyz` (genuinely standard Kubernetes API-server health endpoints) and a `/statusz` alias for `/` (the informal gRPC/OpenCensus "zPages" convention, not a literal Kubernetes convention — worth being precise about the difference). A literal Prometheus `/metrics` self-instrumentation endpoint was considered at the same time but deliberately deferred — see Phase 17, which also folds in real worker-VM virtual-memory instrumentation (a user-requested need that surfaced well after this question was first resolved).
+17. **Public status page port, once ACME exists**: resolved. Once Phase 4 gives kube-shim a real, CA-trusted certificate, keeping the status page on a separate plaintext `:8080` stopped making sense — it moves onto the same `:443` listener as the authenticated API instead (Phase 15), as a structurally separate GET-only sub-router kept outside the bearer-token middleware's scope, rather than a physically separate port. Along the way, added `/healthz`/`/livez`/`/readyz` (genuinely standard Kubernetes API-server health endpoints) and a `/statusz` alias for `/` (the informal gRPC/OpenCensus "zPages" convention, not a literal Kubernetes convention — worth being precise about the difference). A literal Prometheus `/metrics` self-instrumentation endpoint was considered at the same time but deliberately deferred — see Phase 18, which also folds in real worker-VM virtual-memory instrumentation (a user-requested need that surfaced well after this question was first resolved).
 
 ---
 
@@ -1194,7 +1266,7 @@ Not in the initial scope, but the design above is meant to make this additive ra
 - Add `Deployment` (apps/v1) as a second `WorkloadKind` (see Phase 5), alongside `CronJob`.
 - Reuses as-is: the cloud provider client, cloud-init templating, log streaming, events/metrics, and pricing — all built for CronJobs.
 - New pieces needed: a long-running VM state (create → run → restart-on-crash indefinitely, instead of create → run → delete once), a health-check/restart policy, and — per Open Question 8 — a stable network identity if the deployment needs to be reachable.
-- Sequencing: start this only after the CronJob path (Phases 1-16) has run in production for a while and the reconciliation loop has proven itself reliable across restarts. A long-running workload has a much bigger blast radius for a reconciliation-loop bug than a 6-hour job does — a stuck CronJob run wastes at most one job's worth of money; a stuck Deployment could run (and bill) indefinitely.
+- Sequencing: start this only after the CronJob path (Phases 1-17) has run in production for a while and the reconciliation loop has proven itself reliable across restarts. A long-running workload has a much bigger blast radius for a reconciliation-loop bug than a 6-hour job does — a stuck CronJob run wastes at most one job's worth of money; a stuck Deployment could run (and bill) indefinitely.
 
 ---
 
@@ -1220,7 +1292,7 @@ Not in the initial scope. UpCloud (like most VPS providers) has multiple datacen
 
 ## Future Work: Prometheus `/metrics` Self-Instrumentation
 
-**Superseded by Phase 17**, once a real, user-requested need (worker-VM virtual-memory instrumentation) made this worth scheduling as a real phase rather than an open-ended placeholder. This heading is kept as a redirect for anyone following an old link/reference to it.
+**Superseded by Phase 18**, once a real, user-requested need (worker-VM virtual-memory instrumentation) made this worth scheduling as a real phase rather than an open-ended placeholder. This heading is kept as a redirect for anyone following an old link/reference to it.
 
 ---
 
@@ -1255,11 +1327,13 @@ Way out of scope — not sketched in any detail here, just a placeholder so the 
 - **Phase 6-7** (reconciliation skeleton + provider trait + dry-run UpCloud): 2 days
 - **Phase 8-9** (UpCloud volumes + VMs/containers, incl. async create/firewall handling): 2-3 days
 - **Phase 10-11** (log streaming + hardening/deadline enforcement): 2 days
-- **Phase 12-13** (events/metrics + pricing/rolling budget guard/cost report/currency conversion): 2-3 days
-- **Phase 14** (public status page): 1 day
-- **Phase 15** (naming + cleanup): 1 day
-- **Phase 16** (multi-job real-workload testing): 2 days
-- **Phase 17** (Prometheus `/metrics`: shim self-instrumentation + worker-VM virtual-memory stats): 1-2 days — added after a real user request surfaced the virtual-memory need; not in the original estimate below
-- **Total**: ~4 weeks of development (up from ~3.5 weeks — ACME and the cost-report/currency work are the main additions) plus Phase 17, 1+ week of running/monitoring across the whole cronjob family. `Deployment` support, standalone PVCs, zone placement, and additional cloud providers (all under "Future Work") are intentionally excluded from this estimate.
+- **Phase 12** (events/metrics APIs): 2 days — done
+- **Phase 13** (standalone `batch/v1` Jobs): 1 day — added after a real need surfaced (testing a workload version/release before it becomes a scheduled CronJob); not in the original estimate below
+- **Phase 14** (pricing/rolling budget guard/cost report/currency conversion): 2-3 days
+- **Phase 15** (public status page): 1 day
+- **Phase 16** (naming + cleanup): 1 day
+- **Phase 17** (multi-job real-workload testing): 2 days
+- **Phase 18** (Prometheus `/metrics`: shim self-instrumentation + worker-VM virtual-memory stats): 1-2 days — added after a real user request surfaced the virtual-memory need; not in the original estimate below
+- **Total**: ~4 weeks of development (up from ~3.5 weeks — ACME and the cost-report/currency work are the main additions) plus Phase 13 and Phase 18, 1+ week of running/monitoring across the whole cronjob family. `Deployment` support, standalone PVCs, zone placement, and additional cloud providers (all under "Future Work") are intentionally excluded from this estimate.
 
 ---
