@@ -59,7 +59,7 @@
 **4. Public Status Page + Health Endpoints:** static-ish HTML plus a few standard diagnostic paths, served from `:443` alongside the authenticated API (same listener/certificate, a structurally separate GET-only sub-router kept outside the auth middleware)
    - `/` and a `/statusz` alias (the alias name nods to the informal "zPages" debug-page tradition from gRPC/OpenCensus, not a literal Kubernetes API-server convention the way the health endpoints below are): recent events, currently running jobs ("nodes"/pods), accumulated cost and budget balance in `main_currency`
    - `/healthz`, `/livez`, `/readyz`: genuinely standard, Kubernetes-API-server-defined health endpoints, unauthenticated by the same convention real clusters use for infra health checks
-   - `/metrics` (Prometheus self-instrumentation) is a placeholder for later, not built in this round — see "Future Work" — distinct from the already-planned, authenticated `metrics.k8s.io` API (Phase 12), which reports job resource usage, not the shim process's own metrics
+   - `/metrics` (Prometheus self-instrumentation, plus real worker-VM virtual-memory stats) is a placeholder for later, not built in this round — see Phase 17 — distinct from the already-planned, authenticated `metrics.k8s.io` API (Phase 12), which reports job resource usage, not the shim process's own metrics or VM-level virtual-memory detail
    - Read-only, no auth, no `kubectl`/VPN required for any of the above
 
 ### Data Flow
@@ -799,7 +799,7 @@ curl -k https://localhost:443/apis/cost.kube-shim.io/v1/report?from=2026-09-01&t
   - Currently running jobs ("nodes"/pods): name, job type, elapsed time, VM size
   - Accumulated cost and current budget balance / rollover cap, in `main_currency` (Phase 13)
 - `/healthz`, `/livez`, `/readyz`: standard, genuinely Kubernetes-API-server-defined health-check endpoints, unauthenticated by the same convention real clusters use (infra health checks — load balancers, monitoring — can't always present a token). `/livez` reflects whether the process itself is up; `/readyz` additionally reflects whether the reconciliation loop and DB are actually functioning; `/healthz` mirrors `/readyz`, kept for compatibility with tooling that only knows the older combined name.
-- `/metrics` (a Prometheus self-instrumentation endpoint) is explicitly *not* built in this phase — deferred as a placeholder, see "Future Work: Prometheus `/metrics` Self-Instrumentation". Not to be confused with the already-planned, authenticated `metrics.k8s.io` API (Phase 12), which reports job/pod resource usage for `kubectl top`, a different concern with a different audience.
+- `/metrics` (a Prometheus self-instrumentation endpoint) is explicitly *not* built in this phase — deferred to Phase 17, which also adds real worker-VM virtual-memory instrumentation. Not to be confused with the already-planned, authenticated `metrics.k8s.io` API (Phase 12), which reports job/pod resource usage for `kubectl top`, a different concern with a different audience.
 - An explicit allowlist of what's rendered on `/`/`/statusz` — job names, timestamps, event reasons/messages, cost figures. Secret values, S3 credentials, SSH details, and worker VM IPs must never appear here, since these routes have no authentication at all.
 - `deploy/kube-shim.container`'s `:8080` port publish, left in place since Phase 3, is removed — nothing built across this whole plan ends up needing a port of its own beyond `:443`/`:80` (Phase 4).
 
@@ -893,6 +893,58 @@ curl -k https://localhost:443/debug/status | jq '.total_cost, .budget_balance'
 
 ---
 
+### Phase 17: Prometheus `/metrics` — Shim Self-Instrumentation + Worker VM Virtual-Memory Stats (Days 18-19)
+**Goal:** One unauthenticated `/metrics` endpoint serving two distinct audiences: the operator's own Prometheus scraping kube-shim's own process health (the placeholder deferred since Phase 14), and — a real, user-requested need — **actual virtual-memory instrumentation for each job's worker VM**, specifically page-fault/eviction activity and file-backed-vs-anonymous memory breakdown, for workloads that `mmap()` scratch files far larger than physical RAM.
+
+**Why this is its own phase, not folded into Phase 12's follow-up (the real-metrics-over-SSH work):** that work deliberately stayed within `metrics.k8s.io`'s own fixed schema (`usage.cpu`/`usage.memory` only — that's all the real Kubernetes Metrics API spec has room for). Virtual-memory detail has no home there and never will; it needs a different, genuinely extensible channel. There is no Kubernetes-API-level standard for this (`custom.metrics.k8s.io` is generic HPA plumbing with no blessed metric-name vocabulary) — the actual community convention is Prometheus's own naming scheme, via cAdvisor (`container_memory_mapped_file`, `container_memory_failures_total{type="pgfault"|"pgmajfault"}`) and node-exporter (`node_vmstat_pgfault`, `node_vmstat_pgmajfault`, `node_vmstat_pswpin`/`pswpout`, `node_memory_Mapped_bytes`/`AnonPages_bytes`/`Cached_bytes`, all `/proc/vmstat`/`/proc/meminfo`-derived). This phase mimics *that* vocabulary exactly, not a kube-shim-invented one — the same de-risk-migration reasoning as Phase 9's `resources.limits` follow-up: a Grafana dashboard or alerting rule built against kube-shim's own `/metrics` should port unchanged to a real cluster's cAdvisor/node-exporter later, not need rewriting.
+
+**Deliverables:**
+
+1. **Shim self-instrumentation** (the original Phase 14 placeholder, finally built):
+   - `/metrics`, unauthenticated, registered on the existing public GET-only sub-router (Phase 14) alongside `/healthz`/`/livez`/`/readyz` — same reasoning: infra scrapers can't always present a bearer token.
+   - Metrics: process uptime, reconciliation-tick count/duration, orphan-scan and metrics-poll loop last-run timestamp + success/failure counters, a `jobs_by_state` gauge (one series per `STATE_SEQUENCE` value, from a single `SELECT status, COUNT(*) FROM jobs GROUP BY status`), current budget balance (Phase 13, once it exists).
+   - Prometheus text exposition format. Hand-rolled vs. a crate (`prometheus`, `metrics` + `metrics-exporter-prometheus`) is a real decision for this phase to make, not pre-guessed here: the format itself is simple enough (`# HELP`/`# TYPE` comments + `name{labels} value` lines) that hand-rolling costs little and adds zero new dependencies, matching this project's existing preference (e.g. plain `chrono` over a heavier scheduling crate) — but a crate buys correctness/boilerplate for not many metrics either way, so this is worth a real look at both before picking.
+
+2. **Worker VM virtual-memory stats** — extends `reconcile::metrics_collector`'s existing combined SSH poll (the Phase 12 follow-up), not a second collection mechanism:
+   - Add `cat /proc/vmstat` and `cat /proc/meminfo` to the same combined command (both plain reads, no extra SSH round trip, no new privilege needed).
+   - New `worker_metrics` columns, added via `src/db/migrations.rs`'s existing `ALTER TABLE`-safe mechanism (first real reuse since Phase 10): `pgfault`/`pgmajfault` (minor vs. major page faults — major means an actual page-in from disk, i.e. real eviction pressure, which is the specific signal this phase exists for), `pswpin`/`pswpout` (swap activity — **verify hands-on whether the worker image even has swap configured at all**; `bootstrap/provision.sh`/cloud-init never mention it, so these may always read zero, which is itself a real finding worth confirming rather than assuming either way), `mapped_bytes` (file-backed virtual memory — directly what a large `mmap()`'d scratch file shows up as), `cached_bytes`, `anon_bytes`.
+   - Rendered with node-exporter's own exact metric names (`node_vmstat_pgfault`, `node_vmstat_pgmajfault`, `node_vmstat_pswpin`, `node_vmstat_pswpout`, `node_memory_Mapped_bytes`, `node_memory_Cached_bytes`, `node_memory_AnonPages_bytes`), one label set per worker VM (job name/namespace), on the same `/metrics` endpoint as the self-instrumentation above — same response, distinguished by name prefix, not a second endpoint.
+   - **Per-job container-level breakdown (cAdvisor's own `container_memory_mapped_file`/`container_memory_failures_total{type="pgfault"}`) is a stretch goal, not a committed deliverable.** It needs the container's own cgroup `memory.stat`, whose path depends on podman's cgroup driver and cgroup v1-vs-v2 (Ubuntu 24.04's actual default needs verifying hands-on against a real worker, not assumed) — real added fragility, for a number that, given this project's own one-container-per-worker-VM architecture, already sits very close to the node-level figure anyway. Node-level is the real deliverable; container-level is only attempted if the cgroup-path plumbing turns out cheap once it exists.
+   - A job with no sample yet is simply absent, matching Phase 12's own established precedent (the real warm-up gap), not a fallback/zeroed reading.
+
+3. **Access**: unauthenticated for both families — matching the original placeholder's own decision for self-instrumentation, and consistent with Phase 14's existing precedent of showing job names/namespaces on the unauthenticated public status page already (this isn't a new exposure category, just a new format for data already shown unauthenticated elsewhere).
+
+**Files to create/modify:**
+- `src/metrics_export.rs` (new) — Prometheus text-exposition rendering for both metric families
+- `src/status_page.rs` (Phase 14) — registers `GET /metrics` on the existing public sub-router
+- `src/reconcile/metrics_collector.rs` (Phase 12 follow-up) — extends the combined SSH command and `Sample`/`worker_metrics` with the new `/proc/vmstat`/`/proc/meminfo` fields
+- `src/db/migrations.rs` — new `worker_metrics` columns
+- `src/reconcile/mod.rs` — tick-count/duration instrumentation hooks (if not folded directly into the existing loop functions)
+
+**Testing:**
+```bash
+# Self-instrumentation
+curl -k https://localhost:443/metrics | grep kubeshim_
+# Should show process uptime, tick counters, jobs-by-state gauges
+
+# Worker VM virtual memory stats, while a real job is ContainerRunning
+# and actively mmap()ing/touching a large scratch file
+curl -k https://localhost:443/metrics | grep node_vmstat
+# Two scrapes a few seconds apart should show real, *changing*
+# pgfault/pgmajfault counts -- not just present, actually moving,
+# proving this is sampled from the real machine and not a static stub
+
+# The actual de-risking-migration test: point a real local Prometheus
+# + the community "Node Exporter Full" Grafana dashboard (ID 1860) at
+# this endpoint. Panels referencing node_vmstat_pgmajfault /
+# node_memory_Mapped_bytes should render real data completely
+# unmodified -- confirming the metric names/label shapes genuinely
+# match node-exporter's own convention, not just look plausible on
+# paper.
+```
+
+---
+
 ## Critical Files Summary
 
 | File | Purpose | Status |
@@ -911,7 +963,7 @@ curl -k https://localhost:443/debug/status | jq '.total_cost, .budget_balance'
 | `src/workload.rs` | `WorkloadKind` abstraction (CronJob now, Deployment later) | Create (Phase 5) |
 | `src/admission.rs` | `activeDeadlineSeconds`-required policy check; `resources.limits` quantity validation | Create (Phase 5); Phase 9 follow-up |
 | `src/db/schema.sql` | SQLite schema | Phases 1, 5-6, 8-9, 13 |
-| `src/db/migrations.rs` | `ALTER TABLE`-based column migrations for already-existing tables | Create (Phase 6); first real use (Phase 10) |
+| `src/db/migrations.rs` | `ALTER TABLE`-based column migrations for already-existing tables | Create (Phase 6); first real use (Phase 10); second use (Phase 17, `worker_metrics` vmstat columns) |
 | `src/reconcile/*.rs` | State machine loop, `Notify`-based wake-up, `activeDeadlineSeconds` enforcement, event recording | Create (Phases 6, 8-12, 13) |
 | `src/providers/*.rs` | `CloudProvider` trait + UpCloud implementation, request timeout (Phase 11) | Create (Phases 7-9, 11, 13) |
 | `src/providers/upcloud/firewall.rs` | Firewall rules for worker VMs (create + list, both real since Phase 7; poll-until-applied logic itself is Phase 9) | Create (Phase 7) |
@@ -924,7 +976,8 @@ curl -k https://localhost:443/debug/status | jq '.total_cost, .budget_balance'
 | `src/api/metrics.rs` | `kubectl top nodes`/`kubectl top pods`: CPU/memory estimated from each job's own resource requests | Create (Phase 12) |
 | `src/api/pods.rs` | Minimal synthetic Pod `GET`, needed for `kubectl describe pod` to have a base object to fetch | Create (Phase 12) |
 | `src/api/nodes.rs` | Synthetic core v1 `Node` per allocated worker VM, needed for `kubectl top nodes` to correlate against `metrics.k8s.io` | Create (Phase 12) |
-| `src/status_page.rs` | Public status page + `/healthz`/`/livez`/`/readyz`, served on `:443` | Create (Phase 14) |
+| `src/status_page.rs` | Public status page + `/healthz`/`/livez`/`/readyz`, served on `:443`; `GET /metrics` registration (Phase 17) | Create (Phase 14); Phase 17 |
+| `src/metrics_export.rs` | Prometheus text-exposition rendering: shim self-instrumentation + worker-VM virtual-memory stats (node-exporter-compatible names) | Create (Phase 17) |
 | `src/naming.rs` | `resource_prefix`-aware resource name generation | Create (Phase 15) |
 | `src/config.rs` | Configuration parsing | Phases 1-2, 4-5, 7, 9 |
 | `src/cloud_init.rs` | Worker VM `user_data` generation (base64-escaped job values); `resources.limits` → `podman run --cpus`/`--memory` | Create (Phase 9); Phase 9 follow-up |
@@ -1103,7 +1156,7 @@ All questions below are resolved or deliberately deferred — none block startin
 
 16. **Volume performance tiers / IOPS**: resolved. See item 6 above and "Generic Ephemeral Volumes / Storage Tiers" under Key Implementation Details — `storageClassName` selects from a small, fixed, per-provider-mapped set of tier names rather than a portable numeric IOPS target, since even real Kubernetes/CSI doesn't standardize IOPS as a cross-provider parameter, and these providers offer discrete tiers, not a continuously dialable number.
 
-17. **Public status page port, once ACME exists**: resolved. Once Phase 4 gives kube-shim a real, CA-trusted certificate, keeping the status page on a separate plaintext `:8080` stopped making sense — it moves onto the same `:443` listener as the authenticated API instead (Phase 14), as a structurally separate GET-only sub-router kept outside the bearer-token middleware's scope, rather than a physically separate port. Along the way, added `/healthz`/`/livez`/`/readyz` (genuinely standard Kubernetes API-server health endpoints) and a `/statusz` alias for `/` (the informal gRPC/OpenCensus "zPages" convention, not a literal Kubernetes convention — worth being precise about the difference). A literal Prometheus `/metrics` self-instrumentation endpoint was considered at the same time but deliberately deferred — see "Future Work: Prometheus `/metrics` Self-Instrumentation".
+17. **Public status page port, once ACME exists**: resolved. Once Phase 4 gives kube-shim a real, CA-trusted certificate, keeping the status page on a separate plaintext `:8080` stopped making sense — it moves onto the same `:443` listener as the authenticated API instead (Phase 14), as a structurally separate GET-only sub-router kept outside the bearer-token middleware's scope, rather than a physically separate port. Along the way, added `/healthz`/`/livez`/`/readyz` (genuinely standard Kubernetes API-server health endpoints) and a `/statusz` alias for `/` (the informal gRPC/OpenCensus "zPages" convention, not a literal Kubernetes convention — worth being precise about the difference). A literal Prometheus `/metrics` self-instrumentation endpoint was considered at the same time but deliberately deferred — see Phase 17, which also folds in real worker-VM virtual-memory instrumentation (a user-requested need that surfaced well after this question was first resolved).
 
 ---
 
@@ -1140,11 +1193,7 @@ Not in the initial scope. UpCloud (like most VPS providers) has multiple datacen
 
 ## Future Work: Prometheus `/metrics` Self-Instrumentation
 
-Not in the initial scope — deferred by explicit choice when the status-page/z-pages design was discussed (see Phase 14 and Open Question 17), not because it's hard:
-
-- A literal Prometheus text-exposition endpoint at `/metrics`, unauthenticated, on the same public sub-router as `/healthz`/`/livez`/`/readyz` (Phase 14) — self-instrumentation for the shim process itself (uptime, reconciliation tick count/duration, jobs-by-state gauges, current budget balance, ...).
-- Not to be confused with the already-planned, authenticated `metrics.k8s.io` API (Phase 12), which reports job/pod resource usage for `kubectl top` — a different concern (workload metrics) with a different audience (`kubectl`/Terraform, behind the bearer token) than this one (shim self-instrumentation, for an operator's own Prometheus, unauthenticated).
-- Straightforward to add later with the `prometheus` (or `metrics`) crate once there's an actual reason to scrape kube-shim itself (e.g. wiring it into existing personal Grafana/Prometheus infra, if any exists) — no design obstacle, just not needed for this round.
+**Superseded by Phase 17**, once a real, user-requested need (worker-VM virtual-memory instrumentation) made this worth scheduling as a real phase rather than an open-ended placeholder. This heading is kept as a redirect for anyone following an old link/reference to it.
 
 ---
 
@@ -1183,6 +1232,7 @@ Way out of scope — not sketched in any detail here, just a placeholder so the 
 - **Phase 14** (public status page): 1 day
 - **Phase 15** (naming + cleanup): 1 day
 - **Phase 16** (multi-job real-workload testing): 2 days
-- **Total**: ~4 weeks of development (up from ~3.5 weeks — ACME and the cost-report/currency work are the main additions), 1+ week of running/monitoring across the whole cronjob family. `Deployment` support, standalone PVCs, zone placement, and additional cloud providers (all under "Future Work") are intentionally excluded from this estimate.
+- **Phase 17** (Prometheus `/metrics`: shim self-instrumentation + worker-VM virtual-memory stats): 1-2 days — added after a real user request surfaced the virtual-memory need; not in the original estimate below
+- **Total**: ~4 weeks of development (up from ~3.5 weeks — ACME and the cost-report/currency work are the main additions) plus Phase 17, 1+ week of running/monitoring across the whole cronjob family. `Deployment` support, standalone PVCs, zone placement, and additional cloud providers (all under "Future Work") are intentionally excluded from this estimate.
 
 ---
