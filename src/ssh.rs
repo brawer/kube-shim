@@ -51,7 +51,10 @@ const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Everything `api::logs` (Phase 10) needs to SSH into a worker on
 /// demand, handed to the router as an `Extension` -- separate from
 /// `reconcile::job::JobContext`, which is reconcile-loop-only and not
-/// otherwise reachable from the HTTP layer.
+/// otherwise reachable from the HTTP layer. `Clone` so
+/// `reconcile::metrics_collector` can hand each concurrently spawned
+/// per-job task its own cheap copy.
+#[derive(Clone)]
 pub struct WorkerSshConfig {
     pub private_key: String,
     pub port: u16,
