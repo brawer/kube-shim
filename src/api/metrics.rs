@@ -74,6 +74,15 @@ pub(crate) struct WorkerSample {
 pub(crate) async fn real_worker_samples(
     pool: &SqlitePool,
 ) -> Result<Vec<WorkerSample>, sqlx::Error> {
+    // Filtered on jobs.status, not just left to whenever
+    // forget_stale_samples next happens to prune a finished job's row --
+    // without this, a job that just left ContainerRunning could still
+    // be served (with its real, merely slightly stale sample) for up to
+    // one more METRICS_POLL_INTERVAL, purely because pruning and
+    // serving weren't on the same clock. Real Kubernetes metrics-server
+    // has no such lag: it stops reporting a pod the moment its own
+    // container stops supplying fresh stats, not on some later cleanup
+    // tick.
     let rows = sqlx::query(
         "SELECT jobs.name, jobs.namespace, jobs.worker_vm_name, \
                 worker_metrics.cpu_millicores, worker_metrics.memory_usage_bytes, \
@@ -81,7 +90,7 @@ pub(crate) async fn real_worker_samples(
                 worker_metrics.sampled_at \
          FROM worker_metrics \
          JOIN jobs ON worker_metrics.job_id = jobs.id \
-         WHERE jobs.worker_vm_name IS NOT NULL",
+         WHERE jobs.worker_vm_name IS NOT NULL AND jobs.status = 'ContainerRunning'",
     )
     .fetch_all(pool)
     .await?;
@@ -271,6 +280,28 @@ mod tests {
         .unwrap();
     }
 
+    async fn insert_job_with_status(
+        pool: &SqlitePool,
+        id: &str,
+        name: &str,
+        namespace: &str,
+        status: &str,
+        vm_name: Option<&str>,
+    ) {
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, worker_vm_name, created_at, updated_at, version) \
+             VALUES (?, ?, ?, '{}', ?, ?, 0, 0, 1)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(namespace)
+        .bind(status)
+        .bind(vm_name)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     async fn insert_sample(
         pool: &SqlitePool,
         job_id: &str,
@@ -361,6 +392,57 @@ mod tests {
             .unwrap();
         let list: NodeMetricsList = serde_json::from_slice(&body).unwrap();
         assert!(list.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_node_metrics_stops_as_soon_as_job_leaves_container_running() {
+        // A job that has already moved on (Succeeded here) but whose
+        // worker_metrics row hasn't been pruned yet (forget_stale_samples
+        // runs at the *start* of the next poll cycle, not the instant
+        // the job's own status changes) must not still be served --
+        // serving must track the job's current status directly, not
+        // rely on pruning having already caught up.
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_job_with_status(
+            &pool,
+            "j1",
+            "a",
+            "default",
+            "Succeeded",
+            Some("kube-shim-worker-a"),
+        )
+        .await;
+        insert_sample(
+            &pool,
+            "j1",
+            500,
+            536_870_912,
+            2_000_000_000,
+            2,
+            1_700_000_000,
+        )
+        .await;
+
+        let router = Router::new()
+            .route("/nodes", get(list_node_metrics))
+            .with_state(pool);
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/nodes")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let list: NodeMetricsList = serde_json::from_slice(&body).unwrap();
+        assert!(
+            list.items.is_empty(),
+            "a job that already left ContainerRunning must not still be served, even with a lingering row"
+        );
     }
 
     #[tokio::test]
