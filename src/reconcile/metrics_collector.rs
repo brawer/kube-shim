@@ -24,6 +24,24 @@ use crate::ssh::{self, WorkerSshConfig};
 use anyhow::Result;
 use chrono::Utc;
 use sqlx::{Row, SqlitePool};
+use std::time::Duration;
+
+/// Bounds one job's *entire* SSH round-trip, not just the connect phase
+/// `src/ssh.rs`'s own `CONNECT_TIMEOUT`/`INACTIVITY_TIMEOUT` already
+/// cover. Those bound the transport (connect+handshake; "has this gone
+/// completely silent") but not the command itself -- a worker that
+/// accepts the connection and then hangs mid-command (`podman` wedged,
+/// stuck disk I/O, ...) while the session isn't *fully* silent could
+/// otherwise block `ssh::exec_once` forever. That matters more here
+/// than anywhere else SSH is used in this project: `poll_once` awaits
+/// every job's round-trip *sequentially*, so one stuck worker without
+/// this wouldn't just leave that job's own sample stale -- it would
+/// block every other job's poll forever too, since `run_metrics_poll_loop`
+/// never ticks again until `poll_once` itself returns. Comfortably under
+/// `INACTIVITY_TIMEOUT` (30s): if the connection truly goes silent,
+/// `ssh::exec_once` would eventually error out on its own regardless,
+/// but this should fire well before that in practice.
+const SSH_EXEC_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// One shell round-trip: the job's own container's stats, then the
 /// machine's overall memory/CPU/load, separated by a marker that can't
@@ -188,13 +206,30 @@ async fn forget_stale_samples(pool: &SqlitePool) -> Result<()> {
 }
 
 /// One polling pass: every job currently `ContainerRunning` with a
-/// known `worker_ssh_ip` gets one SSH round-trip; a job whose SSH call
-/// fails (worker not reachable *yet*, e.g. firewall rules only just
-/// applied) or whose output doesn't parse just keeps its last known
-/// sample (if any) rather than being zeroed out or removed -- a single
-/// missed poll isn't a reason to make `kubectl top` go blank for 30s.
-/// Returns how many samples were successfully updated.
+/// known `worker_ssh_ip` gets one SSH round-trip, bounded by
+/// `SSH_EXEC_TIMEOUT`; a job whose SSH call fails or times out (worker
+/// not reachable *yet*, e.g. firewall rules only just applied; or
+/// genuinely hung) or whose output doesn't parse just keeps its last
+/// known sample (if any) rather than being zeroed out or removed -- a
+/// single missed poll isn't a reason to make `kubectl top` go blank for
+/// 30s, and critically, isn't a reason for *every other job's* poll to
+/// never happen either. Returns how many samples were successfully
+/// updated.
 pub async fn poll_once(pool: &SqlitePool, ssh_config: &WorkerSshConfig) -> Result<usize> {
+    poll_once_with_timeout(pool, ssh_config, SSH_EXEC_TIMEOUT).await
+}
+
+/// Split out from `poll_once` purely so a test can pass a short timeout
+/// and verify a hung SSH round-trip actually gets cut off (and that the
+/// rest of the pass still proceeds), rather than paying the real
+/// `SSH_EXEC_TIMEOUT` (20s) on every test run just to prove the wrapper
+/// works -- same reasoning as `src/ssh.rs`'s own
+/// `connect_and_open_channel_with_timeout` split.
+async fn poll_once_with_timeout(
+    pool: &SqlitePool,
+    ssh_config: &WorkerSshConfig,
+    ssh_timeout: Duration,
+) -> Result<usize> {
     forget_stale_samples(pool).await?;
 
     let rows = sqlx::query(
@@ -209,16 +244,23 @@ pub async fn poll_once(pool: &SqlitePool, ssh_config: &WorkerSshConfig) -> Resul
         let job_id: String = row.get(0);
         let ip: String = row.get(1);
 
-        let output =
-            match ssh::exec_once(&ip, ssh_config.port, &ssh_config.private_key, &command).await {
-                Ok(output) => output,
-                Err(err) => {
-                    tracing::debug!(
-                        "metrics poll: SSH to {ip} for job {job_id} failed, will retry: {err}"
-                    );
-                    continue;
-                }
-            };
+        let exec = ssh::exec_once(&ip, ssh_config.port, &ssh_config.private_key, &command);
+        let output = match tokio::time::timeout(ssh_timeout, exec).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(err)) => {
+                tracing::debug!(
+                    "metrics poll: SSH to {ip} for job {job_id} failed, will retry: {err}"
+                );
+                continue;
+            }
+            Err(_) => {
+                tracing::debug!(
+                    "metrics poll: SSH to {ip} for job {job_id} did not complete within \
+                     {ssh_timeout:?}, will retry"
+                );
+                continue;
+            }
+        };
         let stdout = String::from_utf8_lossy(&output.stdout);
         let Some(sample) = parse_sample(&stdout) else {
             tracing::debug!("metrics poll: could not parse output from {ip} for job {job_id}");
@@ -389,6 +431,59 @@ mod tests {
         // one job's failure and keeps going.
         let updated = poll_once(&pool, &ssh_config).await.unwrap();
         assert_eq!(updated, 0);
+    }
+
+    #[tokio::test]
+    async fn test_poll_once_bounds_a_hung_worker_instead_of_blocking_forever() {
+        // The property SSH_EXEC_TIMEOUT exists for: a worker that
+        // accepts the connection and then never speaks (simulating a
+        // hung podman/command, same technique as src/ssh.rs's own
+        // CONNECT_TIMEOUT test) must not block ssh::exec_once's caller
+        // forever. Two jobs are pointed at the *same* hung listener
+        // (both never get a response) specifically to prove the bound
+        // applies per-job, independently -- the pass still finishes in
+        // roughly `2 * ssh_timeout`, not hanging on the first one and
+        // never reaching the second.
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+
+        let hung_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let hung_port = hung_listener.local_addr().unwrap().port();
+
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, worker_ssh_ip, created_at, updated_at, version) \
+             VALUES ('j1', 'hung-job-one', 'default', '{}', 'ContainerRunning', '127.0.0.1', 0, 0, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, worker_ssh_ip, created_at, updated_at, version) \
+             VALUES ('j2', 'hung-job-two', 'default', '{}', 'ContainerRunning', '127.0.0.1', 0, 0, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let ssh_config = WorkerSshConfig {
+            private_key: crate::ssh::tests::throwaway_private_key_pem(),
+            port: hung_port,
+        };
+
+        // Outer timeout is a test-safety net, not the thing under test:
+        // if poll_once_with_timeout itself failed to bound anything,
+        // this would hang until it fires and the test would fail with a
+        // clear message instead of hanging the whole suite.
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            poll_once_with_timeout(&pool, &ssh_config, Duration::from_millis(200)),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "poll_once_with_timeout did not return within 5s -- a hung worker blocked the whole pass"
+        );
+        assert_eq!(result.unwrap().unwrap(), 0);
     }
 
     #[tokio::test]
