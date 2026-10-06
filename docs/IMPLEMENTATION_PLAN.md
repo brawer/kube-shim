@@ -757,6 +757,8 @@ cargo test   # 157 lib tests + 19 integration tests, including a real
 
 **Testing:** 216 lib tests + 19 integration tests, all passing; `cargo fmt --check`/`cargo clippy --all-targets -- -D warnings` clean; `./smoke-test.sh --skip-build` passing; dev server started locally and confirmed the new polling loop runs cleanly with zero `ContainerRunning` jobs (no errors, `GET /apis/metrics.k8s.io/v1beta1/{nodes,pods}` and `GET /api/v1/nodes` all correctly return empty lists rather than erroring). The parsing logic itself — the fragile, real-world-dependent part — was verified against actual command output captured from two different real podman versions and a real Ubuntu host, not written against an assumed/documented shape.
 
+**Live verification against `kube-shim.brawer.ch`, closing a gap this phase originally shipped without (release v0.2.2):** a real standalone Job (Phase 13, `busybox`/`sleep`, via `curl` against the live API) was run end to end on real UpCloud infrastructure. Confirmed real: a `Node` entry with real capacity (`1 CPU`/`868932Ki`, matching the actual provisioned plan); `NodeMetrics.usage.memory` reporting the worker's real `free -b` figure (`374188Ki`) rather than an echo of the container's own usage -- the exact thing the node/pod decoupling bullet above was meant to fix; `PodMetrics` showing the container's real `podman stats` reading (`124Ki`) once it was running. A first attempt was itself force-failed by `activeDeadlineSeconds` (real VM+volume provisioning took ~173s, leaving too little margin against a too-tight test deadline) -- not a bug, but a useful incidental confirmation that deadline enforcement and the full cleanup path to `Archived` also work correctly against real infrastructure. Not separately live-tested: the `JoinSet` concurrency fix itself (multiple jobs, some hanging) -- only one real job ran at a time here, so that property remains verified by its own dedicated `TcpListener`-based unit tests rather than live infrastructure, which is a reasonable place to leave it.
+
 ---
 
 ### Phase 13: Standalone Jobs (`batch/v1`) (Days 13-14) — ✅ Complete
@@ -788,6 +790,8 @@ cargo test   # 157 lib tests + 19 integration tests, including a real
 - `tests/job_admission_test.rs` (new) — mirrors `cronjob_admission_test.rs` through the real router; 8 tests
 
 **Testing:** 235 lib tests (12 net new) + 29 integration tests (8 new via `job_admission_test.rs`), all passing; `cargo fmt --check`/`cargo clippy --all-targets -- -D warnings` clean; `./smoke-test.sh --skip-build` passing; real local dev-server verification per above.
+
+**Live verification against `kube-shim.brawer.ch` (release v0.2.2), after the dev-server-only verification above:** a real standalone Job ran end to end on real UpCloud infrastructure -- real volume+VM provisioning, real `podman`/SSH-based container execution (`kubectl logs`-equivalent confirmed the real `"hello world"` output), real metrics served correctly once running, and real cleanup back down to `Archived` with the worker VM/volume actually gone afterward, confirmed via the live UpCloud account. Also exercised, live: `DELETE` on an already-finished Job removing the row outright (used to clean up three unrelated leftover rows from older ad-hoc Phase 11 testing, visible for the first time now that `list_jobs` exists), and a real `activeDeadlineSeconds` force-fail (from a first attempt whose deadline was too tight against real provisioning latency) correctly reaching `Archived` through the normal cleanup path rather than getting stuck.
 
 ---
 
