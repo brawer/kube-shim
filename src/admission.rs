@@ -45,7 +45,7 @@ pub fn require_active_deadline_seconds(
             axum::http::StatusCode::FORBIDDEN,
             "Forbidden",
             format!(
-                "admission webhook \"kube-shim.io/require-active-deadline\" denied the \
+                "admission webhook \"kube-shim.brawer.ch/require-active-deadline\" denied the \
                  request: {field_prefix}.activeDeadlineSeconds must be set (bounds the \
                  job's worst-case cost against the budget guard)"
             ),
