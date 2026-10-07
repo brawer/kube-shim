@@ -94,7 +94,7 @@ Terraform (terraform apply, with a bearer token configured)
     listener/cert as the authenticated API, just a different route group)
   → GET https://kube-shim.brawer.ch/healthz  (unauthenticated health
     check, standard Kubernetes convention)
-  → GET https://kube-shim.brawer.ch/apis/cost.kube-shim.io/v1/report
+  → GET https://kube-shim.brawer.ch/apis/cost.kube-shim.brawer.ch/v1/report
     (authenticated CSV cost report, grouped by job labels)
 
 Separately: release-please merges its release PR, tags vX.Y.Z
@@ -305,9 +305,9 @@ curl --cacert <(curl -s https://letsencrypt.org/certs/staging/letsencrypt-stg-ro
 - `spec.storageClassName` is repurposed from the original plan: since nothing is ever retained, it no longer selects a reclaim policy. Instead it selects a **performance tier** — two built-in, hardcoded class names, `kube-shim-standard` (the default when omitted) and `kube-shim-fast` — mapped internally, per cloud provider, to that provider's closest matching storage tier (UpCloud: `standard` / `maxiops`). No real `StorageClass` resource or general CSI-style pluggable parameters: providers in this space (UpCloud, and likely Infomaniak/Hetzner too) offer a small number of discrete storage tiers, not a continuously tunable IOPS number, and even real Kubernetes doesn't standardize IOPS as a portable parameter — that's left entirely to whichever CSI driver is bound. A small, fixed, hardcoded per-provider lookup table (`match classname { ... }` inside each `CloudProvider` implementation) is both simpler and more honest about what these providers actually offer than inventing a numeric abstraction they can't precisely honor. An unknown class name is rejected the standard way: HTTP 422, `Status` object, `reason: Invalid`, `causes: [{reason: FieldValueNotSupported, field: "...storageClassName"}]` — built via `src/k8s_status.rs` (Phase 2), same as every other structured error in this API.
 - Database: `job_volumes` table (job_id, size_gb, storage_class_name, provider_volume_id, mount_point) — one row per job *run*, not a durable row reused across runs, since nothing here persists between runs. **Reserved schema only in this phase**: nothing writes to it yet, since there's no reconciliation loop (Phase 6) turning a CronJob's schedule into actual job runs for a row to represent.
 - Per-job VM sizing: read `resources.requests.cpu` / `.memory` from the CronJob's pod template and map to a cloud-provider server size (small lookup table), instead of a fixed single size — needed now that the shim runs more than one workload shape. **Built as a standalone, tested `src/workload.rs` function** (`smallest_fitting_server_plan`), using real UpCloud plan names/specs confirmed against the actual API (Phase 7's own research) rather than placeholders — but deliberately a small, incomplete starting table: osmdiffs' real profile (6 CPU/8GB) already exceeds every plan listed, and finding its actual match is left to Phase 9 (VM provisioning), the same way every other provider-specific sizing decision in this plan gets settled hands-on rather than guessed in advance. Not wired into any live request path yet — nothing provisions VMs until Phase 9.
-- Config: `resource_prefix` (default `"kube-shim"`), reserved here since this is the first phase that gives cloud resources shim-managed names — actually threaded through naming and orphan-scan matching in Phase 16. Also reserves the rolling-budget parameters (`budget_daily_rate`, `budget_rollover_cap_days`, in `main_currency` — see Phase 14) and `main_currency` itself — this just reserves the config shape; the accrual/enforcement/conversion logic is built in Phase 14, once cost calculation and ECB-rate sync exist. **Landed as a new top-level `[shim]` config section** (not nested under `[server]` or any provider section, since none of these four fields is specific to the HTTP listener or to UpCloud) — `#[serde(default)]` throughout, so the already-deployed `kube-shim.brawer.ch` config.toml (which predates this section entirely) keeps parsing unchanged.
+- Config: `resource_prefix` (default `"kube-shim"`), reserved here since this is the first phase that gives cloud resources shim-managed names — actually threaded through naming and orphan-scan matching in Phase 16. Also reserves the rolling-budget parameters (`budget_daily_rate`, `budget_rollover_cap_days`, in `main_currency` — see Phase 14b) and `main_currency` itself — this just reserves the config shape; cost calculation and ECB-rate sync are built in Phase 14a, and the accrual/enforcement logic that actually uses these two fields in Phase 14b. **Landed as a new top-level `[shim]` config section** (not nested under `[server]` or any provider section, since none of these four fields is specific to the HTTP listener or to UpCloud) — `#[serde(default)]` throughout, so the already-deployed `kube-shim.brawer.ch` config.toml (which predates this section entirely) keeps parsing unchanged.
 - Internal `WorkloadKind` enum (`CronJob` for now), in `src/workload.rs`. Purely an internal abstraction — no new API surface, and not yet referenced by any reconciliation code (there isn't any until Phase 6) — done now so the future Deployment support (see "Future Work") doesn't require rewriting this layer once it exists.
-- **Admission check on CronJob create/update: `spec.jobTemplate.spec.activeDeadlineSeconds` must be set.** `activeDeadlineSeconds` is optional in the real Kubernetes API, but the shim needs a hard worst-case runtime bound for every job to make the budget guard (Phase 14) and deadline enforcement (Phase 11) meaningful, so it requires it via policy the same way a real cluster's `ValidatingAdmissionPolicy`/webhook would. A CronJob submitted without it is rejected with the same response shape a real admission webhook denial produces: HTTP 403, a `Status` object (`kind: Status`, `reason: Forbidden`, built via Phase 2's `src/k8s_status.rs`), message `admission webhook "kube-shim.io/require-active-deadline" denied the request: spec.jobTemplate.spec.activeDeadlineSeconds must be set (bounds the job's worst-case cost against the budget guard)`. `kubectl`/Terraform surface this exactly like any real admission denial — resolves Open Question 9. **Only wired into `create_cronjob`**: there's no update/PATCH handler yet for CronJobs (Phase 1 only ever built create/read/list/delete), so "on update" is aspirational until that exists.
+- **Admission check on CronJob create/update: `spec.jobTemplate.spec.activeDeadlineSeconds` must be set.** `activeDeadlineSeconds` is optional in the real Kubernetes API, but the shim needs a hard worst-case runtime bound for every job to make the budget guard (Phase 14b) and deadline enforcement (Phase 11) meaningful, so it requires it via policy the same way a real cluster's `ValidatingAdmissionPolicy`/webhook would. A CronJob submitted without it is rejected with the same response shape a real admission webhook denial produces: HTTP 403, a `Status` object (`kind: Status`, `reason: Forbidden`, built via Phase 2's `src/k8s_status.rs`), message `admission webhook "kube-shim.brawer.ch/require-active-deadline" denied the request: spec.jobTemplate.spec.activeDeadlineSeconds must be set (bounds the job's worst-case cost against the budget guard)`. `kubectl`/Terraform surface this exactly like any real admission denial — resolves Open Question 9. **Only wired into `create_cronjob`**: there's no update/PATCH handler yet for CronJobs (Phase 1 only ever built create/read/list/delete), so "on update" is aspirational until that exists.
 - `src/k8s_status.rs` (Phase 2) gained a second builder, `invalid_field_value()`, alongside the existing `status_error()` — produces the full real-Kubernetes shape for a field-validation failure (`Status.details.causes[]`, `reason: FieldValueNotSupported`), not just the message string, so a programmatic consumer can find exactly which field was wrong.
 
 **Files created/modified:**
@@ -330,7 +330,7 @@ cargo test   # 79 tests: unit tests for StorageTier/parse_storage_quantity_gb/
 # Admission check (activeDeadlineSeconds):
 curl -X POST .../cronjobs -d '{"spec": {"jobTemplate": {"spec": {"template": {...}}}}}'
 # 403 Forbidden, Status object:
-# admission webhook "kube-shim.io/require-active-deadline" denied the request: ...
+# admission webhook "kube-shim.brawer.ch/require-active-deadline" denied the request: ...
 
 # Storage tier:
 curl -X POST .../cronjobs -d '{"spec": {"jobTemplate": {"spec": {
@@ -350,9 +350,9 @@ curl -X POST .../cronjobs -d '{"spec": {"jobTemplate": {"spec": {
 **Goal:** Build the state machine that will drive all orchestration.
 
 **Deliverables:**
-- Reconciliation loop: `tokio::time::interval` every 10 seconds as the **fallback** cadence — not the only trigger. A `tokio::sync::Notify` lets specific events wake the loop immediately instead of waiting up to 10s: a new `CronJob` submitted via the API, and (once Phase 14 exists) the budget balance crossing a job out of `BudgetWait`. The 10s poll stays in place regardless, since it's still what catches external state changes the shim wouldn't otherwise hear about (e.g. a provider-side VM failure) — the `Notify` is purely a responsiveness improvement for the cases the shim already knows about immediately, not a replacement for polling. `tokio::time::interval`'s *first* tick fires immediately by design, so the loop's very first pass also happens right at startup, not after the first 10s — a genuine feature (reconcile immediately on boot), not something worked around.
+- Reconciliation loop: `tokio::time::interval` every 10 seconds as the **fallback** cadence — not the only trigger. A `tokio::sync::Notify` lets specific events wake the loop immediately instead of waiting up to 10s: a new `CronJob` submitted via the API, and (once Phase 14b exists) the budget balance crossing a job out of `BudgetWait`. The 10s poll stays in place regardless, since it's still what catches external state changes the shim wouldn't otherwise hear about (e.g. a provider-side VM failure) — the `Notify` is purely a responsiveness improvement for the cases the shim already knows about immediately, not a replacement for polling. `tokio::time::interval`'s *first* tick fires immediately by design, so the loop's very first pass also happens right at startup, not after the first 10s — a genuine feature (reconcile immediately on boot), not something worked around.
 - **A piece the original plan text didn't spell out but turned out to be load-bearing: something has to turn a `CronJob`'s schedule into actual job runs** — otherwise the `jobs` table (which the rest of this phase reconciles) would only ever have zero rows. Built as `src/reconcile/schedule.rs`, the shim-internal equivalent of real Kubernetes' cronjob controller: parses `spec.schedule` (standard 5-field POSIX cron, via the `cron` crate — prepending a fixed `"0 "` seconds field to bridge to the 6-field form that crate expects) and creates a new `jobs` row whenever at least one scheduled instant has passed since the last run (or since the `CronJob`'s own creation, if it's never run) — coalescing any missed instants into a single catch-up run rather than bursting one per missed minute, the same way real `Allow`-policy CronJobs behave. There's no `concurrencyPolicy` support (`Forbid`/`Replace`) — nothing in this plan needs it.
-- Job state machine: the full pipeline from "Reconciliation Loop State Machine" under Key Implementation Details (minus `BudgetWait`, which needs Phase 14's budget guard to mean anything) — one state per reconciliation tick, mocked (no real work happens, `Succeeded`/`Failed` collapses to always `Succeeded` since there's no real container execution yet to have an outcome).
+- Job state machine: the full pipeline from "Reconciliation Loop State Machine" under Key Implementation Details (minus `BudgetWait`, which needs Phase 14b's budget guard to mean anything) — one state per reconciliation tick, mocked (no real work happens, `Succeeded`/`Failed` collapses to always `Succeeded` since there's no real container execution yet to have an outcome).
 - Database updates for job status, volume_id, worker_vm_id, etc.
 - Error handling + retry tracking per job — deferred in substance to Phase 10 (nothing can actually *fail* yet, since every transition is mocked); this phase just makes sure `retry_count`/`version`/`last_transition_time` get touched correctly on every advance, so Phase 10 has real bookkeeping to build retry logic on top of rather than adding it from scratch.
 - Startup reconciliation (detect orphaned jobs from crashed shim) — `src/reconcile/startup.rs` logs every non-terminal job found at boot and confirms it resumes reconciling normally on the very next tick. No actual cleanup logic yet (nothing external exists to clean up) — that's Phase 10.
@@ -406,7 +406,7 @@ sqlite3 db.sqlite "SELECT name, cronjob_name, status FROM jobs"
   - `POST /1.3/server` (create) is **asynchronous** — the response returns before the server is actually ready, so a `VMCreating` → `VMRunning` transition needs an explicit poll/wait step, not a synchronous "create returns a ready server" assumption.
   - `POST /1.3/storage` (create volume) is synchronous; attach/detach go through their own dedicated endpoints and are also synchronous, and can run against a live (already-running) server.
   - Firewall rules (`POST`/`PUT /1.3/server/{uuid}/firewall_rule`) are **asynchronous in effect**: the API call returns immediately, but the rule takes roughly 1-2 minutes to actually apply. This matters for a security-relevant guarantee ("worker VM is unreachable inbound") — the reconciliation loop must not consider a worker VM's network isolation established the instant the firewall API call returns; it needs its own explicit wait/verify step before the VM is treated as safe to leave running unattended (see Phase 9).
-  - `GET /1.3/price` returns prices in the account's own billing currency — for this project's UpCloud account, that's EUR (UpCloud doesn't offer CHF billing), which is exactly why Phase 14's `main_currency` conversion exists.
+  - `GET /1.3/price` returns prices in the account's own billing currency — for this project's UpCloud account, that's EUR (UpCloud doesn't offer CHF billing), which is exactly why Phase 14a's `main_currency` conversion exists.
 - `dry_run` config flag (already existed on `UpCloudConfig` since Phase 1's original scaffold — this phase is the first to actually read it). New `[upcloud] zone` field alongside it (default `"de-fra1"`, the zone `kube-shim.brawer.ch` itself runs in) — real multi-zone/`nodeSelector` support stays deferred (see "Future Work"), so this is one shim-wide default, not per-job, for now.
 - Reconciliation step: `VolumePending` → attempt volume creation (logged, not executed) — implemented in `src/reconcile/job.rs`, extracting the requested size/tier from the job's own stored pod-template spec (via `src/volumes.rs`'s `parse_storage_quantity_gb`/`StorageTier`, both built in Phase 5 and getting their first real caller here).
 - Reconciliation step: `VMPending` → attempt VM creation (logged, not executed) — same pattern, extracting `resources.requests.cpu`/`.memory` and resolving them via `src/workload.rs`'s `smallest_fitting_server_plan` (Phase 5) plus a new `parse_cpu_cores` helper (CPU quantities use their own `"2"`/`"500m"` format, distinct from the `Ki`/`Mi`/`Gi` format memory shares with storage).
@@ -574,7 +574,7 @@ cargo test   # 143 lib tests + 19 integration tests, incl. mock-HTTP-server
 #    schedule, not a realistic production cadence) queued the rest behind
 #    that quota, exactly as the existing one-shot retry logic is designed
 #    to handle; nothing was lost, everything eventually ran. Real
-#    concurrency/budget control is Phase 14's job.
+#    concurrency/budget control is Phase 14b's job.
 #  - The orphan scanner's 5-minute tick can race a job's own
 #    create-volume-then-record-it-locally window, seeing a legitimately
 #    in-progress volume as "untracked" before its `job_volumes` row
@@ -705,7 +705,7 @@ cargo test   # 157 lib tests + 19 integration tests, including a real
 
 **What was actually built:**
 
-- **Events, emitted generically from one choke point, not sprinkled per-handler.** `events` (the table itself was front-loaded since Phase 1, like `job_volumes`/`last_transition_time` — nothing new to migrate). `reconcile::job::record_event` is called from exactly two places: once in `advance_all`'s own shared `UPDATE jobs ... ` block, right after *any* real transition commits (reason = the new `target_status` itself — `"VolumeCreated"`, `"FirewallVerified"`, `"ContainerRunning"`, etc., already exactly matching the plan's own example reasons, verbatim, since they're literally this project's own state names), and once in `force_failed` (reason `"Failed"`, message = the existing `DeadlineExceeded`/`StateTimeout` detail string, type `Warning`). Every other transition is `Normal`. This covers every example reason the plan named except `"BudgetWait"`, which doesn't exist as a state yet (Phase 14).
+- **Events, emitted generically from one choke point, not sprinkled per-handler.** `events` (the table itself was front-loaded since Phase 1, like `job_volumes`/`last_transition_time` — nothing new to migrate). `reconcile::job::record_event` is called from exactly two places: once in `advance_all`'s own shared `UPDATE jobs ... ` block, right after *any* real transition commits (reason = the new `target_status` itself — `"VolumeCreated"`, `"FirewallVerified"`, `"ContainerRunning"`, etc., already exactly matching the plan's own example reasons, verbatim, since they're literally this project's own state names), and once in `force_failed` (reason `"Failed"`, message = the existing `DeadlineExceeded`/`StateTimeout` detail string, type `Warning`). Every other transition is `Normal`. This covers every example reason the plan named except `"BudgetWait"`, which doesn't exist as a state yet (Phase 14b).
 - **`api::events::list_events`** (`GET /api/v1/namespaces/:namespace/events`) — joins `events` against `jobs` to resolve `job_id` back to a name (events don't know a job's user-facing name directly), and parses the real `fieldSelector=involvedObject.name=...` query parameter `kubectl describe pod` actually sends, not just an unfiltered dump.
 - **`api::metrics`** (`GET /apis/metrics.k8s.io/v1beta1/nodes` and `/pods`, plus the namespaced `/namespaces/:namespace/pods` real metrics-server also exposes) — every number is an estimate from each job's own `resources.requests` (the same values `handle_vm_pending` already uses to size the worker VM), not a real measurement; there's no cAdvisor or SSH-based sampling anywhere.
 - **"Node" is not a fiction here, on reflection.** A first version of this reported one synthetic aggregate node summing every job's request, reasoning that this project has no node pool. User feedback during review: a worker VM genuinely *is* a node in the real Kubernetes sense — a machine running exactly one pod — it just doesn't live in a long-lived static pool the way a real cluster's nodes do; it's created and destroyed together with the one job it exists for. Reworked to report one `NodeMetrics` entry per currently-*allocated* worker VM (a job gets one only once `handle_vm_pending` has actually recorded a `worker_vm_name` for it) — a faithful mapping, not a fiction layered on top of one. `api::nodes::list_nodes` (`GET /api/v1/nodes`, new, cluster-scoped) reports the matching core v1 `Node` objects by the same name, with `status.capacity`/`allocatable` set to the worker's *actual* provisioned plan size (`workload::smallest_fitting_server_plan`'s own rounded-up answer, not an echo of the raw request) — verified live that this is what makes `kubectl top nodes` show correct capacity-relative percentages, not just raw numbers.
@@ -762,7 +762,7 @@ cargo test   # 157 lib tests + 19 integration tests, including a real
 ---
 
 ### Phase 13: Standalone Jobs (`batch/v1`) (Days 13-14) — ✅ Complete
-**Goal:** Let a `batch/v1` `Job` be created directly, not only ever indirectly via a `CronJob`'s own schedule — a real, user-surfaced need: testing a new workload version/release by hand before it's trusted enough to run unattended as a recurring `CronJob`. Added right after Phase 12 and ahead of the originally-next pricing/budget work (Phase 14), since it's small and almost entirely decoupled from everything else planned.
+**Goal:** Let a `batch/v1` `Job` be created directly, not only ever indirectly via a `CronJob`'s own schedule — a real, user-surfaced need: testing a new workload version/release by hand before it's trusted enough to run unattended as a recurring `CronJob`. Added right after Phase 12 and ahead of the originally-next pricing/budget work (Phase 14a/14b), since it's small and almost entirely decoupled from everything else planned.
 
 **What was actually built, essentially matching the plan:**
 
@@ -795,34 +795,33 @@ cargo test   # 157 lib tests + 19 integration tests, including a real
 
 ---
 
-### Phase 14: Pricing + Cost Tracking + Budget Guard + Cost Report (Days 13-15)
-**Goal:** Track pricing, calculate job costs in the operator's own currency, enforce a *rolling* budget guard, and expose a per-project cost breakdown.
+### Phase 14a: Pricing + Cost Tracking + FOCUS-Compliant Cost Report (Days 13-14)
+**Goal:** Track real pricing, calculate job costs in the operator's own currency, and expose a cost report that's a genuine, minimal-but-real subset of [FOCUS](https://focus.finops.org/) (the FinOps Open Cost and Usage Specification) — not just FOCUS-flavored column names. Split out from the original single "Phase 14" into this (cost tracking) and Phase 14b (budget enforcement) since they're genuinely separable: nothing about calculating and reporting cost requires the budget guard to exist first.
 
 **Deliverables:**
 - Daily sync of UpCloud's pricing API (`GET /1.3/price`, returned in the account's billing currency — EUR for this project) → SQLite cache table, via `CloudProvider::get_pricing()` (Phase 7).
 - Daily sync of the ECB's reference exchange rates (`https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml`) → SQLite cache table. The feed is EUR-anchored (every rate is EUR→X), which lines up exactly with UpCloud's EUR-denominated pricing — no cross-currency chaining needed, just `amount_eur × rate[main_currency]`.
-- `main_currency` (Phase 5's reserved config field, e.g. `"CHF"`): all cost figures the shim *reports* — budget balance, per-job cost, the cost report below — are expressed in this currency, converted from the provider's real EUR cost via the day's ECB rate. The rolling-budget config fields are renamed from the original `budget_daily_rate_eur`/`balance_eur` to currency-agnostic `budget_daily_rate`/`balance` (implicitly in `main_currency` units) — hardcoding "_eur" in the name stopped making sense once the number displayed to the operator isn't always EUR, even though the underlying UpCloud spend always is.
+- `main_currency` (Phase 5's reserved config field, e.g. `"CHF"`): all cost figures the shim *reports* — per-job cost, the cost report below — are expressed in this currency, converted from the provider's real EUR cost via the day's ECB rate.
 - Cost calculation: (VM hourly price × duration) + (volume price per GB-hour × GB × duration), computed in EUR from provider pricing, then converted to `main_currency` for storage/display.
-- Estimated cost before a job starts — now required, not optional, since the budget guard depends on it: hourly VM price × the job's `activeDeadlineSeconds` (its worst-case runtime) + estimated volume cost for that same duration. This is a true worst-case bound, not a hopeful guess: Phase 5's admission check guarantees every job has `activeDeadlineSeconds` set, and Phase 11 actually force-kills the VM if it's exceeded, so nothing can run past the duration this estimate assumes.
-- Actual cost calculated when job completes
-- Cost aggregated per job and across the whole family (daily/weekly/monthly totals)
-- **Rolling budget guard**, replacing a flat daily cap:
-  - `budget_daily_rate` (e.g. CHF 2/day) accrues into a persisted balance continuously, capped at `budget_daily_rate × budget_rollover_cap_days` (default 7 days) — so several quiet days build up enough headroom for one bigger job, without the balance growing unbounded if jobs never run
-  - Before launching a job, its estimated cost must be ≤ the current balance. If not, the job enters a new `BudgetWait` state and is retried — immediately once the balance changes (via Phase 6's `Notify` wake-up), and on the fallback tick otherwise — not failed, until enough balance has accrued. This resolves Open Question 7's "hard stop vs. soft alert" in favor of a hard stop.
-  - The balance decrements by the job's *actual* cost once it completes (not the conservative estimate), so a job that finishes early returns its unused margin to the balance for the next one.
-  - New `budget_state` table: a single row with `balance`, `last_accrual_at`.
-- **CSV cost report**, `GET /apis/cost.kube-shim.io/v1/report?from=...&to=...`, grouped by a Kubernetes label on the job (e.g. `app.kubernetes.io/name`, or a custom `kube-shim.io/project` label) — answering "which project ate how much budget," not just an aggregate total. Column naming is loosely inspired by the [FOCUS](https://focus.finops.org/) (FinOps Open Cost and Usage Specification) convention — `ServiceCategory`, `ChargeCategory`, `BilledCost`, `BillingCurrency`, `ChargePeriodStart`/`End`, a project/label grouping column — without implementing FOCUS itself: FOCUS is designed for cloud-billing exports at AWS-CUR/Azure-Cost-Management scale, far more machinery than a one-provider, handful-of-jobs report needs. Borrowing its column vocabulary just means the CSV opens sensibly in a spreadsheet and means roughly what a FinOps-familiar reader expects, nothing more.
-- Expose cost and budget balance via the metrics API, events, and the public status page (Phase 15)
-- Hardcoded fallback pricing (and a fallback fixed exchange rate) if either sync fails
+- Estimated cost before a job starts — needed by Phase 14b's budget guard, but calculated here since it's a cost-tracking concern first: hourly VM price × the job's `activeDeadlineSeconds` (its worst-case runtime) + estimated volume cost for that same duration. A true worst-case bound, not a hopeful guess: Phase 5's admission check guarantees every job has `activeDeadlineSeconds` set, and Phase 11 actually force-kills the VM if it's exceeded, so nothing can run past the duration this estimate assumes.
+- Actual cost calculated when job completes.
+- Cost aggregated per job and across the whole family (daily/weekly/monthly totals).
+- **A real, minimal-but-genuine FOCUS v1.4 CSV cost report**, `GET /apis/cost.kube-shim.brawer.ch/v1/report?from=...&to=...` — the user explicitly asked for the minimum subset of FOCUS needed to pass [`focus-validator`](https://pypi.org/project/focus-validator/) (the FinOps Foundation's own Python CLI validator), not just FOCUS-inspired column names (superseding this phase's own original, lighter-weight plan). Researched hands-on against the real spec text (GitHub `FinOps-Open-Cost-and-Usage-Spec/FOCUS_Spec`, tag `v1.4`) and the real tool (installed via `pip`, not assumed from docs) rather than guessed:
+  - **Checked both the current release and the in-progress next one**: `v1.4` (current) and the `working_draft` branch (where v1.5 development happens) are column-for-column identical as of this writing — `working_draft`'s `CHANGELOG.md` has no unreleased section yet, and the one column spot-checked (`BilledCost`) only differs by cosmetic cross-reference renaming (`#datasets.*` → `#datamodel.*`) plus a new, currently-"Not applicable" `Operating Model Conditions` row. Targeting v1.4's column set is therefore safe for both.
+  - **The 21 truly Mandatory columns** (MUST be present, no condition attached) for the Cost and Usage dataset, confirmed by downloading and parsing every column's own `## Content Constraints` table rather than trusting a secondary summary: `BilledCost`, `BillingAccountId`, `BillingAccountName`, `BillingCurrency`, `BillingPeriodStart`, `BillingPeriodEnd`, `ChargeCategory`, `ChargeClass`, `ChargeDescription`, `ChargePeriodStart`, `ChargePeriodEnd`, `ContractedCost`, `EffectiveCost`, `HostProviderName`, `InvoiceIssuerName`, `ListCost`, `PricingQuantity`, `PricingUnit`, `ServiceCategory`, `ServiceName`, `ServiceProviderName`. `ChargeCategory` is a fixed enum (`Usage`/`Purchase`/`Tax`/`Credit`/`Adjustment` — kube-shim's own job runs are always `"Usage"`); `ChargeClass` is nullable and, when set, only ever `"Correction"` (kube-shim never issues corrections, so this column is always null).
+  - **Real multi-currency support, not just the Mandatory minimum** (per the user's own request, since this is a real FOCUS feature, not padding): add the Conditional `PricingCurrency` (the operator's `main_currency`) and `PricingCurrencyEffectiveCost` (the cost converted into it) columns alongside the Mandatory `BillingCurrency`/`BilledCost` (always UpCloud's real `EUR`) — so the CSV shows both the real provider-billed figure and the operator's own converted one side by side, which is exactly what FOCUS's own multi-currency columns are for. Also add `BillingAccountType` (forced non-null the moment `BillingAccountId` is set — a real Conditional dependency, not optional once we set the account ID at all) and the Recommended `ServiceSubcategory` (cheap for us to always set, e.g. `"Virtual Machines"`).
+  - **A real bug in `focus-validator` itself, found by installing and running it, not assumed from its docs:** the current PyPI release (2.2.1) crashes (`Active-edge cycle detected`) just *loading* its own v1.4 rule set — a genuine circular dependency between `CommitmentDiscountQuantity`/`CommitmentDiscountUnit` rules, independent of any input data, already filed upstream (`FinOps-Open-Cost-and-Usage-Spec/FOCUS_Spec` PR #2609, "Correct for Circular dependency found in 1.2, 1.3, 1.4, 1.5 model"). **No one can run a full automated v1.4 validation with today's published tool, regardless of our CSV's content.** Validate against the older, working `v1.3.0.1` rule set (bundled locally with the tool, no download needed) as the practical stand-in during implementation; our column choices themselves are still researched against the real v1.4 spec text, so this is a tooling gap, not a compliance gap. Revisit automated v1.4 validation once the upstream fix lands.
+  - **A real CSV-encoding nuance, found by iterating against `v1.3.0.1` directly:** the validator's checks distinguish a genuinely-NULL field from an empty string (`'' IS NOT NULL` is true in SQL), and expect every column the spec defines for the dataset to be present in the header — not a sparse subset, matching how real provider FOCUS exports (AWS CUR, GCP billing export) already behave. So every declared column must be fully, correctly populated for every row it applies to (a real value, or a genuine SQL NULL) — never a column that's merely declared-but-blank, which several rules interpret as "present but not NULL" and reject.
+- Expose cost via the metrics API, events, and the public status page (Phase 15).
+- Hardcoded fallback pricing (and a fallback fixed exchange rate) if either sync fails.
 
 **Files to create/modify:**
 - `src/providers/upcloud/pricing.rs` (new) - UpCloud pricing API fetch, implements `CloudProvider::get_pricing()`
 - `src/currency.rs` (new) - ECB daily-rate fetch/parse (XML — via `quick-xml` or similar) + EUR-anchored conversion to `main_currency`
-- `src/pricing/mod.rs` (new) - provider-agnostic cost calculation + budget accrual/enforcement, in `main_currency`
-- `src/api/pricing.rs` (new) - cost + budget-balance endpoint
-- `src/api/cost_report.rs` (new) - CSV cost report endpoint, grouped by label
-- `src/reconcile/pricing.rs` (new) - background pricing + ECB-rate sync loop + budget accrual tick + `BudgetWait` check
-- `src/db/schema.sql` - add `provider_pricing`, `exchange_rates` tables; `estimated_cost` column; `budget_state` table
+- `src/pricing/mod.rs` (new) - provider-agnostic cost calculation, in `main_currency`
+- `src/api/cost_report.rs` (new) - the FOCUS-compliant CSV cost report endpoint
+- `src/reconcile/pricing.rs` (new) - background pricing + ECB-rate sync loop
+- `src/db/schema.sql` - add `provider_pricing`, `exchange_rates` tables; `estimated_cost`/`actual_cost` columns
 
 **Testing:**
 ```bash
@@ -831,16 +830,43 @@ journalctl -u kube-shim -f | grep -E "pricing|exchange rate"
 # Should see both updated once per day
 
 # After job completes
-sqlite3 db.sqlite "SELECT name, estimated_cost FROM jobs"
+sqlite3 db.sqlite "SELECT name, estimated_cost, actual_cost FROM jobs"
 # Should show a plausible CHF figure (or whatever main_currency is set to)
 
-# Via API
-curl -k https://localhost:443/debug/status | jq '.total_cost, .budget_balance, .currency'
-
 # Cost report
-curl -k https://localhost:443/apis/cost.kube-shim.io/v1/report?from=2026-09-01&to=2026-09-30
-# CSV, one row per (project label, day), opens cleanly in a spreadsheet
+curl -k https://localhost:443/apis/cost.kube-shim.brawer.ch/v1/report?from=2026-09-01&to=2026-09-30 > report.csv
 
+# Real FOCUS compliance check (against the working v1.3.0.1 rule set,
+# until the v1.4 upstream bug above is fixed):
+pip install focus-validator
+focus-validator --data-file report.csv --validate-version 1.3.0.1
+# Should report zero failures
+```
+
+---
+
+### Phase 14b: Rolling Budget Guard + Top-Up + Mutable Settings (Days 14-15)
+**Goal:** Enforce a *rolling* budget guard on top of Phase 14a's real cost tracking, plus two real operational needs the original single-phase plan hadn't addressed: a way to manually add funds without waiting for the daily accrual, and a way to change budget settings without an SSH session + restart.
+
+**Deliverables:**
+- **Rolling budget guard**, replacing a flat daily cap:
+  - `budget_daily_rate` (e.g. CHF 2/day) accrues into a persisted balance continuously, capped at `budget_rollover_cap_days` (default 7 days) worth of accrual — so several quiet days build up enough headroom for one bigger job, without the balance growing unbounded if jobs never run.
+  - Before launching a job, its estimated cost (Phase 14a) must be ≤ the current balance. If not, the job enters a new `BudgetWait` state and is retried — immediately once the balance changes (via Phase 6's `Notify` wake-up), and on the fallback tick otherwise — not failed, until enough balance has accrued. This resolves Open Question 7's "hard stop vs. soft alert" in favor of a hard stop.
+  - The balance decrements by the job's *actual* cost once it completes (not the conservative estimate), so a job that finishes early returns its unused margin to the balance for the next one.
+- **Manual top-up**, `POST /apis/cost.kube-shim.brawer.ch/v1/budget/topup` with `{"amount": <value, in main_currency>}` — adds directly to the current balance. Deliberately a separate endpoint from settings below, not a field on them: a top-up is a one-time, auditable *action* (recorded as its own event, "BudgetToppedUp: +20, new balance 26"), not a durable *configuration* change, and conflating the two would lose the "when was manual money added, and how much" history that makes the rolling-balance math auditable.
+- **Mutable settings**, moved out of static `config.toml` into a DB-backed row so they're live-changeable without an SSH session + restart: `GET`/`PATCH /apis/cost.kube-shim.brawer.ch/v1/settings` for `budget_daily_rate`, `budget_rollover_cap_days`, `main_currency`. `config.toml`'s existing `[shim]` fields become first-run-only seed defaults (read once to populate the DB row if it doesn't exist yet, then ignored) — consistent with how `api_tokens` already bootstrap once from config rather than being re-read live.
+  - **A real wrinkle, worth getting right rather than glossing over:** changing `main_currency` via `PATCH` must actually *convert* the existing stored balance through the current day's ECB rate into the new currency, not silently reinterpret the same number under a new label (e.g. a balance of `100` doesn't mean the same thing as `100 CHF` once `main_currency` becomes `EUR`). The conversion itself is logged as an event for transparency, same as a top-up.
+  - Every settings change and top-up is recorded via the existing generic `record_event`-style mechanism (Phase 12), so `kubectl describe`-equivalent history shows exactly when/how the budget configuration or balance changed, not just its current value.
+- New `budget_state` table: a single row with `balance`, `last_accrual_at`, plus the three settings fields above (superseding the original plan's `budget_state`-holds-only-balance design, now that settings live in the DB too).
+
+**Files to create/modify:**
+- `src/api/budget.rs` (new) - `GET`/`PATCH /settings`, `POST /budget/topup`
+- `src/pricing/mod.rs` - budget accrual/enforcement logic, reusing Phase 14a's cost calculation
+- `src/reconcile/pricing.rs` - budget accrual tick + `BudgetWait` check, added to Phase 14a's sync loop
+- `src/db/schema.sql` - `budget_state` table (balance, accrual timestamp, settings fields)
+
+**Testing:**
+```bash
 # Rolling budget test:
 # Set budget_daily_rate=2, budget_rollover_cap_days=7 (in main_currency)
 # Let 3 days pass with zero jobs running (or fast-forward budget_state.last_accrual_at for testing)
@@ -848,6 +874,14 @@ curl -k https://localhost:443/apis/cost.kube-shim.io/v1/report?from=2026-09-01&t
 # Apply a job estimated at 5 -- should launch (balance covers it)
 # Apply a second job estimated at 5 in the same tick -- should enter BudgetWait
 #   (only ~1 left), then launch once enough balance has accrued
+
+# Top-up
+curl -k -X POST https://localhost:443/apis/cost.kube-shim.brawer.ch/v1/budget/topup -d '{"amount": 20}'
+# Balance increases by exactly 20; an event records the top-up
+
+# Settings change, including a currency change
+curl -k -X PATCH https://localhost:443/apis/cost.kube-shim.brawer.ch/v1/settings -d '{"main_currency": "EUR"}'
+# Balance is now the real ECB-converted equivalent, not the same raw number; an event records the conversion
 ```
 
 ---
@@ -860,7 +894,7 @@ curl -k https://localhost:443/apis/cost.kube-shim.io/v1/report?from=2026-09-01&t
 - `/` and a `/statusz` alias (nodding to the informal "zPages" debug-page tradition from gRPC/OpenCensus, not a literal Kubernetes API-server convention): single server-rendered HTML page, auto-refreshing (`<meta http-equiv="refresh">` or a few lines of polling JS), showing:
   - Recent events (Phase 12)
   - Currently running jobs ("nodes"/pods): name, job type, elapsed time, VM size
-  - Accumulated cost and current budget balance / rollover cap, in `main_currency` (Phase 14)
+  - Accumulated cost (Phase 14a) and current budget balance / rollover cap, in `main_currency` (Phase 14b)
 - `/healthz`, `/livez`, `/readyz`: standard, genuinely Kubernetes-API-server-defined health-check endpoints, unauthenticated by the same convention real clusters use (infra health checks — load balancers, monitoring — can't always present a token). `/livez` reflects whether the process itself is up; `/readyz` additionally reflects whether the reconciliation loop and DB are actually functioning; `/healthz` mirrors `/readyz`, kept for compatibility with tooling that only knows the older combined name.
 - `/metrics` (a Prometheus self-instrumentation endpoint) is explicitly *not* built in this phase — deferred to Phase 18, which also adds real worker-VM virtual-memory instrumentation. Not to be confused with the already-planned, authenticated `metrics.k8s.io` API (Phase 12), which reports job/pod resource usage for `kubectl top`, a different concern with a different audience.
 - An explicit allowlist of what's rendered on `/`/`/statusz` — job names, timestamps, event reasons/messages, cost figures. Secret values, S3 credentials, SSH details, and worker VM IPs must never appear here, since these routes have no authentication at all.
@@ -965,7 +999,7 @@ curl -k https://localhost:443/debug/status | jq '.total_cost, .budget_balance'
 
 1. **Shim self-instrumentation** (the original Phase 15 placeholder, finally built):
    - `/metrics`, unauthenticated, registered on the existing public GET-only sub-router (Phase 15) alongside `/healthz`/`/livez`/`/readyz` — same reasoning: infra scrapers can't always present a bearer token.
-   - Metrics: process uptime, reconciliation-tick count/duration, orphan-scan and metrics-poll loop last-run timestamp + success/failure counters, a `jobs_by_state` gauge (one series per `STATE_SEQUENCE` value, from a single `SELECT status, COUNT(*) FROM jobs GROUP BY status`), current budget balance (Phase 14, once it exists).
+   - Metrics: process uptime, reconciliation-tick count/duration, orphan-scan and metrics-poll loop last-run timestamp + success/failure counters, a `jobs_by_state` gauge (one series per `STATE_SEQUENCE` value, from a single `SELECT status, COUNT(*) FROM jobs GROUP BY status`), current budget balance (Phase 14b, once it exists).
    - Prometheus text exposition format. Hand-rolled vs. a crate (`prometheus`, `metrics` + `metrics-exporter-prometheus`) is a real decision for this phase to make, not pre-guessed here: the format itself is simple enough (`# HELP`/`# TYPE` comments + `name{labels} value` lines) that hand-rolling costs little and adds zero new dependencies, matching this project's existing preference (e.g. plain `chrono` over a heavier scheduling crate) — but a crate buys correctness/boilerplate for not many metrics either way, so this is worth a real look at both before picking.
 
 2. **Worker VM virtual-memory stats** — extends `reconcile::metrics_collector`'s existing combined SSH poll (the Phase 12 follow-up), not a second collection mechanism:
@@ -1030,9 +1064,10 @@ curl -k https://localhost:443/metrics | grep node_vmstat
 | `src/reconcile/*.rs` | State machine loop, `Notify`-based wake-up, `activeDeadlineSeconds` enforcement, event recording | Create (Phases 6, 8-12, 14) |
 | `src/providers/*.rs` | `CloudProvider` trait + UpCloud implementation, request timeout (Phase 11) | Create (Phases 7-9, 11, 14) |
 | `src/providers/upcloud/firewall.rs` | Firewall rules for worker VMs (create + list, both real since Phase 7; poll-until-applied logic itself is Phase 9) | Create (Phase 7) |
-| `src/currency.rs` | ECB daily exchange-rate sync + conversion to `main_currency` | Create (Phase 14) |
-| `src/pricing/*.rs` | Cost tracking + rolling budget guard, in `main_currency` | Create (Phase 14) |
-| `src/api/cost_report.rs` | CSV cost report, grouped by job label | Create (Phase 14) |
+| `src/currency.rs` | ECB daily exchange-rate sync + conversion to `main_currency` | Create (Phase 14a) |
+| `src/pricing/*.rs` | Cost tracking (Phase 14a) + rolling budget guard (Phase 14b), in `main_currency` | Create (Phases 14a-b) |
+| `src/api/cost_report.rs` | FOCUS-compliant CSV cost report, grouped by job label | Create (Phase 14a) |
+| `src/api/budget.rs` | Budget settings (`GET`/`PATCH`) + manual top-up (`POST`) | Create (Phase 14b) |
 | `src/ssh.rs` | SSH client built on `russh` (`exec_once`/`exec_stream`), no host-key verification (by design); connect/inactivity timeouts (Phase 11) | Create (Phase 10); Phase 11 |
 | `src/api/logs.rs` | `kubectl logs`/`-f`: live SSH while `ContainerRunning`, `jobs.cached_logs` fallback otherwise | Create (Phase 10) |
 | `src/api/events.rs` | `kubectl describe pod`'s Events table: lists `events`, joined against `jobs`, with real `fieldSelector` support | Create (Phase 12) |
@@ -1075,7 +1110,7 @@ russh = "0.45"
 rustls-acme = "0.15"      # Phase 4 (shipped): ACME issuance/renewal against axum-server's rustls stack -- default-features disabled, "ring" re-enabled explicitly to match tls.rs's own provider choice
 tokio-stream = "0.1"      # Phase 4 (shipped): drives rustls-acme's event stream
 cron = "0.17"             # Phase 6 (shipped): parses CronJob schedules to trigger job runs
-quick-xml = "0.36"        # Phase 14: parsing the ECB's daily exchange-rate feed
+quick-xml = "0.36"        # Phase 14a: parsing the ECB's daily exchange-rate feed
 ```
 No dedicated cloud-provider crate: UpCloud has no official Rust SDK, so `src/providers/upcloud/` is a hand-rolled REST client on `reqwest` (Phase 7) rather than an `hcloud`-style dependency.
 
@@ -1098,7 +1133,7 @@ Each state has:
 - Timeout (how long before failing?)
 - Retry logic (backoff on failure)
 
-A job passes through `BudgetWait` before `VolumePending` if its estimated cost exceeds the current rolling budget balance (Phase 14); it's woken immediately when the balance changes (Phase 6's `Notify`), or retried on the fallback tick otherwise, rather than failed.
+A job passes through `BudgetWait` before `VolumePending` if its estimated cost exceeds the current rolling budget balance (Phase 14b); it's woken immediately when the balance changes (Phase 6's `Notify`), or retried on the fallback tick otherwise, rather than failed.
 
 `FirewallApplying → FirewallVerified`, `VMCreating → VMRunning`, and `ContainerRunning → Succeeded`/`Failed` are all explicit poll-until-true steps, not assumed-synchronous transitions. The first two poll UpCloud's own API (Phase 7: firewall-rule-apply and server-create calls both return before the underlying state is actually true). The third polls the worker over SSH for `/tmp/exit-code` (Phase 10) — cloud-init writes it as the very last thing it does, and the shim fetches the real exit code plus the full container logs (cached to `jobs.cached_logs`, since the worker is deleted a few states later) the moment it appears. A resource that never reaches its target state no longer polls forever: Phase 11 added a uniform 5-minute stuck-in-this-state timeout covering every polling state (and every one-shot state, same gap Phase 8 left there) via a single check in `advance_all`, rather than three separately-tracked per-resource-type timeouts.
 
@@ -1128,7 +1163,7 @@ All cloud calls go through a `CloudProvider` trait (Phase 7) — `create_volume`
 - Resource naming (`resource_prefix`-based, Phase 16) for identification and cleanup
 
 ### Rolling Budget Model
-A token bucket, not a fixed daily reset: `balance` (in `main_currency`) increases by `budget_daily_rate` for every day (fractionally, per reconciliation tick) that passes, capped at `budget_daily_rate × budget_rollover_cap_days`. Spending decrements the balance; a job that would exceed it waits in `BudgetWait` instead of being launched. Example: at CHF 2/day with a 7-day cap, 3 idle days accrue CHF 6 of balance — enough for one job estimated at CHF 5, even though no single day's rate alone would cover it. The underlying provider cost is always computed in EUR (UpCloud's own billing currency) and converted via the ECB's daily reference rate (Phase 14) before being compared against or subtracted from the balance.
+A token bucket, not a fixed daily reset: `balance` (in `main_currency`) increases by `budget_daily_rate` for every day (fractionally, per reconciliation tick) that passes, capped at `budget_daily_rate × budget_rollover_cap_days`. Spending decrements the balance; a job that would exceed it waits in `BudgetWait` instead of being launched. Example: at CHF 2/day with a 7-day cap, 3 idle days accrue CHF 6 of balance — enough for one job estimated at CHF 5, even though no single day's rate alone would cover it. The underlying provider cost is always computed in EUR (UpCloud's own billing currency) and converted via the ECB's daily reference rate (Phase 14a) before being compared against or subtracted from the balance.
 
 ### Deployment Model
 The shim ships as a `FROM scratch` OCI image (Phase 3): a statically-linked musl binary with embedded TLS roots and no external process dependencies (SSH goes through `russh`, not a subprocess), run rootless via a podman quadlet unit. Persistent state (`db.sqlite`, TLS certs — including the ACME account key and issued certificate, Phase 4 — and `config.toml`) lives on a host bind mount, so a container restart — whether from a crash or an update — never loses job/volume/VM/budget state, and any in-flight job's worker VM is unaffected since it runs independently on the cloud provider. The `kube-shim.brawer.ch` instance updates itself unattended via `podman-auto-update.timer` tracking `:latest` (see Phase 3), a deliberate trade of update-safety for development-loop speed, bounded by UpCloud's prepaid no-auto-recharge billing; a deployment without that backstop should pin a `vX.Y.Z` tag instead and update manually.
@@ -1157,7 +1192,8 @@ The shim ships as a `FROM scratch` OCI image (Phase 3): a statically-linked musl
 - Phase 11: idempotency-reuse and deadline/stuck-state force-fail all verified against mock UpCloud servers exercising the real response shapes (8 dedicated tests); real hands-on chaos/deadline verification against live UpCloud deferred to the post-merge deploy-and-verify step against `kube-shim.brawer.ch`, same as every other phase's live check — see that phase's own section for the result
 - Phase 12: verified against a real `kubectl` v1.37 client, not just mocks — `kubectl describe pod` shows the full, correctly-ordered Events table with working Age; `kubectl top pods` and `kubectl top nodes` both show correct, capacity-relative CPU/memory (one Node/NodeMetrics entry per currently-allocated worker VM, matched by name)
 - Phase 13: `kubectl create -f` (or `kubectl run --restart=Never`) a standalone `batch/v1` Job runs end-to-end through the exact same reconciliation/VM-provisioning/cleanup path a CronJob-spawned run already does, with no `cronjob_name`; rejected with the same admission errors (missing `activeDeadlineSeconds`, unknown `storageClassName`) a CronJob submission already gets; `kubectl get jobs`/`kubectl describe job` show real status; deleting a still-running one tears down its worker VM/volume the same way a force-failed CronJob run already does
-- Phase 14: costs calculated per job and per family in `main_currency`; a job whose estimate exceeds the budget balance waits in `BudgetWait` and launches once enough has accrued; a job that finishes early returns its unused margin to the balance; the CSV cost report groups correctly by label
+- Phase 14a: costs calculated per job and per family in `main_currency`; the CSV cost report groups correctly by label and passes `focus-validator` for every Mandatory column it populates
+- Phase 14b: a job whose estimate exceeds the budget balance waits in `BudgetWait` and launches once enough has accrued; a job that finishes early returns its unused margin to the balance; a manual top-up and a settings change (including a currency change) both take effect immediately and are recorded as events
 - Phase 15: status page and `/healthz`/`/livez`/`/readyz` reachable with no auth on `:443` (same listener/cert as the authenticated API), show events/jobs/cost, never leak secrets, reject all non-GET requests, and don't widen the authenticated API's own auth requirement
 - Phase 16: all resources named with the configured `resource_prefix`, cleanup script works, two instances with different prefixes don't interfere with each other's orphan scans
 - Phase 17: real osmdiffs job and at least one other cronjob complete successfully, concurrently at least once, cost accurate
@@ -1200,7 +1236,7 @@ All questions below are resolved or deliberately deferred — none block startin
 
 6. **Volume model — reclaim policy vs. tier**: resolved, and revised from the original plan. Implementing full standard Kubernetes dynamic provisioning (a real `StorageClass` + `PersistentVolume` resource pair, with a Retain option) would be meaningfully more work for no practical benefit at this scale and for workloads that are, in practice, always genuinely ephemeral — so the shim uses real Kubernetes **generic ephemeral volumes** (inline in the pod template) instead of standalone PVCs, and repurposes the PVC's `spec.storageClassName` field to select a *performance tier* (`kube-shim-standard`/`kube-shim-fast`) rather than a reclaim policy, since nothing is ever retained across runs at all. See Phase 5 and "Generic Ephemeral Volumes / Storage Tiers" under Key Implementation Details. Standalone `PersistentVolumeClaim` support for data that genuinely needs to survive across runs is deferred — see "Future Work."
 
-7. **Concurrency guard scope**: resolved — dropped entirely, no separate `max_concurrent_jobs`. The rolling budget guard (Phase 14) is the only limiter: at the budget levels this project runs at, it already prevents more than one job's worth of concurrent spend in practice, so a second, separate job-count cap would just be redundant bookkeeping.
+7. **Concurrency guard scope**: resolved — dropped entirely, no separate `max_concurrent_jobs`. The rolling budget guard (Phase 14b) is the only limiter: at the budget levels this project runs at, it already prevents more than one job's worth of concurrent spend in practice, so a second, separate job-count cap would just be redundant bookkeeping.
 
 8. **Worker VM networking**: resolved for the initial scope. Every worker VM is unreachable from the internet inbound (UpCloud firewall rules permit nothing but SSH from the shim's own VPS IP, verified applied before any container starts — see Phase 9) while remaining free to reach the internet outbound for downloading input data and uploading results. Exposing any of this *inbound*, e.g. running the shim itself as a configurable reverse proxy driven by a Kubernetes `Ingress` resource, is explicitly out of scope for a long time — see "Future Work: Ingress Proxy" below.
 
@@ -1294,7 +1330,8 @@ Way out of scope — not sketched in any detail here, just a placeholder so the 
 - **Phase 10-11** (log streaming + hardening/deadline enforcement): 2 days
 - **Phase 12** (events/metrics APIs): 2 days — done
 - **Phase 13** (standalone `batch/v1` Jobs): 1 day — added after a real need surfaced (testing a workload version/release before it becomes a scheduled CronJob); not in the original estimate below
-- **Phase 14** (pricing/rolling budget guard/cost report/currency conversion): 2-3 days
+- **Phase 14a** (pricing/cost tracking/FOCUS-compliant cost report/currency conversion): 1-2 days
+- **Phase 14b** (rolling budget guard/top-up/mutable settings): 1 day
 - **Phase 15** (public status page): 1 day
 - **Phase 16** (naming + cleanup): 1 day
 - **Phase 17** (multi-job real-workload testing): 2 days
