@@ -8,6 +8,7 @@
 pub mod job;
 pub mod metrics_collector;
 pub mod orphan_scan;
+pub mod pricing;
 pub mod schedule;
 pub mod startup;
 
@@ -46,6 +47,12 @@ const ORPHAN_SCAN_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// arbitrarily.
 const METRICS_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How often `reconcile::pricing` re-syncs UpCloud's real pricing
+/// catalog and the ECB's daily reference rates (Phase 14a) -- both
+/// genuinely only change at most once a day at the source, so a daily
+/// cadence matches reality rather than polling needlessly often.
+const PRICING_SYNC_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Runs forever, driving the reconciliation loop: one pass immediately,
 /// then one every time either the fallback interval elapses or `notify`
 /// fires, whichever comes first. Callers wake it immediately by calling
@@ -72,6 +79,11 @@ pub async fn run(pool: SqlitePool, notify: Arc<Notify>, ctx: JobContext) {
         pool.clone(),
         ctx.clone(),
         METRICS_POLL_INTERVAL,
+    ));
+    tokio::spawn(run_pricing_sync_loop(
+        pool.clone(),
+        ctx.clone(),
+        PRICING_SYNC_INTERVAL,
     ));
     run_with_interval(pool, notify, FALLBACK_INTERVAL, ctx).await
 }
@@ -114,6 +126,22 @@ async fn run_metrics_poll_loop(pool: SqlitePool, ctx: JobContext, interval_durat
         match metrics_collector::poll_once(&pool, &ssh_config).await {
             Ok(_) => {}
             Err(err) => tracing::error!("metrics poll failed: {err:?}"),
+        }
+    }
+}
+
+/// Same shape as `run_orphan_scan_loop`: one pass immediately (so a
+/// freshly-started shim has real pricing to estimate the very first
+/// job's cost against, not an empty cache for up to a day), then one
+/// every `interval_duration` thereafter.
+async fn run_pricing_sync_loop(pool: SqlitePool, ctx: JobContext, interval_duration: Duration) {
+    let mut interval = tokio::time::interval(interval_duration);
+
+    loop {
+        interval.tick().await;
+
+        if let Err(err) = pricing::sync_pricing_and_rates(&pool, &ctx).await {
+            tracing::error!("pricing/exchange-rate sync failed: {err:?}");
         }
     }
 }
@@ -171,6 +199,7 @@ mod tests {
             own_public_ip: None,
             worker_ssh_private_key: String::new(),
             worker_ssh_port: crate::ssh::SSH_PORT,
+            main_currency: "EUR".to_string(),
         }
     }
 
@@ -289,6 +318,7 @@ mod tests {
             own_public_ip: None,
             worker_ssh_private_key: String::new(),
             worker_ssh_port: crate::ssh::SSH_PORT,
+            main_currency: "EUR".to_string(),
         };
 
         // A short interval stands in for ORPHAN_SCAN_INTERVAL here --

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use kube_shim::providers::upcloud::UpCloudProvider;
 use kube_shim::reconcile::JobContext;
-use kube_shim::{acme, app, config, db, metadata, reconcile, ssh, tls};
+use kube_shim::{acme, api, app, config, db, metadata, reconcile, ssh, tls};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -81,6 +81,7 @@ async fn main() -> Result<()> {
         own_public_ip,
         worker_ssh_private_key: cfg.upcloud.worker_ssh_private_key.clone(),
         worker_ssh_port: ssh::SSH_PORT,
+        main_currency: cfg.shim.main_currency.clone(),
     };
     tokio::spawn(reconcile::run(pool.clone(), notify.clone(), job_context));
 
@@ -92,11 +93,17 @@ async fn main() -> Result<()> {
         private_key: cfg.upcloud.worker_ssh_private_key.clone(),
         port: ssh::SSH_PORT,
     });
+    let cost_report_config = Arc::new(api::cost_report::CostReportConfig {
+        resource_prefix: cfg.shim.resource_prefix.clone(),
+        zone: cfg.upcloud.zone.clone(),
+        main_currency: cfg.shim.main_currency.clone(),
+    });
     let router = app::build_router(
         pool,
         Arc::new(cfg.server.api_tokens.clone()),
         notify,
         worker_ssh,
+        cost_report_config,
     );
 
     let addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port)

@@ -27,7 +27,22 @@ use sqlx::{Row, SqlitePool};
 /// still works once the worker VM itself is gone (`VMTerminating`
 /// deletes it a few states later), the same way a real Kubernetes pod's
 /// logs remain fetchable for a while after the pod exits.
-const ADDED_COLUMNS: &[(&str, &str, &str)] = &[("jobs", "cached_logs", "TEXT")];
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    ("jobs", "cached_logs", "TEXT"),
+    // Phase 14a: a job's worst-case cost (computed once, at creation,
+    // from its activeDeadlineSeconds) and its real cost (computed once
+    // real completion is detected), both in `main_currency`. Nullable:
+    // either can be unset if pricing/exchange-rate caches weren't
+    // synced yet when they were needed -- see `pricing::` module docs.
+    ("jobs", "estimated_cost", "REAL"),
+    ("jobs", "actual_cost", "REAL"),
+    // The real moment completion was detected -- distinct from
+    // `updated_at` (bumped again by every later cleanup-tail
+    // transition) -- so `api::cost_report` (Phase 14a) has an accurate
+    // `ChargePeriodEnd`, not an approximation from a column that keeps
+    // moving after the job itself actually finished.
+    ("jobs", "completed_at", "INTEGER"),
+];
 
 pub async fn run(pool: &SqlitePool) -> Result<()> {
     apply_added_columns(pool, ADDED_COLUMNS).await

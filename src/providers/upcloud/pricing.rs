@@ -4,8 +4,14 @@
 //! only ever extracts the one `(zone, price_key)` entry a caller actually
 //! asked for, not the whole catalog. See `PriceEntry`'s own docs for why
 //! the return type stays a raw passthrough rather than a typed cost
-//! model -- that's Phase 13's job, once currency conversion exists to
+//! model -- that's Phase 14a's job, once currency conversion exists to
 //! design it for.
+//!
+//! The response's top-level `prices.currency` field (verified hands-on
+//! against the live account: `"EUR"`) is the account's own *real*
+//! billing currency -- not a fixed UpCloud-wide constant, since UpCloud
+//! bills other accounts in `USD`. Phase 14a threads this straight
+//! through to `PriceEntry::currency` rather than assuming anything.
 
 use super::UpCloudProvider;
 use crate::providers::{PriceEntry, ProviderError};
@@ -20,6 +26,7 @@ struct PriceListEnvelope {
 
 #[derive(Deserialize)]
 struct PriceList {
+    currency: String,
     zone: Vec<ZonePrices>,
 }
 
@@ -45,6 +52,7 @@ pub(super) async fn get_pricing(
         .send_json(provider.request(Method::GET, "/price"))
         .await?;
 
+    let currency = response.prices.currency;
     let zone_prices = response
         .prices
         .zone
@@ -61,6 +69,7 @@ pub(super) async fn get_pricing(
     Ok(PriceEntry {
         amount: entry.amount,
         price: entry.price,
+        currency,
     })
 }
 
@@ -74,6 +83,7 @@ mod tests {
     fn sample_price_response() -> serde_json::Value {
         json!({
             "prices": {
+                "currency": "EUR",
                 "zone": [
                     {
                         "name": "de-fra1",
@@ -104,6 +114,34 @@ mod tests {
 
         assert_eq!(entry.amount, 1.0);
         assert_eq!(entry.price, 0.4464);
+        assert_eq!(entry.currency, "EUR");
+    }
+
+    #[tokio::test]
+    async fn test_get_pricing_captures_a_non_eur_currency() {
+        // UpCloud bills some accounts in USD, not just EUR -- this must
+        // come from the real response, not a hardcoded assumption.
+        let app = axum::Router::new().route(
+            "/1.3/price",
+            get(move || async move {
+                Json(json!({
+                    "prices": {
+                        "currency": "USD",
+                        "zone": [{
+                            "name": "us-chi1",
+                            "server_plan_DEV-1xCPU-1GB-10GB": {"amount": 1, "price": 0.5}
+                        }]
+                    }
+                }))
+            }),
+        );
+        let provider = mock_server(app).await;
+
+        let entry = provider
+            .get_pricing("us-chi1", "server_plan_DEV-1xCPU-1GB-10GB")
+            .await
+            .unwrap();
+        assert_eq!(entry.currency, "USD");
     }
 
     #[tokio::test]

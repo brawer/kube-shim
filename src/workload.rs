@@ -73,6 +73,14 @@ const SERVER_PLANS: &[ServerPlan] = &[
     },
 ];
 
+/// Every known server plan -- `pub(crate)` so `reconcile::pricing`
+/// (Phase 14a) can sync real pricing for each one ahead of time (daily,
+/// into `provider_pricing`) rather than hitting the live pricing API
+/// once per job.
+pub(crate) fn all_server_plans() -> &'static [ServerPlan] {
+    SERVER_PLANS
+}
+
 /// The cheapest plan (by cores, then memory) that meets or exceeds both
 /// requested amounts, or `None` if nothing in the table is big enough --
 /// callers decide what "no plan fits" means for them (Phase 9 would

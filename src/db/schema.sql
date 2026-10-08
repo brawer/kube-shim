@@ -102,6 +102,36 @@ CREATE TABLE IF NOT EXISTS hetzner_pricing (
     last_updated INTEGER NOT NULL
 );
 
+-- Real UpCloud pricing (Phase 14a), synced daily from `GET /1.3/price`
+-- -- one row per (zone, price_key) this project actually needs
+-- (`workload::all_server_plans()` + both `volumes::StorageTier`s), not
+-- the whole catalog. `currency` is the account's own real billing
+-- currency, read from the response itself (`providers::PriceEntry`'s
+-- own docs) -- never hardcoded, since UpCloud bills some accounts in
+-- USD, not just EUR.
+CREATE TABLE IF NOT EXISTS provider_pricing (
+    zone TEXT NOT NULL,
+    price_key TEXT NOT NULL,
+    amount REAL NOT NULL,
+    price REAL NOT NULL,
+    currency TEXT NOT NULL,
+    fetched_at INTEGER NOT NULL,
+    PRIMARY KEY (zone, price_key)
+);
+
+-- The ECB's daily reference rates (Phase 14a), EUR-anchored (every row
+-- is "1 EUR = `rate` `currency`") -- see src/currency.rs's own docs for
+-- why converting between two non-EUR currencies pivots through EUR
+-- rather than looking up a direct rate this feed never provides.
+-- Replaced wholesale on every sync (src/currency.rs::store_rates), not
+-- accumulated -- the ECB publishes one complete daily snapshot, not an
+-- incremental diff.
+CREATE TABLE IF NOT EXISTS exchange_rates (
+    currency TEXT PRIMARY KEY,
+    rate REAL NOT NULL,
+    fetched_at INTEGER NOT NULL
+);
+
 -- Indices for common queries
 CREATE INDEX IF NOT EXISTS idx_secrets_namespace ON secrets(namespace);
 CREATE INDEX IF NOT EXISTS idx_cronjobs_namespace ON cronjobs(namespace);

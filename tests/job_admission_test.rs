@@ -28,6 +28,11 @@ async fn test_router() -> axum::Router {
             private_key: String::new(),
             port: kube_shim::ssh::SSH_PORT,
         }),
+        Arc::new(kube_shim::api::cost_report::CostReportConfig {
+            resource_prefix: "kube-shim-test".to_string(),
+            zone: "de-fra1".to_string(),
+            main_currency: "EUR".to_string(),
+        }),
     )
 }
 

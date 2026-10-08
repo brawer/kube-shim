@@ -35,6 +35,11 @@ async fn start_server(api_tokens: Vec<ApiToken>) -> String {
             private_key: String::new(),
             port: kube_shim::ssh::SSH_PORT,
         }),
+        Arc::new(kube_shim::api::cost_report::CostReportConfig {
+            resource_prefix: "kube-shim-test".to_string(),
+            zone: "de-fra1".to_string(),
+            main_currency: "EUR".to_string(),
+        }),
     );
 
     let std_listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
