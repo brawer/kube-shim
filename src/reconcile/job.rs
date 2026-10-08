@@ -2335,8 +2335,12 @@ mod tests {
                 .unwrap();
         // Real elapsed duration was ~1 hour -- same cost as the 1-hour
         // estimate test above, computed from real wall-clock time now,
-        // not the (here, absent) activeDeadlineSeconds.
-        assert!((actual_cost.unwrap() - 0.004464).abs() < 1e-6);
+        // not the (here, absent) activeDeadlineSeconds. The tolerance is
+        // wide enough to absorb the real seconds that pass between
+        // `one_hour_ago` being computed above and `advance_all` calling
+        // `Utc::now()` again internally (observed to exceed 1s on a
+        // loaded CI runner) without masking an actually-wrong result.
+        assert!((actual_cost.unwrap() - 0.004464).abs() < 0.0005);
     }
 
     #[tokio::test]
