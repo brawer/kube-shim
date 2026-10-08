@@ -22,14 +22,21 @@
 //! shape follows: (1) `focus-validator`'s own v1.4 rule set currently
 //! fails to even load -- a circular dependency between
 //! `CommitmentDiscountQuantity`/`CommitmentDiscountUnit` rules,
-//! independent of any input content, already filed upstream at
-//! <https://github.com/FinOps-Open-Cost-and-Usage-Spec/FOCUS_Spec/pull/2609>
-//! -- so this is validated against the older, working `v1.3.0.1` rule
-//! set instead (tracked on our own side at
+//! independent of any input content. The *spec repo's* rule model
+//! already fixed this
+//! (<https://github.com/FinOps-Open-Cost-and-Usage-Spec/FOCUS_Spec/pull/2609>,
+//! merged 2026-09-08), but `focus-validator` is a separate PyPI
+//! package that bundles its own vendored copy of the rule JSON --
+//! its latest release (2.2.1, published 2026-08-05, before that fix)
+//! still crashes identically on `--validate-version 1.4` (confirmed
+//! hands-on, not assumed from the merged PR alone). So this is
+//! validated against the older, working `v1.3.0.1` rule set instead
+//! (tracked on our own side at
 //! <https://github.com/brawer/kube-shim/issues/62>, to re-run a real
-//! `v1.4` pass once the upstream fix ships); (2) the validator expects
-//! *every* column FOCUS v1.4 defines for the Cost and Usage dataset to
-//! be present in the header -- genuinely null for whichever ones don't
+//! `v1.4` pass once a `focus-validator` release actually picks up the
+//! fix); (2) the validator expects *every* column FOCUS v1.4 defines
+//! for the Cost and Usage dataset to be present in the header --
+//! genuinely null for whichever ones don't
 //! apply, not a sparse subset -- confirmed by running the real tool
 //! against real generated output, not assumed from a schema reading.
 
