@@ -196,6 +196,8 @@ mod tests {
                 resource_prefix: "kube-shim-test".to_string(),
                 zone: "de-fra1".to_string(),
                 main_currency: "EUR".to_string(),
+                provider_name: "UpCloud".to_string(),
+                invoice_issuer_name: "UpCloud Ltd".to_string(),
             }),
         )
     }

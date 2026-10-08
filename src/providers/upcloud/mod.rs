@@ -124,6 +124,14 @@ fn error_for_status(status: StatusCode, body: String) -> ProviderError {
 
 #[async_trait]
 impl CloudProvider for UpCloudProvider {
+    fn provider_name(&self) -> &str {
+        "UpCloud"
+    }
+
+    fn invoice_issuer_name(&self) -> &str {
+        "UpCloud Ltd"
+    }
+
     async fn create_volume(&self, req: CreateVolumeRequest) -> Result<Volume, ProviderError> {
         volumes::create_volume(self, req).await
     }
@@ -209,5 +217,13 @@ pub(crate) mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         UpCloudProvider::with_base_url("mock-token", format!("http://{addr}/1.3"))
+    }
+
+    #[test]
+    fn test_provider_name_and_invoice_issuer_name() {
+        use crate::providers::CloudProvider;
+        let provider = UpCloudProvider::new("unused-token".to_string());
+        assert_eq!(provider.provider_name(), "UpCloud");
+        assert_eq!(provider.invoice_issuer_name(), "UpCloud Ltd");
     }
 }

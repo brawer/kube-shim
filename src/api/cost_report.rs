@@ -20,11 +20,16 @@
 //! See docs/IMPLEMENTATION_PLAN.md Phase 14a for the full research
 //! writeup, including the other two real findings this module's own
 //! shape follows: (1) `focus-validator`'s own v1.4 rule set currently
-//! fails to even load (an already-filed upstream bug, independent of
-//! any CSV content), so this is validated against the older, working
-//! `v1.3.0.1` rule set instead; (2) the validator expects *every*
-//! column FOCUS v1.4 defines for the Cost and Usage dataset to be
-//! present in the header -- genuinely null for whichever ones don't
+//! fails to even load -- a circular dependency between
+//! `CommitmentDiscountQuantity`/`CommitmentDiscountUnit` rules,
+//! independent of any input content, already filed upstream at
+//! <https://github.com/FinOps-Open-Cost-and-Usage-Spec/FOCUS_Spec/pull/2609>
+//! -- so this is validated against the older, working `v1.3.0.1` rule
+//! set instead (tracked on our own side at
+//! <https://github.com/brawer/kube-shim/issues/62>, to re-run a real
+//! `v1.4` pass once the upstream fix ships); (2) the validator expects
+//! *every* column FOCUS v1.4 defines for the Cost and Usage dataset to
+//! be present in the header -- genuinely null for whichever ones don't
 //! apply, not a sparse subset -- confirmed by running the real tool
 //! against real generated output, not assumed from a schema reading.
 
@@ -50,6 +55,16 @@ pub struct CostReportConfig {
     pub resource_prefix: String,
     pub zone: String,
     pub main_currency: String,
+    /// From `CloudProvider::provider_name()` -- `HostProviderName`/
+    /// `ServiceProviderName` come from the actual provider
+    /// implementation rather than a hardcoded `"UpCloud"` literal
+    /// here, so a future second provider doesn't require editing this
+    /// module at all.
+    pub provider_name: String,
+    /// From `CloudProvider::invoice_issuer_name()` -- see that
+    /// method's own docs for why it's kept separate from
+    /// `provider_name`.
+    pub invoice_issuer_name: String,
 }
 
 /// Every column FOCUS v1.4 defines for the Cost and Usage dataset, in
@@ -207,10 +222,13 @@ fn csv_field(value: &str) -> String {
     }
 }
 
-/// UpCloud's own prices are quoted to 4 decimal places; matching that
-/// precision rather than Rust's default float formatting (which can
-/// print long tails for an inexact value) keeps the report's own
-/// numbers looking like real currency amounts.
+/// 6 decimal places, not UpCloud's own 4 -- a single hour of this
+/// project's cheapest real plan already costs a provider-currency
+/// amount like `0.004464` (0.4464 cents/hour), which 4 decimal places
+/// would round to `0.0045`, a ~0.8% error that then compounds across
+/// every aggregation. 6 places keeps that real precision while still
+/// avoiding Rust's default float formatting's long, non-currency-like
+/// tails for an inexact value.
 fn format_decimal(value: f64) -> String {
     format!("{value:.6}")
 }
@@ -288,8 +306,8 @@ async fn charge_row(
     fields.insert("ContractedCost", billed_cost.clone());
     fields.insert("ContractedUnitPrice", unit_price.clone());
     fields.insert("EffectiveCost", billed_cost.clone());
-    fields.insert("HostProviderName", "UpCloud".to_string());
-    fields.insert("InvoiceIssuerName", "UpCloud Ltd".to_string());
+    fields.insert("HostProviderName", config.provider_name.clone());
+    fields.insert("InvoiceIssuerName", config.invoice_issuer_name.clone());
     fields.insert("ListCost", billed_cost.clone());
     fields.insert("ListUnitPrice", unit_price.clone());
     fields.insert("PricingCategory", charge.pricing_category.to_string());
@@ -308,10 +326,32 @@ async fn charge_row(
     );
     fields.insert("PricingQuantity", quantity);
     fields.insert("PricingUnit", charge.unit.to_string());
-    fields.insert("ServiceCategory", "Compute".to_string());
-    fields.insert("ServiceName", "UpCloud Server".to_string());
-    fields.insert("ServiceProviderName", "UpCloud".to_string());
-    fields.insert("ServiceSubcategory", "Virtual Machines".to_string());
+    // Real FOCUS enum values (verified against the spec's own "Allowed
+    // Values" table for both ServiceCategory and ServiceSubcategory) --
+    // a volume charge is genuinely "Storage"/"Block Storage", not
+    // "Compute"/"Virtual Machines" like its job's VM charge.
+    fields.insert(
+        "ServiceCategory",
+        if is_volume { "Storage" } else { "Compute" }.to_string(),
+    );
+    fields.insert(
+        "ServiceName",
+        format!(
+            "{} {}",
+            config.provider_name,
+            if is_volume { "Storage" } else { "Server" }
+        ),
+    );
+    fields.insert("ServiceProviderName", config.provider_name.clone());
+    fields.insert(
+        "ServiceSubcategory",
+        if is_volume {
+            "Block Storage"
+        } else {
+            "Virtual Machines"
+        }
+        .to_string(),
+    );
     fields.insert("SkuId", charge.sku_id.clone());
     fields.insert(
         "SkuMeter",
@@ -425,6 +465,8 @@ mod tests {
                 resource_prefix: "kube-shim-test".to_string(),
                 zone: "de-fra1".to_string(),
                 main_currency: "EUR".to_string(),
+                provider_name: "UpCloud".to_string(),
+                invoice_issuer_name: "UpCloud Ltd".to_string(),
             })))
             .with_state(pool)
     }
@@ -548,6 +590,14 @@ mod tests {
         assert_eq!(col("PricingCategory"), "Standard");
         assert_eq!(col("PricingCurrency"), "EUR");
         assert_eq!(col("PricingCurrencyEffectiveCost"), "0.004464");
+        // Sourced from CostReportConfig (ultimately CloudProvider::
+        // provider_name()/invoice_issuer_name()), not a literal in this
+        // module.
+        assert_eq!(col("HostProviderName"), "UpCloud");
+        assert_eq!(col("ServiceProviderName"), "UpCloud");
+        assert_eq!(col("InvoiceIssuerName"), "UpCloud Ltd");
+        assert_eq!(col("ServiceCategory"), "Compute");
+        assert_eq!(col("ServiceSubcategory"), "Virtual Machines");
     }
 
     #[tokio::test]
@@ -582,6 +632,27 @@ mod tests {
             .map(|line| line.split(',').nth(sku_id_idx).unwrap())
             .collect();
         assert_eq!(sku_ids, vec!["DEV-1xCPU-1GB-10GB", "standard-10GB"]);
+
+        // The volume charge is genuinely "Storage"/"Block Storage", not
+        // "Compute"/"Virtual Machines" like its job's VM charge.
+        let category_idx = COLUMNS
+            .iter()
+            .position(|c| *c == "ServiceCategory")
+            .unwrap();
+        let subcategory_idx = COLUMNS
+            .iter()
+            .position(|c| *c == "ServiceSubcategory")
+            .unwrap();
+        let categories: Vec<&str> = lines[1..]
+            .iter()
+            .map(|line| line.split(',').nth(category_idx).unwrap())
+            .collect();
+        let subcategories: Vec<&str> = lines[1..]
+            .iter()
+            .map(|line| line.split(',').nth(subcategory_idx).unwrap())
+            .collect();
+        assert_eq!(categories, vec!["Compute", "Storage"]);
+        assert_eq!(subcategories, vec!["Virtual Machines", "Block Storage"]);
     }
 
     #[tokio::test]

@@ -164,6 +164,19 @@ pub struct PriceEntry {
 
 #[async_trait]
 pub trait CloudProvider: Send + Sync {
+    /// The provider's own display/brand name (e.g. `"UpCloud"`) --
+    /// used wherever FOCUS wants to know which cloud actually
+    /// hosts/provides the resource (`HostProviderName`,
+    /// `ServiceProviderName` in `api::cost_report`), so a future
+    /// second provider doesn't require editing that module at all.
+    fn provider_name(&self) -> &str;
+    /// The legal entity that actually issues invoices for this
+    /// provider (e.g. `"UpCloud Ltd"`) -- kept separate from
+    /// `provider_name` since it can genuinely differ (a reseller, or
+    /// a brand name vs. the registered company name); used for
+    /// `InvoiceIssuerName`.
+    fn invoice_issuer_name(&self) -> &str;
+
     async fn create_volume(&self, req: CreateVolumeRequest) -> Result<Volume, ProviderError>;
     async fn delete_volume(&self, volume_id: &str) -> Result<(), ProviderError>;
     /// Every volume that currently exists in `zone` -- not filtered by

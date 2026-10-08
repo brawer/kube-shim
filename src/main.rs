@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use kube_shim::providers::upcloud::UpCloudProvider;
+use kube_shim::providers::CloudProvider;
 use kube_shim::reconcile::JobContext;
 use kube_shim::{acme, api, app, config, db, metadata, reconcile, ssh, tls};
 use std::net::SocketAddr;
@@ -46,6 +47,12 @@ async fn main() -> Result<()> {
     // crash-loop that instance on its next auto-update for no operational
     // reason.
     let upcloud = Arc::new(UpCloudProvider::new(cfg.upcloud.token.clone()));
+    // Grabbed before `upcloud` moves into `job_context` below -- these
+    // feed `CostReportConfig` (Phase 14a) so the cost report's own
+    // provider-name fields come from the actual provider
+    // implementation, not a hardcoded literal.
+    let provider_name = upcloud.provider_name().to_string();
+    let invoice_issuer_name = upcloud.invoice_issuer_name().to_string();
     match upcloud.check_connectivity().await {
         Ok(()) => tracing::info!("UpCloud connectivity check succeeded"),
         Err(err) => tracing::warn!("UpCloud connectivity check failed (continuing anyway): {err}"),
@@ -115,6 +122,8 @@ async fn main() -> Result<()> {
         resource_prefix: cfg.shim.resource_prefix.clone(),
         zone: cfg.upcloud.zone.clone(),
         main_currency: cfg.shim.main_currency.clone(),
+        provider_name,
+        invoice_issuer_name,
     });
     let router = app::build_router(
         pool,
