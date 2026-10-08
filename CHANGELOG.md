@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.2.3](https://github.com/brawer/kube-shim/compare/v0.2.2...v0.2.3) (2026-10-08)
+
+
+### 🆕 Enhancements
+
+* Phase 14a -- pricing, cost tracking, and a real FOCUS cost report ([#61](https://github.com/brawer/kube-shim/issues/61)) ([745755b](https://github.com/brawer/kube-shim/commit/745755bf7a2ce6f238833ec9b7afb3c672b64569))
+
+
+### 🐞 Bug Fixes
+
+* use kube-shim.brawer.ch, not kube-shim.io, in the admission webhook name ([#58](https://github.com/brawer/kube-shim/issues/58)) ([4a6419a](https://github.com/brawer/kube-shim/commit/4a6419a85e2ea6ea97752f18a3c6cb1a2ad4fbba))
+
+
+### 📚 Documentation
+
+* don't hardcode EUR as UpCloud's billing currency, read it from the API ([#60](https://github.com/brawer/kube-shim/issues/60)) ([70c46e2](https://github.com/brawer/kube-shim/commit/70c46e20806d59d3a18a74c81836b18c11195a98))
+* record live verification of v0.2.2 against kube-shim.brawer.ch ([#56](https://github.com/brawer/kube-shim/issues/56)) ([37a06ca](https://github.com/brawer/kube-shim/commit/37a06cadf204af64371810ce47b50b33c1f1f79f))
+* split Phase 14 into cost tracking (14a) and budget enforcement (14b) ([#59](https://github.com/brawer/kube-shim/issues/59)) ([c3a0bb3](https://github.com/brawer/kube-shim/commit/c3a0bb322b99f8e911a081d721a3c9cf15910e66))
+
 ## [0.2.2](https://github.com/brawer/kube-shim/compare/v0.2.1...v0.2.2) (2026-10-05)
 
 
