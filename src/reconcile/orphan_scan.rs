@@ -149,6 +149,7 @@ mod tests {
             own_public_ip: None,
             worker_ssh_private_key: String::new(),
             worker_ssh_port: crate::ssh::SSH_PORT,
+            main_currency: "EUR".to_string(),
         }
     }
 

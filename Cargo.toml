@@ -62,6 +62,10 @@ base64 = "0.22"
 # musl/Alpine release build) in favor of "ring", the same substitution
 # tls.rs/rustls-acme already make for the exact same reason (Phase 3/4).
 russh = { version = "0.63", default-features = false, features = ["ring", "rsa", "flate2"] }
+# Phase 14a: parsing the ECB's daily reference-rate feed (XML, verified
+# hands-on against the real live feed -- nested <Cube> elements, not a
+# flat list), via the `serde` feature rather than a hand-rolled parser.
+quick-xml = { version = "0.36", features = ["serialize"] }
 
 [dev-dependencies]
 rcgen = "0.13"

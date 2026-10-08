@@ -1,3 +1,4 @@
+pub mod cost_report;
 pub mod cronjob;
 pub mod events;
 pub mod job;
@@ -47,9 +48,36 @@ pub async fn discovery_apis_root() -> impl IntoResponse {
                 "name": "metrics.k8s.io",
                 "versions": [{"groupVersion": "metrics.k8s.io/v1beta1", "version": "v1beta1"}],
                 "preferredVersion": {"groupVersion": "metrics.k8s.io/v1beta1", "version": "v1beta1"}
+            },
+            {
+                "name": "cost.kube-shim.brawer.ch",
+                "versions": [{"groupVersion": "cost.kube-shim.brawer.ch/v1", "version": "v1"}],
+                "preferredVersion": {"groupVersion": "cost.kube-shim.brawer.ch/v1", "version": "v1"}
             }
         ]
     }))
+}
+
+/// `cost.kube-shim.brawer.ch/v1` (Phase 14a) -- a kube-shim-specific
+/// extension API group, the same convention real custom Kubernetes
+/// extensions use (e.g. `metrics.k8s.io` above) for something with no
+/// upstream Kubernetes equivalent. Only a CSV report today
+/// (`api::cost_report`); Phase 14b's budget settings/top-up endpoints
+/// join this same group once they exist.
+pub async fn discovery_cost_v1() -> impl IntoResponse {
+    let response = json!({
+        "kind": "APIResourceList",
+        "groupVersion": "cost.kube-shim.brawer.ch/v1",
+        "resources": [
+            {
+                "name": "report",
+                "namespaced": false,
+                "kind": "CostReport",
+                "verbs": ["get"]
+            }
+        ]
+    });
+    Json(response)
 }
 
 pub async fn discovery_v1() -> impl IntoResponse {

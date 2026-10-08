@@ -97,7 +97,7 @@ use crate::providers::{
     CloudProvider, CreateServerRequest, CreateVolumeRequest, FirewallAction, FirewallDirection,
     FirewallFamily, FirewallRule, ProviderError,
 };
-use crate::{cloud_init, ssh, volumes, workload};
+use crate::{cloud_init, pricing, ssh, volumes, workload};
 use anyhow::Result;
 use chrono::Utc;
 use serde_json::Value as JsonValue;
@@ -201,6 +201,12 @@ pub struct JobContext {
     /// `UpCloudProvider::with_base_url` already gives UpCloud API tests
     /// (Phase 7).
     pub worker_ssh_port: u16,
+    /// From `config.toml`'s `[shim] main_currency` (Phase 5, first real
+    /// use in Phase 14a) -- every cost figure `handle_created`/
+    /// `handle_container_running` compute is expressed in this currency,
+    /// never the provider's own real billing currency directly (see
+    /// `pricing::estimate_job_cost`'s own docs).
+    pub main_currency: String,
 }
 
 /// The state one tick after `current`, or `None` if `current` is
@@ -418,6 +424,10 @@ pub async fn advance_all(pool: &SqlitePool, ctx: &JobContext) -> Result<usize> {
         }
 
         let target_status: Option<&'static str> = match status.as_str() {
+            "Created" => {
+                handle_created(pool, ctx, &id, &namespace, &name, &spec_str).await?;
+                Some(next)
+            }
             "VolumePending" => handle_volume_pending(
                 pool,
                 ctx,
@@ -457,7 +467,8 @@ pub async fn advance_all(pool: &SqlitePool, ctx: &JobContext) -> Result<usize> {
                     .then_some(next)
             }
             "ContainerRunning" => {
-                handle_container_running(pool, ctx, &id, &namespace, &name).await?
+                handle_container_running(pool, ctx, &id, &namespace, &name, &spec_str, created_at)
+                    .await?
             }
             "VolumeDetaching" => {
                 handle_volume_detaching(pool, ctx, &id, &namespace, &name, last_transition_time)
@@ -515,7 +526,12 @@ pub async fn advance_all(pool: &SqlitePool, ctx: &JobContext) -> Result<usize> {
 /// `template.spec.containers[]`, `activeDeadlineSeconds` all live at the
 /// top level here, one JSON path segment shorter than in the CronJob's
 /// own spec (see `src/admission.rs` for that longer form).
-fn find_ephemeral_volume(spec: &JsonValue) -> Option<&JsonValue> {
+///
+/// `pub(crate)`: also used by `pricing::cost_for_duration` (Phase 14a)
+/// to know whether a job's cost includes a volume at all -- the exact
+/// same extraction `handle_volume_pending` already does for real
+/// provisioning, reused rather than duplicated.
+pub(crate) fn find_ephemeral_volume(spec: &JsonValue) -> Option<&JsonValue> {
     spec.pointer("/template/spec/volumes")
         .and_then(JsonValue::as_array)?
         .iter()
@@ -542,6 +558,48 @@ pub(crate) fn extract_resource_requests(spec: &JsonValue) -> (Option<u32>, Optio
         .and_then(JsonValue::as_str)
         .and_then(|q| volumes::parse_storage_quantity_mb(q).ok());
     (cpu_millicores, memory_mb)
+}
+
+/// `Created`: computes the job's worst-case cost (Phase 14a), from its
+/// own `activeDeadlineSeconds`, before any real provisioning starts --
+/// stored for later display/budget use (Phase 14b), never blocking the
+/// job itself: a pricing/exchange-rate cache that hasn't synced yet
+/// (`pricing::estimate_job_cost` returning `None`) just leaves
+/// `jobs.estimated_cost` unset, the same "stays absent rather than a
+/// fake number" stance this project already takes for real metrics
+/// (`api::metrics`'s own docs). Always advances regardless -- an
+/// unestimated cost is not a reason to stall the job itself.
+async fn handle_created(
+    pool: &SqlitePool,
+    ctx: &JobContext,
+    job_id: &str,
+    namespace: &str,
+    name: &str,
+    spec_str: &str,
+) -> Result<()> {
+    let spec: JsonValue = serde_json::from_str(spec_str).unwrap_or(JsonValue::Null);
+    let Some(deadline) = active_deadline_seconds(&spec) else {
+        return Ok(());
+    };
+
+    match pricing::estimate_job_cost(pool, &ctx.zone, &spec, deadline, &ctx.main_currency).await {
+        Ok(Some(cost)) => {
+            sqlx::query("UPDATE jobs SET estimated_cost = ? WHERE id = ?")
+                .bind(cost)
+                .bind(job_id)
+                .execute(pool)
+                .await?;
+        }
+        Ok(None) => {
+            tracing::debug!(
+                "job {namespace}/{name}: pricing not cached yet, estimated_cost left unset"
+            );
+        }
+        Err(err) => {
+            tracing::warn!("job {namespace}/{name}: estimated_cost calculation failed: {err:?}");
+        }
+    }
+    Ok(())
 }
 
 /// `VolumePending`: create the job's ephemeral volume for real (or log
@@ -1004,6 +1062,8 @@ async fn handle_container_running(
     job_id: &str,
     namespace: &str,
     name: &str,
+    spec_str: &str,
+    created_at: i64,
 ) -> Result<Option<&'static str>> {
     if ctx.dry_run {
         return Ok(Some("Succeeded"));
@@ -1078,7 +1138,30 @@ async fn handle_container_running(
         String::new()
     };
 
-    record_completion(pool, job_id, exit_code, &logs).await?;
+    // Real cost (Phase 14a), from the job's real elapsed wall-clock
+    // duration -- not the conservative activeDeadlineSeconds estimate
+    // `handle_created` already stored. Best-effort, same as that
+    // estimate: a pricing/exchange-rate cache gap just leaves
+    // `jobs.actual_cost` unset rather than blocking completion.
+    let duration_seconds = Utc::now().timestamp() - created_at;
+    let spec: JsonValue = serde_json::from_str(spec_str).unwrap_or(JsonValue::Null);
+    let actual_cost = match pricing::calculate_actual_cost(
+        pool,
+        &ctx.zone,
+        &spec,
+        duration_seconds,
+        &ctx.main_currency,
+    )
+    .await
+    {
+        Ok(cost) => cost,
+        Err(err) => {
+            tracing::warn!("job {namespace}/{name}: actual_cost calculation failed: {err:?}");
+            None
+        }
+    };
+
+    record_completion(pool, job_id, exit_code, &logs, actual_cost).await?;
     tracing::info!("job {namespace}/{name}: container finished on {ip}, exit code {exit_code}");
     Ok(Some(if exit_code == 0 {
         "Succeeded"
@@ -1337,13 +1420,19 @@ async fn record_completion(
     job_id: &str,
     exit_code: i64,
     logs: &str,
+    actual_cost: Option<f64>,
 ) -> Result<()> {
-    sqlx::query("UPDATE jobs SET exit_code = ?, cached_logs = ? WHERE id = ?")
-        .bind(exit_code)
-        .bind(logs)
-        .bind(job_id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE jobs SET exit_code = ?, cached_logs = ?, actual_cost = ?, completed_at = ? \
+         WHERE id = ?",
+    )
+    .bind(exit_code)
+    .bind(logs)
+    .bind(actual_cost)
+    .bind(Utc::now().timestamp())
+    .bind(job_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -1409,6 +1498,7 @@ mod tests {
             own_public_ip: Some("203.0.113.5".to_string()),
             worker_ssh_private_key: crate::ssh::tests::throwaway_private_key_pem(),
             worker_ssh_port: ssh::SSH_PORT,
+            main_currency: "EUR".to_string(),
         }
     }
 
@@ -2140,6 +2230,117 @@ mod tests {
         assert_eq!(status, "Succeeded");
         assert_eq!(exit_code, Some(0));
         assert_eq!(cached_logs.as_deref(), Some("hello from the container\n"));
+    }
+
+    async fn insert_provider_price(pool: &SqlitePool, price_key: &str, amount: f64, price: f64) {
+        sqlx::query(
+            "INSERT INTO provider_pricing (zone, price_key, amount, price, currency, fetched_at) \
+             VALUES ('de-fra1', ?, ?, ?, 'EUR', 0)",
+        )
+        .bind(price_key)
+        .bind(amount)
+        .bind(price)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_created_computes_estimated_cost_when_pricing_is_cached() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_provider_price(&pool, "server_plan_DEV-1xCPU-1GB-10GB", 1.0, 0.4464).await;
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
+             VALUES ('j1', 'job-one', 'default', ?, 'Created', ?, ?, 1)",
+        )
+        .bind(r#"{"activeDeadlineSeconds": 3600}"#)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        advance_all(&pool, &mock_ctx(false)).await.unwrap();
+
+        let estimated_cost: Option<f64> =
+            sqlx::query_scalar("SELECT estimated_cost FROM jobs WHERE id = 'j1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        // 1 hour at the default 1-CPU/1GB plan's own cents/hour price.
+        assert!((estimated_cost.unwrap() - 0.004464).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn test_created_leaves_estimated_cost_unset_when_pricing_not_cached() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        // No provider_pricing row at all.
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
+             VALUES ('j1', 'job-one', 'default', ?, 'Created', ?, ?, 1)",
+        )
+        .bind(r#"{"activeDeadlineSeconds": 3600}"#)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        advance_all(&pool, &mock_ctx(false)).await.unwrap();
+
+        let (status, estimated_cost): (String, Option<f64>) =
+            sqlx::query_as("SELECT status, estimated_cost FROM jobs WHERE id = 'j1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        // Advances regardless -- an unestimated cost never blocks the job.
+        assert_eq!(status, "VolumePending");
+        assert_eq!(estimated_cost, None);
+    }
+
+    #[tokio::test]
+    async fn test_container_running_records_actual_cost_on_completion() {
+        let mut responses = HashMap::new();
+        responses.insert("cat /tmp/exit-code", ("0", 0));
+        responses.insert("cat /tmp/container-id.txt", ("abc123", 0));
+        responses.insert("podman logs abc123", ("hello\n", 0));
+        let (host, port) = crate::ssh::tests::mock_ssh_server(responses).await;
+        let mut ctx = mock_ctx(false);
+        ctx.worker_ssh_port = port;
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_provider_price(&pool, "server_plan_DEV-1xCPU-1GB-10GB", 1.0, 0.4464).await;
+        let now = Utc::now().timestamp();
+        let one_hour_ago = now - 3600;
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, worker_vm_id, worker_ssh_ip, created_at, updated_at, last_transition_time, version) \
+             VALUES ('j1', 'job-one', 'default', '{}', 'ContainerRunning', 'srv1', ?, ?, ?, ?, 1)",
+        )
+        .bind(&host)
+        .bind(one_hour_ago) // created_at: the job genuinely started an hour ago
+        .bind(now)
+        .bind(now) // last_transition_time: recently entered this state, not "stuck"
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        advance_all(&pool, &ctx).await.unwrap();
+
+        let actual_cost: Option<f64> =
+            sqlx::query_scalar("SELECT actual_cost FROM jobs WHERE id = 'j1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        // Real elapsed duration was ~1 hour -- same cost as the 1-hour
+        // estimate test above, computed from real wall-clock time now,
+        // not the (here, absent) activeDeadlineSeconds. The tolerance is
+        // wide enough to absorb the real seconds that pass between
+        // `one_hour_ago` being computed above and `advance_all` calling
+        // `Utc::now()` again internally (observed to exceed 1s on a
+        // loaded CI runner) without masking an actually-wrong result.
+        assert!((actual_cost.unwrap() - 0.004464).abs() < 0.0005);
     }
 
     #[tokio::test]

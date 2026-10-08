@@ -142,19 +142,41 @@ pub enum FirewallFamily {
 
 /// One entry from the provider's pricing catalog -- deliberately raw and
 /// unnormalized (`amount`/`price` straight from UpCloud's own `GET
-/// /1.3/price` response, in the account's billing currency, cents per
-/// `amount` units) rather than a rich typed cost model: Phase 13 is where
-/// that model actually gets designed, once ECB-rate conversion and budget
-/// accrual exist to build it for. Committing to a shape now would just
-/// mean redesigning it then.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// /1.3/price` response, cents per `amount` units) rather than a rich
+/// typed cost model: Phase 14a is where that model actually gets
+/// designed, once ECB-rate conversion and budget accrual exist to build
+/// it for. Committing to a shape now would just mean redesigning it then.
+///
+/// `currency` is the account's *own real* billing currency for this
+/// price, read directly from the response's own top-level
+/// `prices.currency` field -- verified hands-on against a live UpCloud
+/// account (`EUR`), but **not a fixed, UpCloud-wide constant**: UpCloud
+/// bills other accounts in `USD`. An earlier version of this struct had
+/// no `currency` field at all, silently dropping it; Phase 14a's own
+/// cost calculation is what actually needs to know which currency these
+/// numbers are in, rather than assuming.
+#[derive(Debug, Clone, PartialEq)]
 pub struct PriceEntry {
     pub amount: f64,
     pub price: f64,
+    pub currency: String,
 }
 
 #[async_trait]
 pub trait CloudProvider: Send + Sync {
+    /// The provider's own display/brand name (e.g. `"UpCloud"`) --
+    /// used wherever FOCUS wants to know which cloud actually
+    /// hosts/provides the resource (`HostProviderName`,
+    /// `ServiceProviderName` in `api::cost_report`), so a future
+    /// second provider doesn't require editing that module at all.
+    fn provider_name(&self) -> &str;
+    /// The legal entity that actually issues invoices for this
+    /// provider (e.g. `"UpCloud Ltd"`) -- kept separate from
+    /// `provider_name` since it can genuinely differ (a reseller, or
+    /// a brand name vs. the registered company name); used for
+    /// `InvoiceIssuerName`.
+    fn invoice_issuer_name(&self) -> &str;
+
     async fn create_volume(&self, req: CreateVolumeRequest) -> Result<Volume, ProviderError>;
     async fn delete_volume(&self, volume_id: &str) -> Result<(), ProviderError>;
     /// Every volume that currently exists in `zone` -- not filtered by

@@ -34,12 +34,15 @@ pub fn server_header_layer() -> SetResponseHeaderLayer<HeaderValue> {
 /// that one handler without changing every other handler's `State<...>`
 /// extractor. `worker_ssh` (Phase 10) is the same pattern, for
 /// `api::logs`'s own need to SSH into a worker VM directly, independent
-/// of the reconciliation loop's own `JobContext`.
+/// of the reconciliation loop's own `JobContext`. `cost_report_config`
+/// (Phase 14a) is the same pattern again, for `api::cost_report`'s own
+/// need for `resource_prefix`/`zone`/`main_currency`.
 pub fn build_router(
     pool: sqlx::SqlitePool,
     api_tokens: Arc<Vec<config::ApiToken>>,
     notify: Arc<Notify>,
     worker_ssh: Arc<ssh::WorkerSshConfig>,
+    cost_report_config: Arc<api::cost_report::CostReportConfig>,
 ) -> Router {
     Router::new()
         // Discovery endpoints
@@ -50,6 +53,10 @@ pub fn build_router(
         .route(
             "/apis/metrics.k8s.io/v1beta1",
             get(api::discovery_metrics_v1beta1),
+        )
+        .route(
+            "/apis/cost.kube-shim.brawer.ch/v1",
+            get(api::discovery_cost_v1),
         )
         // Health check
         .route("/health", get(api::health))
@@ -120,8 +127,14 @@ pub fn build_router(
             "/apis/batch/v1/namespaces/:namespace/jobs/:name",
             get(api::job::get_job).delete(api::job::delete_job),
         )
+        // Cost report (Phase 14a) -- cluster-scoped, same as `/api/v1/nodes`.
+        .route(
+            "/apis/cost.kube-shim.brawer.ch/v1/report",
+            get(api::cost_report::get_cost_report),
+        )
         .layer(Extension(notify))
         .layer(Extension(worker_ssh))
+        .layer(Extension(cost_report_config))
         .layer(CorsLayer::permissive())
         // Runs before CORS and before any handler, so an unauthenticated
         // request never reaches application logic at all.

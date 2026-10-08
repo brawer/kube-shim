@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use kube_shim::providers::upcloud::UpCloudProvider;
+use kube_shim::providers::CloudProvider;
 use kube_shim::reconcile::JobContext;
-use kube_shim::{acme, app, config, db, metadata, reconcile, ssh, tls};
+use kube_shim::{acme, api, app, config, db, metadata, reconcile, ssh, tls};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -46,6 +47,12 @@ async fn main() -> Result<()> {
     // crash-loop that instance on its next auto-update for no operational
     // reason.
     let upcloud = Arc::new(UpCloudProvider::new(cfg.upcloud.token.clone()));
+    // Grabbed before `upcloud` moves into `job_context` below -- these
+    // feed `CostReportConfig` (Phase 14a) so the cost report's own
+    // provider-name fields come from the actual provider
+    // implementation, not a hardcoded literal.
+    let provider_name = upcloud.provider_name().to_string();
+    let invoice_issuer_name = upcloud.invoice_issuer_name().to_string();
     match upcloud.check_connectivity().await {
         Ok(()) => tracing::info!("UpCloud connectivity check succeeded"),
         Err(err) => tracing::warn!("UpCloud connectivity check failed (continuing anyway): {err}"),
@@ -81,7 +88,26 @@ async fn main() -> Result<()> {
         own_public_ip,
         worker_ssh_private_key: cfg.upcloud.worker_ssh_private_key.clone(),
         worker_ssh_port: ssh::SSH_PORT,
+        main_currency: cfg.shim.main_currency.clone(),
     };
+    // Phase 14a: if this is genuinely the first boot ever against this
+    // database (neither UpCloud pricing nor ECB exchange rates cached
+    // yet), sync both once, blocking, before the server starts accepting
+    // any requests below -- otherwise a job could be admitted and reach
+    // `Created` before `reconcile::run`'s own background sync loop has
+    // had a chance to run even once, leaving its cost permanently
+    // unknowable (cost calculation never hits either API live per job).
+    // On every later restart the tables already have rows in them from
+    // a previous sync, so this is skipped and startup stays immediate --
+    // the background loop's own eager first tick still refreshes both
+    // right away, just non-blocking.
+    if !reconcile::pricing::has_cached_pricing(&pool).await? {
+        tracing::info!(
+            "No cached pricing/exchange rates yet (first boot) -- syncing once before starting"
+        );
+        reconcile::pricing::sync_pricing_and_rates(&pool, &job_context).await?;
+    }
+
     tokio::spawn(reconcile::run(pool.clone(), notify.clone(), job_context));
 
     // Build router. The worker SSH private key is handed in separately
@@ -92,11 +118,19 @@ async fn main() -> Result<()> {
         private_key: cfg.upcloud.worker_ssh_private_key.clone(),
         port: ssh::SSH_PORT,
     });
+    let cost_report_config = Arc::new(api::cost_report::CostReportConfig {
+        resource_prefix: cfg.shim.resource_prefix.clone(),
+        zone: cfg.upcloud.zone.clone(),
+        main_currency: cfg.shim.main_currency.clone(),
+        provider_name,
+        invoice_issuer_name,
+    });
     let router = app::build_router(
         pool,
         Arc::new(cfg.server.api_tokens.clone()),
         notify,
         worker_ssh,
+        cost_report_config,
     );
 
     let addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port)
