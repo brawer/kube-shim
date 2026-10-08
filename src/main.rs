@@ -83,6 +83,24 @@ async fn main() -> Result<()> {
         worker_ssh_port: ssh::SSH_PORT,
         main_currency: cfg.shim.main_currency.clone(),
     };
+    // Phase 14a: if this is genuinely the first boot ever against this
+    // database (neither UpCloud pricing nor ECB exchange rates cached
+    // yet), sync both once, blocking, before the server starts accepting
+    // any requests below -- otherwise a job could be admitted and reach
+    // `Created` before `reconcile::run`'s own background sync loop has
+    // had a chance to run even once, leaving its cost permanently
+    // unknowable (cost calculation never hits either API live per job).
+    // On every later restart the tables already have rows in them from
+    // a previous sync, so this is skipped and startup stays immediate --
+    // the background loop's own eager first tick still refreshes both
+    // right away, just non-blocking.
+    if !reconcile::pricing::has_cached_pricing(&pool).await? {
+        tracing::info!(
+            "No cached pricing/exchange rates yet (first boot) -- syncing once before starting"
+        );
+        reconcile::pricing::sync_pricing_and_rates(&pool, &job_context).await?;
+    }
+
     tokio::spawn(reconcile::run(pool.clone(), notify.clone(), job_context));
 
     // Build router. The worker SSH private key is handed in separately

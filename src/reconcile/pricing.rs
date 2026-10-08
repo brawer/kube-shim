@@ -26,6 +26,27 @@ fn needed_price_keys() -> Vec<String> {
     keys
 }
 
+/// Whether a previous sync (this boot or an earlier one -- the tables
+/// persist across restarts) has ever populated *both* caches. Used by
+/// `main.rs` to decide whether the very first sync needs to be a
+/// blocking, synchronous call before the server starts accepting
+/// requests at all: a job admitted before either cache has anything in
+/// it would otherwise have no way to ever learn its own cost, since
+/// `src/pricing.rs` never hits either API live per job. Deliberately a
+/// cumulative (AND, not OR) check -- UpCloud pricing and ECB exchange
+/// rates are two independent real network dependencies, and having
+/// only one of them still leaves currency conversion (or the pricing
+/// itself) unable to produce a real number.
+pub async fn has_cached_pricing(pool: &SqlitePool) -> Result<bool> {
+    let pricing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_pricing")
+        .fetch_one(pool)
+        .await?;
+    let rates: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM exchange_rates")
+        .fetch_one(pool)
+        .await?;
+    Ok(pricing > 0 && rates > 0)
+}
+
 /// One pass: sync pricing, then exchange rates. Each half tolerates
 /// the other failing independently (a `?` on the first alone would
 /// otherwise skip exchange-rate sync entirely just because, say,
@@ -88,4 +109,56 @@ async fn sync_exchange_rates(pool: &SqlitePool) -> Result<()> {
     let rates = currency::fetch_ecb_rates().await?;
     currency::store_rates(pool, &rates, Utc::now().timestamp()).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn insert_price(pool: &SqlitePool) {
+        sqlx::query(
+            "INSERT INTO provider_pricing (zone, price_key, amount, price, currency, fetched_at) \
+             VALUES ('de-fra1', 'server_plan_DEV-1xCPU-1GB-10GB', 1.0, 0.4464, 'EUR', 0)",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_rate(pool: &SqlitePool) {
+        sqlx::query(
+            "INSERT INTO exchange_rates (currency, rate, fetched_at) VALUES ('USD', 1.08, 0)",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_has_cached_pricing_false_when_both_tables_empty() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        assert!(!has_cached_pricing(&pool).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_has_cached_pricing_false_when_only_pricing_present() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_price(&pool).await;
+        assert!(!has_cached_pricing(&pool).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_has_cached_pricing_false_when_only_rates_present() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_rate(&pool).await;
+        assert!(!has_cached_pricing(&pool).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_has_cached_pricing_true_when_both_present() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_price(&pool).await;
+        insert_rate(&pool).await;
+        assert!(has_cached_pricing(&pool).await.unwrap());
+    }
 }
