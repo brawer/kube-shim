@@ -548,7 +548,12 @@ pub async fn advance_all(pool: &SqlitePool, ctx: &JobContext) -> Result<usize> {
         .await?;
 
         tracing::info!("job {namespace}/{name}: {status} -> {target_status}");
-        let event_type = if target_status == "Failed" {
+        // "BudgetWait" (Phase 14b) is a Warning too, not just "Failed" --
+        // it's the one state transition that needs a human to actually
+        // notice and react (top up, or raise the budget) within
+        // activeDeadlineSeconds, unlike every other ordinary transition
+        // on the way to a job finishing on its own.
+        let event_type = if target_status == "Failed" || target_status == "BudgetWait" {
             "Warning"
         } else {
             "Normal"
@@ -2449,6 +2454,17 @@ mod tests {
         // can't launch yet -- BudgetWait only gates real provisioning.
         assert!((estimated_cost.unwrap() - 0.004464).abs() < 1e-9);
         assert_eq!(status, "BudgetWait");
+
+        // Entering BudgetWait is a Warning event, not a routine Normal
+        // transition -- it's the one state that needs a human to
+        // actually notice and react within activeDeadlineSeconds.
+        let (reason, event_type): (String, String) =
+            sqlx::query_as("SELECT reason, type FROM events WHERE job_id = 'j1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reason, "BudgetWait");
+        assert_eq!(event_type, "Warning");
     }
 
     #[tokio::test]
