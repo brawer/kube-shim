@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod cost_report;
 pub mod cronjob;
 pub mod events;
@@ -74,6 +75,18 @@ pub async fn discovery_cost_v1() -> impl IntoResponse {
                 "namespaced": false,
                 "kind": "CostReport",
                 "verbs": ["get"]
+            },
+            {
+                "name": "settings",
+                "namespaced": false,
+                "kind": "CostSettings",
+                "verbs": ["get", "patch"]
+            },
+            {
+                "name": "budget/topup",
+                "namespaced": false,
+                "kind": "BudgetTopUp",
+                "verbs": ["create"]
             }
         ]
     });

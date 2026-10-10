@@ -4,10 +4,11 @@
 //! converted to the operator's `main_currency` via `currency::convert`.
 
 use crate::currency;
-use crate::reconcile::job::{extract_resource_requests, find_ephemeral_volume};
+use crate::reconcile::job::{extract_resource_requests, find_ephemeral_volume, is_committed_state};
 use crate::volumes::{self, StorageTier};
 use crate::workload;
 use anyhow::Result;
+use chrono::Utc;
 use serde_json::Value as JsonValue;
 use sqlx::{Row, SqlitePool};
 
@@ -242,6 +243,322 @@ pub async fn provider_currency(pool: &SqlitePool) -> Result<Option<String>> {
         .fetch_optional(pool)
         .await?;
     Ok(row.map(|r| r.get(0)))
+}
+
+/// Rolling budget guard (Phase 14b): the three settings `PATCH
+/// /settings` (`api::budget`) can change live, bundled together since
+/// they're always read and written as one row (`budget_state`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BudgetSettings {
+    pub main_currency: String,
+    pub budget_daily_rate: f64,
+    pub budget_rollover_cap_days: u32,
+}
+
+/// A subset of `BudgetSettings`' own fields a `PATCH /settings` call
+/// wants to change -- `None` on a field means "leave it alone", the
+/// real PATCH semantics (not "set to a default"), so a caller only
+/// ever sends the fields it actually wants to update.
+#[derive(Debug, Default)]
+pub struct SettingsPatch {
+    pub budget_daily_rate: Option<f64>,
+    pub budget_rollover_cap_days: Option<u32>,
+    pub main_currency: Option<String>,
+}
+
+/// The real outcome of a `PATCH /settings` call -- the settled
+/// balance and final settings, plus the real before/after numbers if
+/// `main_currency` actually changed, for `api::budget` to record as
+/// an event.
+#[derive(Debug)]
+pub struct SettingsPatchOutcome {
+    pub settings: BudgetSettings,
+    pub balance: f64,
+    /// `(old_currency, old_balance, new_currency, new_balance)`.
+    pub currency_conversion: Option<(String, f64, String, f64)>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BudgetError {
+    #[error("budget settings have not been initialized")]
+    NotSeeded,
+    #[error("cannot convert {from} to {to}: no exchange rate cached for one of them")]
+    CurrencyConversionUnavailable { from: String, to: String },
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+struct BudgetRow {
+    balance: f64,
+    last_accrual_at: i64,
+    main_currency: String,
+    budget_daily_rate: f64,
+    budget_rollover_cap_days: u32,
+}
+
+async fn fetch_budget_row(pool: &SqlitePool) -> Result<Option<BudgetRow>> {
+    let row = sqlx::query(
+        "SELECT balance, last_accrual_at, main_currency, budget_daily_rate, \
+         budget_rollover_cap_days FROM budget_state WHERE id = 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| BudgetRow {
+        balance: r.get(0),
+        last_accrual_at: r.get(1),
+        main_currency: r.get(2),
+        budget_daily_rate: r.get(3),
+        budget_rollover_cap_days: r.get(4),
+    }))
+}
+
+/// Seeds the single `budget_state` row from `config.toml`'s `[shim]`
+/// fields -- but only on a genuine first boot (no row yet); every
+/// later boot leaves it alone, since `PATCH /settings` may have since
+/// changed these live and `config.toml` is never re-read for this
+/// (same bootstrap-once convention `server.api_tokens` already uses).
+/// A no-op if a row already exists.
+pub async fn ensure_budget_seeded(pool: &SqlitePool, seed: &BudgetSettings) -> Result<()> {
+    if fetch_budget_row(pool).await?.is_some() {
+        return Ok(());
+    }
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        "INSERT INTO budget_state \
+         (id, balance, last_accrual_at, main_currency, budget_daily_rate, budget_rollover_cap_days) \
+         VALUES (1, 0.0, ?, ?, ?, ?)",
+    )
+    .bind(now)
+    .bind(&seed.main_currency)
+    .bind(seed.budget_daily_rate)
+    .bind(seed.budget_rollover_cap_days)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The live settings, or `None` if `budget_state` has never been
+/// seeded (e.g. a bare test pool, or a process that hasn't called
+/// `ensure_budget_seeded` yet).
+pub async fn current_settings(pool: &SqlitePool) -> Result<Option<BudgetSettings>> {
+    Ok(fetch_budget_row(pool).await?.map(|r| BudgetSettings {
+        main_currency: r.main_currency,
+        budget_daily_rate: r.budget_daily_rate,
+        budget_rollover_cap_days: r.budget_rollover_cap_days,
+    }))
+}
+
+/// The live `main_currency` setting if `budget_state` has been seeded,
+/// else `fallback` -- the `config.toml`-sourced value every cost
+/// calculation call site (`reconcile::job`, `api::cost_report`) had
+/// before this table existed. Lets a `PATCH /settings` currency change
+/// take effect immediately everywhere, without needing `JobContext`/
+/// `CostReportConfig` to carry a mutable copy of their own.
+pub async fn effective_main_currency(pool: &SqlitePool, fallback: &str) -> Result<String> {
+    Ok(current_settings(pool)
+        .await?
+        .map(|s| s.main_currency)
+        .unwrap_or_else(|| fallback.to_string()))
+}
+
+/// Settles time-based accrual into the stored balance -- the real
+/// elapsed time since `last_accrual_at`, at `budget_daily_rate` per
+/// day, capped so *accrual alone* never pushes the balance past
+/// `budget_rollover_cap_days` worth -- several quiet days build up
+/// headroom for one bigger job, without growing unbounded if jobs
+/// never run. Deliberately a cap on accrual, not a hard ceiling on the
+/// balance itself: a manual top-up can legitimately push the balance
+/// above that cap on purpose (that's the whole point of being able to
+/// top up at all), and this must never claw it back down again on the
+/// next settle just because accrual's own cap says so -- only the
+/// *accrued* portion is ever limited by how much headroom is left
+/// below the cap, never applied to money that arrived another way.
+/// The only place that both computes and persists this, so every real
+/// caller (the budget-admission check, `GET`/`PATCH /settings`, a
+/// top-up) sees the same real-time-correct number instead of a stale
+/// tick's worth -- no separate periodic "accrual tick" exists for
+/// this reason; settling lazily on read is simpler and always
+/// correct-as-of-now, not just correct-as-of-the-last-tick.
+///
+/// `None` if `budget_state` has never been seeded. A no-op (returns
+/// the stored balance unchanged, doesn't touch `last_accrual_at`)
+/// when `budget_daily_rate <= 0.0` -- this project's own "budgeting
+/// disabled" convention (also `ShimConfig::default()`'s own value, so
+/// an already-deployed instance that's never configured a budget
+/// keeps behaving exactly as before this phase existed).
+pub async fn settle_accrual(pool: &SqlitePool) -> Result<Option<(f64, BudgetSettings)>> {
+    let Some(row) = fetch_budget_row(pool).await? else {
+        return Ok(None);
+    };
+    let settings = BudgetSettings {
+        main_currency: row.main_currency.clone(),
+        budget_daily_rate: row.budget_daily_rate,
+        budget_rollover_cap_days: row.budget_rollover_cap_days,
+    };
+    if row.budget_daily_rate <= 0.0 {
+        return Ok(Some((row.balance, settings)));
+    }
+    let now = Utc::now().timestamp();
+    let elapsed_days = (now - row.last_accrual_at).max(0) as f64 / 86400.0;
+    let cap = row.budget_daily_rate * row.budget_rollover_cap_days as f64;
+    let room_left_below_cap = (cap - row.balance).max(0.0);
+    let accrued = (row.budget_daily_rate * elapsed_days).min(room_left_below_cap);
+    let new_balance = row.balance + accrued;
+    sqlx::query("UPDATE budget_state SET balance = ?, last_accrual_at = ? WHERE id = 1")
+        .bind(new_balance)
+        .bind(now)
+        .execute(pool)
+        .await?;
+    Ok(Some((new_balance, settings)))
+}
+
+/// Every other currently in-flight job's `estimated_cost` that's
+/// already started real provisioning (`reconcile::job::
+/// is_committed_state`) -- a job still sitting in `Created`/
+/// `BudgetWait` hasn't consumed anything yet, so it doesn't count
+/// here; it's the thing being checked against this sum, not a
+/// contributor to it. Reuses `reconcile::job`'s own state ordering
+/// rather than hardcoding a second copy of "which states count" here.
+async fn committed_budget(pool: &SqlitePool) -> Result<f64> {
+    let rows: Vec<(String, f64)> = sqlx::query_as(
+        "SELECT status, estimated_cost FROM jobs WHERE estimated_cost IS NOT NULL AND status != ?",
+    )
+    .bind(crate::reconcile::job::TERMINAL_STATE)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter(|(status, _)| is_committed_state(status))
+        .map(|(_, cost)| cost)
+        .sum())
+}
+
+/// `None` means budgeting is disabled (no settings row, or
+/// `budget_daily_rate <= 0`) -- callers should treat every job as
+/// always permitted to launch. `Some(available)` is the real,
+/// accrual-settled balance minus every other already-launched job's
+/// estimate (`committed_budget`) -- can go negative if committed
+/// spend already exceeds the balance (e.g. right after a currency
+/// conversion), in which case nothing new should launch until it
+/// recovers.
+pub async fn available_budget(pool: &SqlitePool) -> Result<Option<f64>> {
+    let Some((balance, settings)) = settle_accrual(pool).await? else {
+        return Ok(None);
+    };
+    if settings.budget_daily_rate <= 0.0 {
+        return Ok(None);
+    }
+    let committed = committed_budget(pool).await?;
+    Ok(Some(balance - committed))
+}
+
+/// Adds `amount` directly to the current balance (after settling
+/// accrual first, so a pending-but-unsettled accrual isn't lost under
+/// the top-up). Deliberately additive, not a "set to X" call: the
+/// caller never needs to know the current balance to compute the
+/// right number, and an additive update can't race against accrual
+/// settling the way a "set absolute" one would (no read-then-write
+/// gap for a concurrent accrual to land in).
+pub async fn apply_topup(pool: &SqlitePool, amount: f64) -> Result<f64, BudgetError> {
+    let Some((balance, _)) = settle_accrual(pool).await? else {
+        return Err(BudgetError::NotSeeded);
+    };
+    let new_balance = balance + amount;
+    sqlx::query("UPDATE budget_state SET balance = ? WHERE id = 1")
+        .bind(new_balance)
+        .execute(pool)
+        .await
+        .map_err(|e| BudgetError::Internal(e.into()))?;
+    Ok(new_balance)
+}
+
+/// Applies a `PATCH /settings` request. A `main_currency` change
+/// settles accrual first (in the *old* currency, so the balance being
+/// converted is genuinely up to date), then converts both the balance
+/// and `budget_daily_rate` through the day's ECB rate -- not a silent
+/// relabeling: a balance of `100` doesn't mean the same thing as `100
+/// CHF` once `main_currency` becomes `EUR`, and `budget_daily_rate` is
+/// denominated in `main_currency` too (`config.rs`'s own docs), so
+/// leaving it as a bare number under the new currency would silently
+/// change the real accrual rate. `budget_daily_rate` is only
+/// auto-converted this way when the same request isn't *also*
+/// explicitly overriding it -- an explicit value always wins over an
+/// implicit conversion of the old one.
+pub async fn patch_settings(
+    pool: &SqlitePool,
+    patch: SettingsPatch,
+) -> Result<SettingsPatchOutcome, BudgetError> {
+    let Some((settled_balance, mut settings)) = settle_accrual(pool).await? else {
+        return Err(BudgetError::NotSeeded);
+    };
+    let mut balance = settled_balance;
+    let mut currency_conversion = None;
+
+    if let Some(target_currency) = &patch.main_currency {
+        if *target_currency != settings.main_currency {
+            let converted_balance =
+                currency::convert(pool, balance, &settings.main_currency, target_currency)
+                    .await?
+                    .ok_or_else(|| BudgetError::CurrencyConversionUnavailable {
+                        from: settings.main_currency.clone(),
+                        to: target_currency.clone(),
+                    })?;
+            let new_daily_rate = if patch.budget_daily_rate.is_none() {
+                Some(
+                    currency::convert(
+                        pool,
+                        settings.budget_daily_rate,
+                        &settings.main_currency,
+                        target_currency,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        BudgetError::CurrencyConversionUnavailable {
+                            from: settings.main_currency.clone(),
+                            to: target_currency.clone(),
+                        }
+                    })?,
+                )
+            } else {
+                None
+            };
+            currency_conversion = Some((
+                settings.main_currency.clone(),
+                balance,
+                target_currency.clone(),
+                converted_balance,
+            ));
+            balance = converted_balance;
+            if let Some(rate) = new_daily_rate {
+                settings.budget_daily_rate = rate;
+            }
+            settings.main_currency = target_currency.clone();
+        }
+    }
+    if let Some(rate) = patch.budget_daily_rate {
+        settings.budget_daily_rate = rate;
+    }
+    if let Some(days) = patch.budget_rollover_cap_days {
+        settings.budget_rollover_cap_days = days;
+    }
+
+    sqlx::query(
+        "UPDATE budget_state SET balance = ?, main_currency = ?, budget_daily_rate = ?, \
+         budget_rollover_cap_days = ? WHERE id = 1",
+    )
+    .bind(balance)
+    .bind(&settings.main_currency)
+    .bind(settings.budget_daily_rate)
+    .bind(settings.budget_rollover_cap_days)
+    .execute(pool)
+    .await
+    .map_err(|e| BudgetError::Internal(e.into()))?;
+
+    Ok(SettingsPatchOutcome {
+        settings,
+        balance,
+        currency_conversion,
+    })
 }
 
 #[cfg(test)]
@@ -560,5 +877,359 @@ mod tests {
 
         let total: f64 = charges.iter().map(|c| c.total).sum();
         assert!((total - 0.005644).abs() < 1e-9); // matches the old blended total
+    }
+
+    // --- Phase 14b: rolling budget guard ---
+
+    async fn seed_budget_row(
+        pool: &SqlitePool,
+        balance: f64,
+        last_accrual_at: i64,
+        currency: &str,
+        daily_rate: f64,
+        rollover_cap_days: u32,
+    ) {
+        sqlx::query(
+            "INSERT INTO budget_state \
+             (id, balance, last_accrual_at, main_currency, budget_daily_rate, budget_rollover_cap_days) \
+             VALUES (1, ?, ?, ?, ?, ?)",
+        )
+        .bind(balance)
+        .bind(last_accrual_at)
+        .bind(currency)
+        .bind(daily_rate)
+        .bind(rollover_cap_days)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_job_with_estimate(pool: &SqlitePool, id: &str, status: &str, estimate: f64) {
+        let now = chrono::Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, estimated_cost, created_at, updated_at, version) \
+             VALUES (?, ?, 'default', '{}', ?, ?, ?, ?, 1)",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(status)
+        .bind(estimate)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_ensure_budget_seeded_seeds_once_from_config_defaults() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let seed = BudgetSettings {
+            main_currency: "CHF".to_string(),
+            budget_daily_rate: 2.0,
+            budget_rollover_cap_days: 7,
+        };
+        ensure_budget_seeded(&pool, &seed).await.unwrap();
+
+        let settings = current_settings(&pool).await.unwrap().unwrap();
+        assert_eq!(settings, seed);
+        let (balance, _) = settle_accrual(&pool).await.unwrap().unwrap();
+        assert_eq!(balance, 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_budget_seeded_is_a_noop_if_already_seeded() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        ensure_budget_seeded(
+            &pool,
+            &BudgetSettings {
+                main_currency: "EUR".to_string(),
+                budget_daily_rate: 2.0,
+                budget_rollover_cap_days: 7,
+            },
+        )
+        .await
+        .unwrap();
+        // A later boot's config.toml seed (e.g. after PATCH /settings
+        // already changed the live value) must not overwrite it.
+        ensure_budget_seeded(
+            &pool,
+            &BudgetSettings {
+                main_currency: "USD".to_string(),
+                budget_daily_rate: 99.0,
+                budget_rollover_cap_days: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let settings = current_settings(&pool).await.unwrap().unwrap();
+        assert_eq!(settings.main_currency, "EUR");
+        assert_eq!(settings.budget_daily_rate, 2.0);
+    }
+
+    #[tokio::test]
+    async fn test_settle_accrual_accrues_at_the_daily_rate() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let half_day_ago = now - 12 * 3600;
+        seed_budget_row(&pool, 0.0, half_day_ago, "EUR", 2.0, 7).await;
+
+        let (balance, _) = settle_accrual(&pool).await.unwrap().unwrap();
+        // Half a day at 2.0/day.
+        assert!((balance - 1.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn test_settle_accrual_caps_at_the_rollover_limit() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let ten_days_ago = now - 10 * 86400;
+        // 10 days at 2.0/day would be 20, but the cap is 7 days (14.0).
+        seed_budget_row(&pool, 0.0, ten_days_ago, "EUR", 2.0, 7).await;
+
+        let (balance, _) = settle_accrual(&pool).await.unwrap().unwrap();
+        assert!((balance - 14.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn test_settle_accrual_caps_an_already_saturated_balance_too() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let one_day_ago = now - 86400;
+        // Already at the cap; one more day must not push it past it.
+        seed_budget_row(&pool, 14.0, one_day_ago, "EUR", 2.0, 7).await;
+
+        let (balance, _) = settle_accrual(&pool).await.unwrap().unwrap();
+        assert!((balance - 14.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn test_settle_accrual_never_claws_back_a_balance_above_the_cap_from_a_topup() {
+        // A manual top-up can legitimately push the balance above the
+        // accrual cap on purpose -- a later settle must not reduce it
+        // back down to the cap, which would silently destroy the
+        // top-up. This is exactly the real bug `apply_topup`'s own test
+        // caught: a top-up immediately followed by a settle used to
+        // clamp 25.0 back down to the 14.0 accrual cap.
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        // Cap is 2.0 * 7 = 14.0; balance of 25.0 is already above it.
+        seed_budget_row(&pool, 25.0, now, "EUR", 2.0, 7).await;
+
+        let (balance, _) = settle_accrual(&pool).await.unwrap().unwrap();
+        assert!((balance - 25.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn test_settle_accrual_is_a_noop_when_disabled() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let long_ago = now - 30 * 86400;
+        seed_budget_row(&pool, 5.0, long_ago, "EUR", 0.0, 7).await;
+
+        let (balance, _) = settle_accrual(&pool).await.unwrap().unwrap();
+        assert_eq!(balance, 5.0);
+        // last_accrual_at must also be left untouched.
+        let row = fetch_budget_row(&pool).await.unwrap().unwrap();
+        assert_eq!(row.last_accrual_at, long_ago);
+    }
+
+    #[tokio::test]
+    async fn test_settle_accrual_none_when_not_seeded() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        assert_eq!(settle_accrual(&pool).await.unwrap(), None);
+        assert_eq!(current_settings(&pool).await.unwrap(), None);
+        assert_eq!(available_budget(&pool).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_available_budget_none_when_disabled() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        seed_budget_row(&pool, 100.0, chrono::Utc::now().timestamp(), "EUR", 0.0, 7).await;
+        assert_eq!(available_budget(&pool).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_available_budget_subtracts_only_already_launched_jobs() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        seed_budget_row(&pool, 10.0, chrono::Utc::now().timestamp(), "EUR", 2.0, 7).await;
+        // Already launched -- counts against the balance.
+        insert_job_with_estimate(&pool, "launched", "VolumePending", 3.0).await;
+        // Still waiting its turn -- must not count twice (it's the one
+        // being checked, not a contributor), and Created hasn't
+        // launched either.
+        insert_job_with_estimate(&pool, "waiting", "BudgetWait", 4.0).await;
+        insert_job_with_estimate(&pool, "fresh", "Created", 1.0).await;
+        // Finished -- long done consuming anything.
+        insert_job_with_estimate(&pool, "done", "Succeeded", 2.0).await;
+
+        let available = available_budget(&pool).await.unwrap().unwrap();
+        assert!((available - 7.0).abs() < 1e-6); // 10 - 3 (launched only)
+    }
+
+    #[tokio::test]
+    async fn test_apply_topup_adds_to_the_settled_balance() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        seed_budget_row(&pool, 5.0, chrono::Utc::now().timestamp(), "EUR", 2.0, 7).await;
+
+        let balance = apply_topup(&pool, 20.0).await.unwrap();
+        assert!((balance - 25.0).abs() < 1e-6);
+        let (settled, _) = settle_accrual(&pool).await.unwrap().unwrap();
+        assert!((settled - 25.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn test_apply_topup_not_seeded_is_an_error() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let err = apply_topup(&pool, 20.0).await.unwrap_err();
+        assert!(matches!(err, BudgetError::NotSeeded));
+    }
+
+    #[tokio::test]
+    async fn test_patch_settings_updates_rate_and_cap_days_without_touching_currency() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        seed_budget_row(&pool, 10.0, chrono::Utc::now().timestamp(), "EUR", 2.0, 7).await;
+
+        let outcome = patch_settings(
+            &pool,
+            SettingsPatch {
+                budget_daily_rate: Some(3.0),
+                budget_rollover_cap_days: Some(14),
+                main_currency: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.settings.budget_daily_rate, 3.0);
+        assert_eq!(outcome.settings.budget_rollover_cap_days, 14);
+        assert_eq!(outcome.settings.main_currency, "EUR");
+        assert!(outcome.currency_conversion.is_none());
+        assert!((outcome.balance - 10.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn test_patch_settings_converts_balance_and_daily_rate_on_currency_change() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        seed_budget_row(&pool, 10.0, chrono::Utc::now().timestamp(), "EUR", 2.0, 7).await;
+        currency::store_rates(
+            &pool,
+            &[currency::ExchangeRate {
+                currency: "CHF".to_string(),
+                rate: 0.9359,
+            }],
+            0,
+        )
+        .await
+        .unwrap();
+
+        let outcome = patch_settings(
+            &pool,
+            SettingsPatch {
+                budget_daily_rate: None,
+                budget_rollover_cap_days: None,
+                main_currency: Some("CHF".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.settings.main_currency, "CHF");
+        // Both the balance and the daily rate convert by the same rate.
+        assert!((outcome.balance - 10.0 * 0.9359).abs() < 1e-6);
+        assert!((outcome.settings.budget_daily_rate - 2.0 * 0.9359).abs() < 1e-6);
+        let (old_currency, old_balance, new_currency, new_balance) =
+            outcome.currency_conversion.unwrap();
+        assert_eq!(old_currency, "EUR");
+        assert_eq!(new_currency, "CHF");
+        assert!((old_balance - 10.0).abs() < 1e-6);
+        assert!((new_balance - 10.0 * 0.9359).abs() < 1e-6);
+
+        // Persisted, not just returned.
+        let settings = current_settings(&pool).await.unwrap().unwrap();
+        assert_eq!(settings.main_currency, "CHF");
+    }
+
+    #[tokio::test]
+    async fn test_patch_settings_explicit_daily_rate_overrides_auto_conversion() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        seed_budget_row(&pool, 10.0, chrono::Utc::now().timestamp(), "EUR", 2.0, 7).await;
+        currency::store_rates(
+            &pool,
+            &[currency::ExchangeRate {
+                currency: "CHF".to_string(),
+                rate: 0.9359,
+            }],
+            0,
+        )
+        .await
+        .unwrap();
+
+        let outcome = patch_settings(
+            &pool,
+            SettingsPatch {
+                budget_daily_rate: Some(5.0),
+                budget_rollover_cap_days: None,
+                main_currency: Some("CHF".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        // The explicit value wins outright -- not also converted.
+        assert_eq!(outcome.settings.budget_daily_rate, 5.0);
+        // The balance (which has no explicit-override alternative) still
+        // converts regardless.
+        assert!((outcome.balance - 10.0 * 0.9359).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn test_patch_settings_currency_change_without_cached_rate_is_an_error() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        seed_budget_row(&pool, 10.0, chrono::Utc::now().timestamp(), "EUR", 2.0, 7).await;
+        // No CHF rate stored.
+
+        let err = patch_settings(
+            &pool,
+            SettingsPatch {
+                budget_daily_rate: None,
+                budget_rollover_cap_days: None,
+                main_currency: Some("CHF".to_string()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            BudgetError::CurrencyConversionUnavailable { .. }
+        ));
+
+        // Nothing was persisted on failure.
+        let settings = current_settings(&pool).await.unwrap().unwrap();
+        assert_eq!(settings.main_currency, "EUR");
+    }
+
+    #[tokio::test]
+    async fn test_patch_settings_not_seeded_is_an_error() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let err = patch_settings(&pool, SettingsPatch::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BudgetError::NotSeeded));
+    }
+
+    #[tokio::test]
+    async fn test_effective_main_currency_falls_back_when_not_seeded() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        assert_eq!(effective_main_currency(&pool, "EUR").await.unwrap(), "EUR");
+    }
+
+    #[tokio::test]
+    async fn test_effective_main_currency_uses_the_live_value_once_seeded() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        seed_budget_row(&pool, 0.0, chrono::Utc::now().timestamp(), "CHF", 0.0, 7).await;
+        // The fallback ("EUR") is ignored once a live settings row exists.
+        assert_eq!(effective_main_currency(&pool, "EUR").await.unwrap(), "CHF");
     }
 }
