@@ -132,6 +132,22 @@ CREATE TABLE IF NOT EXISTS exchange_rates (
     fetched_at INTEGER NOT NULL
 );
 
+-- Rolling budget guard (Phase 14b): a single row (`id` is always 1,
+-- enforced by the CHECK) holding the current balance plus the three
+-- settings `PATCH /settings` can change live. `config.toml`'s `[shim]`
+-- fields only ever seed this row once, on first boot
+-- (`pricing::ensure_budget_seeded`) -- every real read/write after
+-- that goes through this table, never `config.toml` again (same
+-- bootstrap-once convention `server.api_tokens` already uses).
+CREATE TABLE IF NOT EXISTS budget_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    balance REAL NOT NULL,
+    last_accrual_at INTEGER NOT NULL,
+    main_currency TEXT NOT NULL,
+    budget_daily_rate REAL NOT NULL,
+    budget_rollover_cap_days INTEGER NOT NULL
+);
+
 -- Indices for common queries
 CREATE INDEX IF NOT EXISTS idx_secrets_namespace ON secrets(namespace);
 CREATE INDEX IF NOT EXISTS idx_cronjobs_namespace ON cronjobs(namespace);

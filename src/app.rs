@@ -132,6 +132,19 @@ pub fn build_router(
             "/apis/cost.kube-shim.brawer.ch/v1/report",
             get(api::cost_report::get_cost_report),
         )
+        // Rolling budget guard (Phase 14b) -- `notify` (already layered
+        // below for `create_cronjob`) wakes the reconciliation loop
+        // immediately on either call, so a job in `BudgetWait` doesn't
+        // wait for the fallback tick to notice a new top-up/settings
+        // change.
+        .route(
+            "/apis/cost.kube-shim.brawer.ch/v1/settings",
+            get(api::budget::get_settings).patch(api::budget::patch_settings),
+        )
+        .route(
+            "/apis/cost.kube-shim.brawer.ch/v1/budget/topup",
+            post(api::budget::topup),
+        )
         .layer(Extension(notify))
         .layer(Extension(worker_ssh))
         .layer(Extension(cost_report_config))

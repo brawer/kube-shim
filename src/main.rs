@@ -3,7 +3,7 @@ use clap::Parser;
 use kube_shim::providers::upcloud::UpCloudProvider;
 use kube_shim::providers::CloudProvider;
 use kube_shim::reconcile::JobContext;
-use kube_shim::{acme, api, app, config, db, metadata, reconcile, ssh, tls};
+use kube_shim::{acme, api, app, config, db, metadata, pricing, reconcile, ssh, tls};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -107,6 +107,21 @@ async fn main() -> Result<()> {
         );
         reconcile::pricing::sync_pricing_and_rates(&pool, &job_context).await?;
     }
+
+    // Phase 14b: seeds the rolling budget guard's DB-backed settings
+    // from config.toml's [shim] fields, but only on a genuine first
+    // boot -- a no-op on every later restart, since PATCH /settings
+    // may have since changed these live and config.toml is never
+    // re-read for this (see pricing::ensure_budget_seeded's own docs).
+    pricing::ensure_budget_seeded(
+        &pool,
+        &pricing::BudgetSettings {
+            main_currency: cfg.shim.main_currency.clone(),
+            budget_daily_rate: cfg.shim.budget_daily_rate,
+            budget_rollover_cap_days: cfg.shim.budget_rollover_cap_days,
+        },
+    )
+    .await?;
 
     tokio::spawn(reconcile::run(pool.clone(), notify.clone(), job_context));
 
