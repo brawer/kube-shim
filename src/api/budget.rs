@@ -15,6 +15,15 @@
 //! balance between that `GET` and the `PATCH`/`POST` that follows it)
 //! -- an additive top-up needs no such read-first step at all, so
 //! there's no race window to begin with.
+//!
+//! `amount` can be negative, to correct an over-generous previous
+//! top-up -- the same race-free reasoning applies either way. The
+//! result is clamped so the balance never goes below zero
+//! (`pricing::apply_topup`'s own docs); when a correction overshoots
+//! (e.g. `-1000` against a balance of `10`), the event recorded below
+//! says so explicitly (what was requested vs. what actually landed),
+//! and the response's `balance` is always the real post-clamp value
+//! -- never a number that silently wasn't honored.
 
 use crate::pricing::{self, BudgetError, SettingsPatch};
 use crate::reconcile::job::record_event;
@@ -46,6 +55,10 @@ pub struct PatchSettingsRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct TopUpRequest {
+    /// Positive to add funds; negative to correct an over-generous
+    /// previous top-up (clamped so the balance never goes below
+    /// zero -- see `pricing::apply_topup`'s own docs). Must be
+    /// nonzero and finite.
     pub amount: f64,
 }
 
@@ -153,27 +166,36 @@ pub async fn topup(
     // Written as the condition to accept, not the one to reject: a
     // negated `>` comparison on a float is a real correctness trap
     // (NaN compares false either way around), not just a style nit.
-    let is_valid_amount = req.amount.is_finite() && req.amount > 0.0;
+    // Zero is rejected too -- a no-op top-up is almost certainly a
+    // client bug, not a real request.
+    let is_valid_amount = req.amount.is_finite() && req.amount != 0.0;
     if !is_valid_amount {
         return Err((
             StatusCode::BAD_REQUEST,
-            "amount must be a positive number".to_string(),
+            "amount must be a nonzero finite number".to_string(),
         ));
     }
 
-    let balance = pricing::apply_topup(&pool, req.amount)
+    let (balance, applied_delta) = pricing::apply_topup(&pool, req.amount)
         .await
         .map_err(budget_error_response)?;
 
-    record_event(
-        &pool,
-        None,
-        "BudgetToppedUp",
-        &format!("+{:.4}, new balance {balance:.4}", req.amount),
-        "Normal",
-    )
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // `applied_delta` only ever differs from the requested `amount`
+    // when clamping kicked in (a correction that overshot zero) --
+    // the event must say so explicitly rather than silently reporting
+    // a number that wasn't actually honored.
+    let message = if (applied_delta - req.amount).abs() > 1e-9 {
+        format!(
+            "{:+.4} requested, clamped to {applied_delta:+.4} (balance cannot go below \
+             zero), new balance {balance:.4}",
+            req.amount
+        )
+    } else {
+        format!("{:+.4}, new balance {balance:.4}", req.amount)
+    };
+    record_event(&pool, None, "BudgetToppedUp", &message, "Normal")
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     notify.notify_one();
 
     Ok(Json(TopUpResponse { balance }).into_response())
@@ -357,22 +379,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_topup_rejects_negative_amount() {
+    async fn test_topup_negative_corrects_an_over_generous_previous_topup() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
-        seed(&pool, 5.0, 2.0, 7).await;
+        seed(&pool, 25.0, 0.0, 7).await;
 
-        let response = router(pool)
+        let response = router(pool.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/budget/topup")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"amount": -5}"#))
+                    .body(Body::from(r#"{"amount": -15}"#))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert!((body["balance"].as_f64().unwrap() - 10.0).abs() < 1e-6);
+
+        let message: String = sqlx::query_scalar("SELECT message FROM events WHERE job_id IS NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(message.contains("-15.0000"));
+        assert!(!message.contains("clamped"));
+    }
+
+    #[tokio::test]
+    async fn test_topup_negative_clamps_at_zero_and_says_so_in_the_event() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        seed(&pool, 10.0, 0.0, 7).await;
+
+        let response = router(pool.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/budget/topup")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"amount": -1000}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        // The response's balance is always the real, honest post-clamp
+        // value -- never the unclamped number the caller asked for.
+        assert_eq!(body["balance"].as_f64().unwrap(), 0.0);
+
+        let message: String = sqlx::query_scalar("SELECT message FROM events WHERE job_id IS NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        // States both what was requested and what actually landed.
+        assert!(message.contains("-1000.0000 requested"));
+        assert!(message.contains("clamped to -10.0000"));
     }
 
     #[tokio::test]

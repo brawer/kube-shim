@@ -459,17 +459,31 @@ pub async fn available_budget(pool: &SqlitePool) -> Result<Option<f64>> {
 /// right number, and an additive update can't race against accrual
 /// settling the way a "set absolute" one would (no read-then-write
 /// gap for a concurrent accrual to land in).
-pub async fn apply_topup(pool: &SqlitePool, amount: f64) -> Result<f64, BudgetError> {
+///
+/// `amount` can be negative too -- to correct an over-generous
+/// previous top-up, the same additive/race-free reasoning applies
+/// equally in either direction. The result is clamped so the balance
+/// never goes below zero (there's no sensible meaning for a negative
+/// stored balance anywhere else in this project); returns
+/// `(new_balance, applied_delta)`, where `applied_delta` is `amount`
+/// itself unless clamping kicked in, in which case it's the smaller
+/// delta that actually landed (e.g. requesting `-1000` against a
+/// balance of `10` applies `-10`, not `-1000`) -- callers compare it
+/// against the requested `amount` to know whether to mention clamping
+/// rather than silently reporting a number that wasn't actually
+/// honored.
+pub async fn apply_topup(pool: &SqlitePool, amount: f64) -> Result<(f64, f64), BudgetError> {
     let Some((balance, _)) = settle_accrual(pool).await? else {
         return Err(BudgetError::NotSeeded);
     };
-    let new_balance = balance + amount;
+    let new_balance = (balance + amount).max(0.0);
+    let applied_delta = new_balance - balance;
     sqlx::query("UPDATE budget_state SET balance = ? WHERE id = 1")
         .bind(new_balance)
         .execute(pool)
         .await
         .map_err(|e| BudgetError::Internal(e.into()))?;
-    Ok(new_balance)
+    Ok((new_balance, applied_delta))
 }
 
 /// Applies a `PATCH /settings` request. A `main_currency` change
@@ -1073,10 +1087,33 @@ mod tests {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
         seed_budget_row(&pool, 5.0, chrono::Utc::now().timestamp(), "EUR", 2.0, 7).await;
 
-        let balance = apply_topup(&pool, 20.0).await.unwrap();
+        let (balance, applied_delta) = apply_topup(&pool, 20.0).await.unwrap();
         assert!((balance - 25.0).abs() < 1e-6);
+        assert!((applied_delta - 20.0).abs() < 1e-6);
         let (settled, _) = settle_accrual(&pool).await.unwrap().unwrap();
         assert!((settled - 25.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn test_apply_topup_negative_corrects_an_over_generous_previous_topup() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        seed_budget_row(&pool, 25.0, chrono::Utc::now().timestamp(), "EUR", 0.0, 7).await;
+
+        let (balance, applied_delta) = apply_topup(&pool, -15.0).await.unwrap();
+        assert!((balance - 10.0).abs() < 1e-6);
+        assert!((applied_delta - (-15.0)).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn test_apply_topup_negative_clamps_at_zero_and_reports_the_applied_delta() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        seed_budget_row(&pool, 10.0, chrono::Utc::now().timestamp(), "EUR", 0.0, 7).await;
+
+        // Requesting -1000 against a balance of 10 must not go negative --
+        // and the caller must be told only -10 actually landed, not -1000.
+        let (balance, applied_delta) = apply_topup(&pool, -1000.0).await.unwrap();
+        assert_eq!(balance, 0.0);
+        assert!((applied_delta - (-10.0)).abs() < 1e-6);
     }
 
     #[tokio::test]
