@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.4](https://github.com/brawer/kube-shim/compare/v0.2.3...v0.2.4) (2026-10-10)
+
+
+### 🆕 Enhancements
+
+* allow negative budget top-ups to correct over-generous ones ([0e42019](https://github.com/brawer/kube-shim/commit/0e420197b72a3797204567a88be110475d7352fb))
+* Phase 14b -- rolling budget guard, top-up, and mutable settings ([4b762a2](https://github.com/brawer/kube-shim/commit/4b762a2abde09ff4faf1e90501b0612455f82bb7))
+
+
+### 🐞 Bug Fixes
+
+* record entering BudgetWait as a Warning event, not Normal ([b4c8f99](https://github.com/brawer/kube-shim/commit/b4c8f9999637842cf75cc7cfe574b12753b3ef5f))
+
 ## [0.2.3](https://github.com/brawer/kube-shim/compare/v0.2.2...v0.2.3) (2026-10-08)
 
 
