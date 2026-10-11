@@ -171,7 +171,7 @@ async fn run_with_interval(
 /// scanning is *not* part of this pass -- it runs on its own slower
 /// cadence, see `run_orphan_scan_loop`/`ORPHAN_SCAN_INTERVAL`.
 pub async fn tick(pool: &SqlitePool, ctx: &JobContext) -> Result<()> {
-    let scheduled = schedule::schedule_due_jobs(pool).await?;
+    let scheduled = schedule::schedule_due_jobs(pool, ctx).await?;
     let advanced = job::advance_all(pool, ctx).await?;
     if scheduled > 0 || advanced > 0 {
         tracing::debug!(

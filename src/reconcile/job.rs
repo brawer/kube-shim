@@ -114,23 +114,20 @@ use uuid::Uuid;
 /// special-cases, not a state ever reached by walking forward from
 /// `"Created"`; see that function's own docs.
 ///
-/// **`"BudgetWait"` (Phase 14b) is the same kind of lateral branch**,
-/// for the same reason: `handle_created` decides the real target
-/// itself (`"VolumePending"` directly if the budget guard is disabled
-/// or covers the job's estimate, `"BudgetWait"` otherwise) rather than
-/// blindly trusting `next_state("Created")` -- so a job never actually
-/// takes two ticks to leave `"Created"` when budgeting is off or
-/// affordable, exactly matching this project's existing one-tick
-/// `Created` -> `VolumePending` behavior from before this phase
-/// existed. `"BudgetWait"` still needs a real slot in this array
-/// (rather than existing purely as a value handlers pass around)
-/// so `next_state`/`is_pre_completion_state` recognize it like any
-/// other state -- `handle_budget_wait`'s own "ready now" case returns
-/// `next_state("BudgetWait")`, which resolves to `"VolumePending"`
-/// because of where it sits here.
+/// **No `"BudgetWait"` state** -- Phase 14b's first attempt at the
+/// rolling budget guard added one (a job that couldn't afford to
+/// launch sat here, retried until `activeDeadlineSeconds` gave up on
+/// it), but that turned out to be more machinery than the problem
+/// needed: the guard is now checked at *admission* time instead
+/// (`pricing::check_budget`, called from `api::job::create_job` and
+/// `reconcile::schedule::create_job_run` before a `jobs` row is ever
+/// created at all), the same way a real cluster's `ResourceQuota`
+/// admission controller rejects synchronously rather than creating a
+/// pending object. Every row that exists in this table has therefore
+/// already been admitted -- there's no "waiting to find out" state to
+/// represent here.
 const STATE_SEQUENCE: &[&str] = &[
     "Created",
-    "BudgetWait",
     "VolumePending",
     "VolumeCreating",
     "VolumeCreated",
@@ -271,17 +268,6 @@ pub(crate) fn is_pre_completion_state(status: &str) -> bool {
     }
 }
 
-/// True once a job has actually started real provisioning -- strictly
-/// after `"Created"`/`"BudgetWait"` and still short of `"Succeeded"`.
-/// `pub(crate)`: used by `pricing::committed_budget` (Phase 14b) to
-/// decide which jobs' `estimated_cost` already counts as committed
-/// against the rolling budget balance. A job still sitting in
-/// `"Created"`/`"BudgetWait"` hasn't consumed anything yet -- it's the
-/// thing being checked against that sum, not a contributor to it.
-pub(crate) fn is_committed_state(status: &str) -> bool {
-    is_pre_completion_state(status) && status != "Created" && status != "BudgetWait"
-}
-
 /// `spec.activeDeadlineSeconds`, Kubernetes' own field name and location
 /// (top-level on the pod template's enclosing spec -- see
 /// `find_ephemeral_volume`'s own docs on this spec's shape). Phase 5's
@@ -289,7 +275,12 @@ pub(crate) fn is_committed_state(status: &str) -> bool {
 /// missing/malformed value here just disables deadline enforcement for
 /// that job rather than erroring -- the per-state stuck-timeout check
 /// (`advance_all`) still applies regardless.
-fn active_deadline_seconds(spec: &JsonValue) -> Option<i64> {
+///
+/// `pub(crate)`: also used by `api::job::create_job`/`reconcile::
+/// schedule::create_job_run` (Phase 14b) to extract the same value for
+/// the admission-time budget check, rather than a second copy of this
+/// one-line JSON lookup.
+pub(crate) fn active_deadline_seconds(spec: &JsonValue) -> Option<i64> {
     spec.get("activeDeadlineSeconds")?.as_i64()
 }
 
@@ -441,39 +432,30 @@ pub async fn advance_all(pool: &SqlitePool, ctx: &JobContext) -> Result<usize> {
                 }
             }
 
-            // `"BudgetWait"` (Phase 14b) is deliberately exempt from this
-            // one check (not the activeDeadlineSeconds check above,
-            // which still applies): waiting on budget to accrue can
-            // legitimately take far longer than any other state's own
-            // retry loop ever should, and force-failing it after 5
-            // minutes would defeat the entire point of the state
-            // existing. `activeDeadlineSeconds` is still the real upper
-            // bound on how long a job will wait before giving up.
-            if status != "BudgetWait" {
-                let stuck_since = last_transition_time.unwrap_or(created_at);
-                if now - stuck_since > RETRY_ESCALATION_THRESHOLD {
-                    force_failed(
-                        pool,
-                        &id,
-                        &namespace,
-                        &name,
-                        &format!(
-                            "StateTimeout: stuck in {status} for over {RETRY_ESCALATION_THRESHOLD}s"
-                        ),
-                        now,
-                    )
-                    .await?;
-                    advanced += 1;
-                    continue;
-                }
+            let stuck_since = last_transition_time.unwrap_or(created_at);
+            if now - stuck_since > RETRY_ESCALATION_THRESHOLD {
+                force_failed(
+                    pool,
+                    &id,
+                    &namespace,
+                    &name,
+                    &format!(
+                        "StateTimeout: stuck in {status} for over {RETRY_ESCALATION_THRESHOLD}s"
+                    ),
+                    now,
+                )
+                .await?;
+                advanced += 1;
+                continue;
             }
         }
 
         let target_status: Option<&'static str> = match status.as_str() {
-            "Created" => Some(handle_created(pool, ctx, &id, &namespace, &name, &spec_str).await?),
-            "BudgetWait" => handle_budget_wait(pool, &id, &namespace, &name)
-                .await?
-                .then_some(next),
+            // "Created" has no special handling of its own anymore --
+            // `estimated_cost` is computed and stored at admission time
+            // now (`pricing::check_budget`, called from `api::job::
+            // create_job`/`reconcile::schedule::create_job_run`), so it
+            // just falls through to the generic `_` catch-all below.
             "VolumePending" => handle_volume_pending(
                 pool,
                 ctx,
@@ -548,12 +530,7 @@ pub async fn advance_all(pool: &SqlitePool, ctx: &JobContext) -> Result<usize> {
         .await?;
 
         tracing::info!("job {namespace}/{name}: {status} -> {target_status}");
-        // "BudgetWait" (Phase 14b) is a Warning too, not just "Failed" --
-        // it's the one state transition that needs a human to actually
-        // notice and react (top up, or raise the budget) within
-        // activeDeadlineSeconds, unlike every other ordinary transition
-        // on the way to a job finishing on its own.
-        let event_type = if target_status == "Failed" || target_status == "BudgetWait" {
+        let event_type = if target_status == "Failed" {
             "Warning"
         } else {
             "Normal"
@@ -609,107 +586,6 @@ pub(crate) fn extract_resource_requests(spec: &JsonValue) -> (Option<u32>, Optio
         .and_then(JsonValue::as_str)
         .and_then(|q| volumes::parse_storage_quantity_mb(q).ok());
     (cpu_millicores, memory_mb)
-}
-
-/// `Created`: computes the job's worst-case cost (Phase 14a), from its
-/// own `activeDeadlineSeconds`, before any real provisioning starts --
-/// never blocking the job just because the cost itself is unknown: a
-/// pricing/exchange-rate cache that hasn't synced yet
-/// (`pricing::estimate_job_cost` returning `None`) just leaves
-/// `jobs.estimated_cost` unset, the same "stays absent rather than a
-/// fake number" stance this project already takes for real metrics
-/// (`api::metrics`'s own docs).
-///
-/// **Decides the real target status itself (Phase 14b), rather than
-/// blindly returning `next_state("Created")`** -- see `STATE_SEQUENCE`'s
-/// own docs for why `"BudgetWait"` is a lateral branch, not a state
-/// every job actually passes through. The budget check uses whatever
-/// estimate this call just computed (even `None`): no estimate means
-/// no way to evaluate the guard, so it fails open to `"VolumePending"`
-/// exactly like every other "don't know yet" gap in this project does,
-/// never `"BudgetWait"` purely because the cost is unknown.
-async fn handle_created(
-    pool: &SqlitePool,
-    ctx: &JobContext,
-    job_id: &str,
-    namespace: &str,
-    name: &str,
-    spec_str: &str,
-) -> Result<&'static str> {
-    let spec: JsonValue = serde_json::from_str(spec_str).unwrap_or(JsonValue::Null);
-    let estimated_cost = match active_deadline_seconds(&spec) {
-        None => None,
-        Some(deadline) => {
-            let main_currency = pricing::effective_main_currency(pool, &ctx.main_currency).await?;
-            match pricing::estimate_job_cost(pool, &ctx.zone, &spec, deadline, &main_currency).await
-            {
-                Ok(Some(cost)) => {
-                    sqlx::query("UPDATE jobs SET estimated_cost = ? WHERE id = ?")
-                        .bind(cost)
-                        .bind(job_id)
-                        .execute(pool)
-                        .await?;
-                    Some(cost)
-                }
-                Ok(None) => {
-                    tracing::debug!(
-                        "job {namespace}/{name}: pricing not cached yet, estimated_cost left unset"
-                    );
-                    None
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        "job {namespace}/{name}: estimated_cost calculation failed: {err:?}"
-                    );
-                    None
-                }
-            }
-        }
-    };
-
-    match (pricing::available_budget(pool).await?, estimated_cost) {
-        (Some(available), Some(cost)) if available < cost => {
-            tracing::debug!(
-                "job {namespace}/{name}: entering BudgetWait ({available:.4} available, \
-                 {cost:.4} needed)"
-            );
-            Ok("BudgetWait")
-        }
-        _ => Ok("VolumePending"),
-    }
-}
-
-/// `BudgetWait`: re-checks whether the balance now covers the job's
-/// `estimated_cost` -- a polling state (see this module's top-level
-/// docs on the one-shot/polling distinction), not a failure, so it
-/// only logs at `debug` and never touches `retry_count`/`last_error`.
-/// Fails open (advances) if `estimated_cost` is still unset (can't
-/// evaluate the guard) or budgeting is disabled, same stance
-/// `handle_created` already takes.
-async fn handle_budget_wait(
-    pool: &SqlitePool,
-    job_id: &str,
-    namespace: &str,
-    name: &str,
-) -> Result<bool> {
-    let estimated_cost: Option<f64> =
-        sqlx::query_scalar("SELECT estimated_cost FROM jobs WHERE id = ?")
-            .bind(job_id)
-            .fetch_one(pool)
-            .await?;
-    let Some(estimated_cost) = estimated_cost else {
-        return Ok(true);
-    };
-    match pricing::available_budget(pool).await? {
-        Some(available) if available < estimated_cost => {
-            tracing::debug!(
-                "job {namespace}/{name}: still waiting on budget ({available:.4} available, \
-                 {estimated_cost:.4} needed)"
-            );
-            Ok(false)
-        }
-        _ => Ok(true),
-    }
 }
 
 /// `VolumePending`: create the job's ephemeral volume for real (or log
@@ -2357,220 +2233,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_created_computes_estimated_cost_when_pricing_is_cached() {
-        let pool = crate::db::init_pool(":memory:").await.unwrap();
-        insert_provider_price(&pool, "server_plan_DEV-1xCPU-1GB-10GB", 1.0, 0.4464).await;
-        let now = Utc::now().timestamp();
-        sqlx::query(
-            "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
-             VALUES ('j1', 'job-one', 'default', ?, 'Created', ?, ?, 1)",
-        )
-        .bind(r#"{"activeDeadlineSeconds": 3600}"#)
-        .bind(now)
-        .bind(now)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        advance_all(&pool, &mock_ctx(false)).await.unwrap();
-
-        let estimated_cost: Option<f64> =
-            sqlx::query_scalar("SELECT estimated_cost FROM jobs WHERE id = 'j1'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        // 1 hour at the default 1-CPU/1GB plan's own cents/hour price.
-        assert!((estimated_cost.unwrap() - 0.004464).abs() < 1e-9);
-    }
-
-    #[tokio::test]
-    async fn test_created_leaves_estimated_cost_unset_when_pricing_not_cached() {
-        let pool = crate::db::init_pool(":memory:").await.unwrap();
-        // No provider_pricing row at all.
-        let now = Utc::now().timestamp();
-        sqlx::query(
-            "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
-             VALUES ('j1', 'job-one', 'default', ?, 'Created', ?, ?, 1)",
-        )
-        .bind(r#"{"activeDeadlineSeconds": 3600}"#)
-        .bind(now)
-        .bind(now)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        advance_all(&pool, &mock_ctx(false)).await.unwrap();
-
-        let (status, estimated_cost): (String, Option<f64>) =
-            sqlx::query_as("SELECT status, estimated_cost FROM jobs WHERE id = 'j1'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        // Advances regardless -- an unestimated cost never blocks the job.
-        assert_eq!(status, "VolumePending");
-        assert_eq!(estimated_cost, None);
-    }
-
-    async fn insert_budget_state(pool: &SqlitePool, balance: f64, daily_rate: f64) {
-        let now = Utc::now().timestamp();
-        sqlx::query(
-            "INSERT INTO budget_state \
-             (id, balance, last_accrual_at, main_currency, budget_daily_rate, budget_rollover_cap_days) \
-             VALUES (1, ?, ?, 'EUR', ?, 7)",
-        )
-        .bind(balance)
-        .bind(now)
-        .bind(daily_rate)
-        .execute(pool)
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_created_enters_budget_wait_when_balance_is_insufficient() {
-        let pool = crate::db::init_pool(":memory:").await.unwrap();
-        insert_provider_price(&pool, "server_plan_DEV-1xCPU-1GB-10GB", 1.0, 0.4464).await;
-        insert_budget_state(&pool, 0.0, 2.0).await;
-        let now = Utc::now().timestamp();
-        sqlx::query(
-            "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
-             VALUES ('j1', 'job-one', 'default', ?, 'Created', ?, ?, 1)",
-        )
-        .bind(r#"{"activeDeadlineSeconds": 3600}"#)
-        .bind(now)
-        .bind(now)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        advance_all(&pool, &mock_ctx(false)).await.unwrap();
-
-        let (status, estimated_cost): (String, Option<f64>) =
-            sqlx::query_as("SELECT status, estimated_cost FROM jobs WHERE id = 'j1'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        // The estimate is still computed and stored even though the job
-        // can't launch yet -- BudgetWait only gates real provisioning.
-        assert!((estimated_cost.unwrap() - 0.004464).abs() < 1e-9);
-        assert_eq!(status, "BudgetWait");
-
-        // Entering BudgetWait is a Warning event, not a routine Normal
-        // transition -- it's the one state that needs a human to
-        // actually notice and react within activeDeadlineSeconds.
-        let (reason, event_type): (String, String) =
-            sqlx::query_as("SELECT reason, type FROM events WHERE job_id = 'j1'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(reason, "BudgetWait");
-        assert_eq!(event_type, "Warning");
-    }
-
-    #[tokio::test]
-    async fn test_budget_wait_advances_once_balance_covers_the_estimate() {
-        let pool = crate::db::init_pool(":memory:").await.unwrap();
-        insert_budget_state(&pool, 0.0, 2.0).await;
-        let now = Utc::now().timestamp();
-        sqlx::query(
-            "INSERT INTO jobs \
-             (id, name, namespace, spec, status, estimated_cost, created_at, updated_at, last_transition_time, version) \
-             VALUES ('j1', 'job-one', 'default', ?, 'BudgetWait', 0.004464, ?, ?, ?, 1)",
-        )
-        .bind(r#"{"activeDeadlineSeconds": 3600}"#)
-        .bind(now)
-        .bind(now)
-        .bind(now)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // Not enough balance yet -- stays put.
-        advance_all(&pool, &mock_ctx(false)).await.unwrap();
-        let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = 'j1'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(status, "BudgetWait");
-
-        // A top-up (Phase 14b's manual top-up, not a background tick)
-        // covers it now.
-        pricing::apply_topup(&pool, 1.0).await.unwrap();
-
-        advance_all(&pool, &mock_ctx(false)).await.unwrap();
-        let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = 'j1'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(status, "VolumePending");
-    }
-
-    #[tokio::test]
-    async fn test_budget_wait_is_exempt_from_the_stuck_state_timeout() {
-        // A job can legitimately wait in BudgetWait far longer than
-        // RETRY_ESCALATION_THRESHOLD -- it must not be force-failed just
-        // for that, unlike every other pre-completion state.
-        let pool = crate::db::init_pool(":memory:").await.unwrap();
-        insert_budget_state(&pool, 0.0, 2.0).await;
-        let now = Utc::now().timestamp();
-        let long_ago = now - RETRY_ESCALATION_THRESHOLD - 60;
-        sqlx::query(
-            "INSERT INTO jobs \
-             (id, name, namespace, spec, status, estimated_cost, created_at, updated_at, last_transition_time, version) \
-             VALUES ('j1', 'job-one', 'default', ?, 'BudgetWait', 5.0, ?, ?, ?, 1)",
-        )
-        .bind(r#"{"activeDeadlineSeconds": 100000}"#)
-        .bind(long_ago)
-        .bind(now)
-        .bind(long_ago)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        advance_all(&pool, &mock_ctx(false)).await.unwrap();
-
-        let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = 'j1'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            status, "BudgetWait",
-            "must not be force-failed just for waiting a long time"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_created_advances_directly_to_volume_pending_when_budgeting_disabled() {
-        // budget_daily_rate <= 0 (including no budget_state row at all,
-        // the default for every already-deployed instance) means the
-        // guard is off entirely -- BudgetWait is skipped, not just
-        // immediately satisfied, matching this project's exact
-        // pre-Phase-14b behavior.
-        let pool = crate::db::init_pool(":memory:").await.unwrap();
-        insert_provider_price(&pool, "server_plan_DEV-1xCPU-1GB-10GB", 1.0, 0.4464).await;
-        insert_budget_state(&pool, 0.0, 0.0).await;
-        let now = Utc::now().timestamp();
-        sqlx::query(
-            "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
-             VALUES ('j1', 'job-one', 'default', ?, 'Created', ?, ?, 1)",
-        )
-        .bind(r#"{"activeDeadlineSeconds": 3600}"#)
-        .bind(now)
-        .bind(now)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        advance_all(&pool, &mock_ctx(false)).await.unwrap();
-
-        let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = 'j1'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(status, "VolumePending");
-    }
-
-    #[tokio::test]
     async fn test_container_running_records_actual_cost_on_completion() {
         let mut responses = HashMap::new();
         responses.insert("cat /tmp/exit-code", ("0", 0));
@@ -2917,7 +2579,6 @@ mod tests {
     fn test_is_pre_completion_state_covers_the_working_states_only() {
         for state in [
             "Created",
-            "BudgetWait",
             "VolumePending",
             "VolumeCreating",
             "VolumeCreated",
@@ -2945,24 +2606,6 @@ mod tests {
                 !is_pre_completion_state(state),
                 "{state} should not be covered"
             );
-        }
-    }
-
-    #[test]
-    fn test_is_committed_state_excludes_created_and_budget_wait() {
-        // Neither has started real provisioning yet -- they're the
-        // thing being checked against the committed-budget sum, not a
-        // contributor to it.
-        assert!(!is_committed_state("Created"));
-        assert!(!is_committed_state("BudgetWait"));
-        // Every other pre-completion state has started.
-        for state in ["VolumePending", "VMRunning", "ContainerRunning"] {
-            assert!(is_committed_state(state), "{state} should be committed");
-        }
-        // Anything at or past Succeeded hasn't started, in the sense
-        // that matters here: it's finished, not waiting to start.
-        for state in ["Succeeded", "Failed", "Archived"] {
-            assert!(!is_committed_state(state));
         }
     }
 
