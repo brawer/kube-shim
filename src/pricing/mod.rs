@@ -1120,7 +1120,14 @@ mod tests {
         insert_job_with_estimate(&pool, "done", "Succeeded", 2.0).await;
 
         let available = available_budget(&pool).await.unwrap().unwrap();
-        assert!((available - 6.0).abs() < 1e-6); // 10 - 3 - 1
+        // 10 - 3 - 1 = 6, modulo whatever real accrual (2.0/day) landed
+        // in the real seconds between seed_budget_row's own
+        // `last_accrual_at` timestamp and available_budget's internal
+        // settle_accrual call -- this tolerance comfortably absorbs
+        // even a full minute of that (observed to exceed 1e-6's
+        // implied ~43ms budget on a loaded CI runner) without masking
+        // an actually-wrong result.
+        assert!((available - 6.0).abs() < 2e-3);
     }
 
     #[tokio::test]
@@ -1218,10 +1225,13 @@ mod tests {
         seed_budget_row(&pool, 5.0, chrono::Utc::now().timestamp(), "EUR", 2.0, 7).await;
 
         let (balance, applied_delta) = apply_topup(&pool, 20.0).await.unwrap();
-        assert!((balance - 25.0).abs() < 1e-6);
-        assert!((applied_delta - 20.0).abs() < 1e-6);
+        // Widened from 1e-6: real accrual (2.0/day) lands in the real
+        // seconds between seeding and this call settling it, same
+        // class of drift as test_available_budget_subtracts_every_non_terminal_job.
+        assert!((balance - 25.0).abs() < 2e-3);
+        assert!((applied_delta - 20.0).abs() < 2e-3);
         let (settled, _) = settle_accrual(&pool).await.unwrap().unwrap();
-        assert!((settled - 25.0).abs() < 1e-6);
+        assert!((settled - 25.0).abs() < 2e-3);
     }
 
     #[tokio::test]
@@ -1273,7 +1283,9 @@ mod tests {
         assert_eq!(outcome.settings.budget_rollover_cap_days, 14);
         assert_eq!(outcome.settings.main_currency, "EUR");
         assert!(outcome.currency_conversion.is_none());
-        assert!((outcome.balance - 10.0).abs() < 1e-6);
+        // Widened from 1e-6 for the same real-accrual-drift reason as
+        // test_available_budget_subtracts_every_non_terminal_job.
+        assert!((outcome.balance - 10.0).abs() < 2e-3);
     }
 
     #[tokio::test]
@@ -1303,15 +1315,18 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome.settings.main_currency, "CHF");
-        // Both the balance and the daily rate convert by the same rate.
-        assert!((outcome.balance - 10.0 * 0.9359).abs() < 1e-6);
-        assert!((outcome.settings.budget_daily_rate - 2.0 * 0.9359).abs() < 1e-6);
+        // Both the balance and the daily rate convert by the same
+        // rate. Tolerances widened from 1e-6 for the same real-
+        // accrual-drift reason as
+        // test_available_budget_subtracts_every_non_terminal_job.
+        assert!((outcome.balance - 10.0 * 0.9359).abs() < 2e-3);
+        assert!((outcome.settings.budget_daily_rate - 2.0 * 0.9359).abs() < 2e-3);
         let (old_currency, old_balance, new_currency, new_balance) =
             outcome.currency_conversion.unwrap();
         assert_eq!(old_currency, "EUR");
         assert_eq!(new_currency, "CHF");
-        assert!((old_balance - 10.0).abs() < 1e-6);
-        assert!((new_balance - 10.0 * 0.9359).abs() < 1e-6);
+        assert!((old_balance - 10.0).abs() < 2e-3);
+        assert!((new_balance - 10.0 * 0.9359).abs() < 2e-3);
 
         // Persisted, not just returned.
         let settings = current_settings(&pool).await.unwrap().unwrap();
@@ -1347,8 +1362,10 @@ mod tests {
         // The explicit value wins outright -- not also converted.
         assert_eq!(outcome.settings.budget_daily_rate, 5.0);
         // The balance (which has no explicit-override alternative) still
-        // converts regardless.
-        assert!((outcome.balance - 10.0 * 0.9359).abs() < 1e-6);
+        // converts regardless. Tolerance widened from 1e-6 for the same
+        // real-accrual-drift reason as
+        // test_available_budget_subtracts_every_non_terminal_job.
+        assert!((outcome.balance - 10.0 * 0.9359).abs() < 2e-3);
     }
 
     #[tokio::test]
