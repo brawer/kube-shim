@@ -15,10 +15,11 @@
 //! standalone Job's own top-level `.spec` already is, so no translation
 //! is needed here either. See docs/IMPLEMENTATION_PLAN.md Phase 13.
 
+use super::cost_report::CostReportConfig;
 use super::pods::phase_for;
 use super::secret::ObjectMeta;
 use crate::reconcile::job as reconcile_job;
-use crate::{admission, k8s_status};
+use crate::{admission, k8s_status, pricing};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -149,6 +150,7 @@ fn row_to_job(row: SqliteRow) -> Job {
 pub async fn create_job(
     State(pool): State<SqlitePool>,
     Extension(notify): Extension<Arc<Notify>>,
+    Extension(cost_report_config): Extension<Arc<CostReportConfig>>,
     Json(req): Json<CreateJobRequest>,
 ) -> Response {
     // Admission checks first, before anything is written -- same
@@ -170,6 +172,44 @@ pub async fn create_job(
         admission::validate_resource_limits(&object_description, &req.spec, FIELD_PREFIX)
     {
         return response;
+    }
+
+    // Budget admission (Phase 14b, moved here from a `BudgetWait`
+    // state that created the row first and found out later): rejected
+    // synchronously, the same way a real cluster's `ResourceQuota`
+    // admission controller would, rather than creating a row that
+    // might just sit idle. `require_active_deadline_seconds` above
+    // already guarantees this unwrap succeeds.
+    let deadline = reconcile_job::active_deadline_seconds(&req.spec).unwrap();
+    let main_currency =
+        match pricing::effective_main_currency(&pool, &cost_report_config.main_currency).await {
+            Ok(c) => c,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+    let (estimated_cost, sufficient) = match pricing::check_budget(
+        &pool,
+        &cost_report_config.zone,
+        &req.spec,
+        deadline,
+        &main_currency,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    if !sufficient {
+        return k8s_status::status_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!(
+                "admission webhook \"kube-shim.brawer.ch/require-sufficient-budget\" denied \
+                 the request: estimated cost ({:.4} {main_currency}) exceeds the current \
+                 budget balance -- top up via POST /apis/cost.kube-shim.brawer.ch/v1/budget/topup \
+                 and resubmit",
+                estimated_cost.unwrap_or(0.0)
+            ),
+        );
     }
 
     let namespace = req
@@ -206,14 +246,18 @@ pub async fn create_job(
     // from a CronJob-spawned run everywhere else that matters
     // (reconcile::metrics_collector/api::metrics's own is_pre_completion_state
     // reuse neither know nor care, by design).
+    // estimated_cost was already computed above, at admission time --
+    // handle_created no longer exists to compute it again on the
+    // first tick.
     let insert_result = sqlx::query(
-        "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
-         VALUES (?, ?, ?, ?, 'Created', ?, ?, 1)",
+        "INSERT INTO jobs (id, name, namespace, spec, status, estimated_cost, created_at, updated_at, version) \
+         VALUES (?, ?, ?, ?, 'Created', ?, ?, ?, 1)",
     )
     .bind(&id)
     .bind(&req.metadata.name)
     .bind(&namespace)
     .bind(&spec_json)
+    .bind(estimated_cost)
     .bind(now)
     .bind(now)
     .execute(&pool)
@@ -356,6 +400,13 @@ mod tests {
                 get(get_job).delete(delete_job),
             )
             .layer(Extension(Arc::new(Notify::new())))
+            .layer(Extension(Arc::new(CostReportConfig {
+                resource_prefix: "kube-shim-test".to_string(),
+                zone: "de-fra1".to_string(),
+                main_currency: "EUR".to_string(),
+                provider_name: "UpCloud".to_string(),
+                invoice_issuer_name: "UpCloud Ltd".to_string(),
+            })))
             .with_state(pool)
     }
 
@@ -431,6 +482,97 @@ mod tests {
         let message = body["message"].as_str().unwrap();
         assert!(message.contains("spec.activeDeadlineSeconds"));
         assert!(!message.contains("jobTemplate"));
+    }
+
+    async fn insert_price(pool: &SqlitePool) {
+        sqlx::query(
+            "INSERT INTO provider_pricing (zone, price_key, amount, price, currency, fetched_at) \
+             VALUES ('de-fra1', 'server_plan_DEV-1xCPU-1GB-10GB', 1.0, 0.4464, 'EUR', 0)",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_budget(pool: &SqlitePool, balance: f64, daily_rate: f64) {
+        sqlx::query(
+            "INSERT INTO budget_state \
+             (id, balance, last_accrual_at, main_currency, budget_daily_rate, budget_rollover_cap_days) \
+             VALUES (1, ?, ?, 'EUR', ?, 7)",
+        )
+        .bind(balance)
+        .bind(Utc::now().timestamp())
+        .bind(daily_rate)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_create_job_rejected_at_admission_when_budget_insufficient() {
+        // The real simplification over this project's first attempt at
+        // the budget guard (a BudgetWait state the job sat in, created
+        // anyway): reject synchronously, before any row exists at all,
+        // the same way a real cluster's ResourceQuota admission
+        // controller would.
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_price(&pool).await;
+        seed_budget(&pool, 0.0, 2.0).await;
+
+        let response = router(pool.clone())
+            .oneshot(create_request("too-expensive", valid_spec()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = body_json(response).await;
+        assert_eq!(body["reason"], "Forbidden");
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains("require-sufficient-budget"));
+        assert!(message.contains("budget/topup"));
+
+        // Nothing was created at all -- not even a row to hold a
+        // rejection reason on.
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_create_job_accepted_and_stores_estimated_cost_when_budget_covers_it() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_price(&pool).await;
+        seed_budget(&pool, 10.0, 2.0).await;
+
+        let response = router(pool.clone())
+            .oneshot(create_request("affordable", valid_spec()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let estimated_cost: Option<f64> =
+            sqlx::query_scalar("SELECT estimated_cost FROM jobs WHERE name = 'affordable'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        // activeDeadlineSeconds: 300 (5 minutes) at the DEV plan's own
+        // cents/hour rate.
+        assert!((estimated_cost.unwrap() - 0.0003720).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn test_create_job_accepted_when_budgeting_disabled() {
+        // No budget_state row at all -- the default for every
+        // already-deployed instance that's never configured a budget.
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_price(&pool).await;
+
+        let response = router(pool)
+            .oneshot(create_request("no-budget-configured", valid_spec()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
     }
 
     #[tokio::test]

@@ -4,7 +4,9 @@
 //! converted to the operator's `main_currency` via `currency::convert`.
 
 use crate::currency;
-use crate::reconcile::job::{extract_resource_requests, find_ephemeral_volume, is_committed_state};
+use crate::reconcile::job::{
+    extract_resource_requests, find_ephemeral_volume, is_pre_completion_state, TERMINAL_STATE,
+};
 use crate::volumes::{self, StorageTier};
 use crate::workload;
 use anyhow::Result;
@@ -412,23 +414,28 @@ pub async fn settle_accrual(pool: &SqlitePool) -> Result<Option<(f64, BudgetSett
     Ok(Some((new_balance, settings)))
 }
 
-/// Every other currently in-flight job's `estimated_cost` that's
-/// already started real provisioning (`reconcile::job::
-/// is_committed_state`) -- a job still sitting in `Created`/
-/// `BudgetWait` hasn't consumed anything yet, so it doesn't count
-/// here; it's the thing being checked against this sum, not a
-/// contributor to it. Reuses `reconcile::job`'s own state ordering
-/// rather than hardcoding a second copy of "which states count" here.
+/// Every other still-running job's `estimated_cost` -- `is_pre_
+/// completion_state` (not just "non-terminal"), since once a job
+/// reaches `Succeeded`/`Failed` its real `actual_cost` is what
+/// matters going forward (charged separately, in
+/// `handle_container_running`), not the estimate still holding a
+/// phantom claim against the balance through the whole cleanup tail.
+/// The guard is checked at admission time now (`check_budget`, called
+/// before a job row ever exists at all), so every pre-completion row
+/// that *does* exist has already been admitted -- there's no
+/// "waiting, not yet committed" sub-state to exclude within that
+/// range anymore (unlike this project's first attempt at this,
+/// `BudgetWait`, which needed exactly that distinction).
 async fn committed_budget(pool: &SqlitePool) -> Result<f64> {
     let rows: Vec<(String, f64)> = sqlx::query_as(
         "SELECT status, estimated_cost FROM jobs WHERE estimated_cost IS NOT NULL AND status != ?",
     )
-    .bind(crate::reconcile::job::TERMINAL_STATE)
+    .bind(TERMINAL_STATE)
     .fetch_all(pool)
     .await?;
     Ok(rows
         .into_iter()
-        .filter(|(status, _)| is_committed_state(status))
+        .filter(|(status, _)| is_pre_completion_state(status))
         .map(|(_, cost)| cost)
         .sum())
 }
@@ -450,6 +457,42 @@ pub async fn available_budget(pool: &SqlitePool) -> Result<Option<f64>> {
     }
     let committed = committed_budget(pool).await?;
     Ok(Some(balance - committed))
+}
+
+/// Computes a job's estimated cost and checks it against the current
+/// budget guard, for **admission-time** rejection -- standalone Jobs
+/// (`api::job::create_job`) and CronJob-spawned runs
+/// (`reconcile::schedule::create_job_run`) both call this *before*
+/// a `jobs` row is ever created, rather than creating the row and
+/// finding out later (`BudgetWait`, this project's own first attempt
+/// at this, which added a real state-machine state, a stuck-timeout
+/// exemption, and a lateral branch off `Created` for what turns out
+/// to be a simpler problem: deciding whether to admit a job at all).
+///
+/// Returns `(estimated_cost, sufficient)`. `estimated_cost` is `None`
+/// if pricing isn't cached yet -- not an error, same "don't know yet"
+/// stance as every other pricing gap in this project; the caller
+/// still stores it (even when `None`) on the job row it creates, so
+/// `Created`'s own tick never needs to compute it again. `sufficient`
+/// is `false` only when *both* the estimate and the current budget
+/// are known and the budget doesn't cover it -- every other
+/// combination (budgeting disabled, pricing not cached yet) fails
+/// open, exactly like `handle_created`'s own stance before the budget
+/// guard existed at all.
+pub async fn check_budget(
+    pool: &SqlitePool,
+    zone: &str,
+    spec: &JsonValue,
+    active_deadline_seconds: i64,
+    main_currency: &str,
+) -> Result<(Option<f64>, bool)> {
+    let estimated_cost =
+        estimate_job_cost(pool, zone, spec, active_deadline_seconds, main_currency).await?;
+    let sufficient = match (available_budget(pool).await?, estimated_cost) {
+        (Some(available), Some(cost)) => available >= cost,
+        _ => true,
+    };
+    Ok((estimated_cost, sufficient))
 }
 
 /// Adds `amount` directly to the current balance (after settling
@@ -1065,21 +1108,108 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_available_budget_subtracts_only_already_launched_jobs() {
+    async fn test_available_budget_subtracts_every_non_terminal_job() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
         seed_budget_row(&pool, 10.0, chrono::Utc::now().timestamp(), "EUR", 2.0, 7).await;
-        // Already launched -- counts against the balance.
+        // Both non-terminal rows count now -- the guard runs at
+        // admission time (check_budget), before a row ever exists, so
+        // every row that *does* exist has already been admitted.
         insert_job_with_estimate(&pool, "launched", "VolumePending", 3.0).await;
-        // Still waiting its turn -- must not count twice (it's the one
-        // being checked, not a contributor), and Created hasn't
-        // launched either.
-        insert_job_with_estimate(&pool, "waiting", "BudgetWait", 4.0).await;
         insert_job_with_estimate(&pool, "fresh", "Created", 1.0).await;
         // Finished -- long done consuming anything.
         insert_job_with_estimate(&pool, "done", "Succeeded", 2.0).await;
 
         let available = available_budget(&pool).await.unwrap().unwrap();
-        assert!((available - 7.0).abs() < 1e-6); // 10 - 3 (launched only)
+        assert!((available - 6.0).abs() < 1e-6); // 10 - 3 - 1
+    }
+
+    #[tokio::test]
+    async fn test_check_budget_rejects_when_estimate_exceeds_available() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_price(
+            &pool,
+            "de-fra1",
+            "server_plan_DEV-1xCPU-1GB-10GB",
+            1.0,
+            0.4464,
+            "EUR",
+        )
+        .await;
+        // A nonzero daily_rate -- budgeting must be enabled for this
+        // test to exercise the "insufficient" path at all; rate <= 0.0
+        // means disabled, which fails open regardless of the balance.
+        seed_budget_row(&pool, 0.0, chrono::Utc::now().timestamp(), "EUR", 2.0, 7).await;
+
+        let (estimated_cost, sufficient) =
+            check_budget(&pool, "de-fra1", &vm_only_spec(), 3600, "EUR")
+                .await
+                .unwrap();
+        assert!((estimated_cost.unwrap() - 0.004464).abs() < 1e-9);
+        assert!(!sufficient);
+    }
+
+    #[tokio::test]
+    async fn test_check_budget_allows_when_balance_covers_it() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_price(
+            &pool,
+            "de-fra1",
+            "server_plan_DEV-1xCPU-1GB-10GB",
+            1.0,
+            0.4464,
+            "EUR",
+        )
+        .await;
+        // A nonzero daily_rate -- so this genuinely exercises "the
+        // balance covers it", not budgeting-disabled's own separate
+        // fail-open path.
+        seed_budget_row(&pool, 10.0, chrono::Utc::now().timestamp(), "EUR", 2.0, 7).await;
+
+        let (estimated_cost, sufficient) =
+            check_budget(&pool, "de-fra1", &vm_only_spec(), 3600, "EUR")
+                .await
+                .unwrap();
+        assert!(estimated_cost.is_some());
+        assert!(sufficient);
+    }
+
+    #[tokio::test]
+    async fn test_check_budget_fails_open_when_budgeting_disabled() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_price(
+            &pool,
+            "de-fra1",
+            "server_plan_DEV-1xCPU-1GB-10GB",
+            1.0,
+            0.4464,
+            "EUR",
+        )
+        .await;
+        // No budget_state row at all -- budgeting was never configured.
+
+        let (estimated_cost, sufficient) =
+            check_budget(&pool, "de-fra1", &vm_only_spec(), 3600, "EUR")
+                .await
+                .unwrap();
+        assert!(estimated_cost.is_some());
+        assert!(sufficient);
+    }
+
+    #[tokio::test]
+    async fn test_check_budget_fails_open_when_estimate_is_unknown() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        // No provider_pricing row -- the estimate can't be computed.
+        // Budgeting is enabled (nonzero rate) and balance is 0, so this
+        // only passes via the "estimate unknown" fail-open branch, not
+        // because budgeting happens to be disabled too.
+        seed_budget_row(&pool, 0.0, chrono::Utc::now().timestamp(), "EUR", 2.0, 7).await;
+
+        let (estimated_cost, sufficient) =
+            check_budget(&pool, "de-fra1", &vm_only_spec(), 3600, "EUR")
+                .await
+                .unwrap();
+        assert_eq!(estimated_cost, None);
+        assert!(sufficient);
     }
 
     #[tokio::test]
