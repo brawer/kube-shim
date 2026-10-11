@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.5](https://github.com/brawer/kube-shim/compare/v0.2.4...v0.2.5) (2026-10-11)
+
+
+### 🆕 Enhancements
+
+* move the budget guard to admission time, remove BudgetWait ([cf356c2](https://github.com/brawer/kube-shim/commit/cf356c24e4d2c19a6625476a499dac471348c173))
+
+
+### 🐞 Bug Fixes
+
+* use the real ValidatingAdmissionPolicy denial shape, not webhook's ([e41ad25](https://github.com/brawer/kube-shim/commit/e41ad25d9343e2786e8b9adda98a9a041262f79a))
+* widen four budget test tolerances against real accrual drift ([ac7db27](https://github.com/brawer/kube-shim/commit/ac7db27e5919d509a95d78709b60f3547d0f9dc5))
+
 ## [0.2.4](https://github.com/brawer/kube-shim/compare/v0.2.3...v0.2.4) (2026-10-10)
 
 
