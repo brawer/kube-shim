@@ -199,14 +199,12 @@ pub async fn create_job(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
     if !sufficient {
-        return k8s_status::status_error(
-            StatusCode::FORBIDDEN,
-            "Forbidden",
+        return k8s_status::policy_denied(
+            "kube-shim.brawer.ch/require-sufficient-budget",
             format!(
-                "admission webhook \"kube-shim.brawer.ch/require-sufficient-budget\" denied \
-                 the request: estimated cost ({:.4} {main_currency}) exceeds the current \
-                 budget balance -- top up via POST /apis/cost.kube-shim.brawer.ch/v1/budget/topup \
-                 and resubmit",
+                "estimated cost ({:.4} {main_currency}) exceeds the current budget balance \
+                 -- top up via POST /apis/cost.kube-shim.brawer.ch/v1/budget/topup and \
+                 resubmit",
                 estimated_cost.unwrap_or(0.0)
             ),
         );

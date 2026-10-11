@@ -1,8 +1,16 @@
 //! Admission checks for `CronJob`/standalone `Job` create (Phase 5;
 //! generalized in Phase 13 for Jobs to reuse) -- policy rejections in
-//! the same shape a real cluster's `ValidatingAdmissionPolicy`/webhook
-//! would produce, not bespoke error formats. See
-//! docs/IMPLEMENTATION_PLAN.md Phase 5.
+//! the same shape a real cluster's native `ValidatingAdmissionPolicy`
+//! would produce, not bespoke error formats. Deliberately the native
+//! in-process policy shape, not a webhook's: this project has no
+//! external webhook callout, and `ValidatingAdmissionPolicy`'s own
+//! message (`ValidatingAdmissionPolicy '<policy>' with binding
+//! '<binding>' denied request: ...`) is the more architecturally
+//! honest match for "in-process policy, evaluated inline" -- verified
+//! hands-on against the real Kubernetes docs and multiple real
+//! examples, not assumed (an earlier version of this code used the
+//! webhook-denial wording instead, copied from habit rather than
+//! checked). See docs/IMPLEMENTATION_PLAN.md Phase 5.
 //!
 //! Every check here takes the pod-template-level spec directly (what a
 //! standalone `Job`'s own `.spec` already is, and what a `CronJob`'s
@@ -23,8 +31,8 @@ use serde_json::Value as JsonValue;
 /// real Kubernetes API, but the shim needs a hard worst-case runtime
 /// bound for every job to make the budget guard (Phase 14) and deadline
 /// enforcement (Phase 11) meaningful -- so it's required via policy, the
-/// same way a real cluster's admission webhook would reject a policy
-/// violation. Resolves Open Question 9.
+/// same way a real cluster's native admission policy would reject a
+/// policy violation. Resolves Open Question 9.
 ///
 /// Returns the rejection response directly (rather than `Result<(),
 /// Response>`) since `Response` is too large for clippy's
@@ -41,13 +49,11 @@ pub fn require_active_deadline_seconds(
     if has_deadline {
         None
     } else {
-        Some(k8s_status::status_error(
-            axum::http::StatusCode::FORBIDDEN,
-            "Forbidden",
+        Some(k8s_status::policy_denied(
+            "kube-shim.brawer.ch/require-active-deadline",
             format!(
-                "admission webhook \"kube-shim.brawer.ch/require-active-deadline\" denied the \
-                 request: {field_prefix}.activeDeadlineSeconds must be set (bounds the \
-                 job's worst-case cost against the budget guard)"
+                "{field_prefix}.activeDeadlineSeconds must be set (bounds the job's \
+                 worst-case cost against the budget guard)"
             ),
         ))
     }

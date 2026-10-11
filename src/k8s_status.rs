@@ -76,6 +76,33 @@ pub fn unauthorized(message: impl Into<String>) -> axum::response::Response {
     status_error(StatusCode::UNAUTHORIZED, "Unauthorized", message)
 }
 
+/// 403 Forbidden, `reason: Forbidden`: a policy check (not a field-
+/// validation error -- see `invalid_field_value` for that) rejects an
+/// otherwise well-formed request. Message shape matches a real
+/// cluster's native `ValidatingAdmissionPolicy` denial exactly
+/// (`ValidatingAdmissionPolicy '<policy>' with binding '<binding>'
+/// denied request: <reason>`) -- verified hands-on against the real
+/// Kubernetes docs and multiple real examples, not assumed. Shared by
+/// every policy-style check in this project (`src/admission.rs`,
+/// `api::job::create_job`'s budget check) so they all name their own
+/// policy consistently rather than each hand-rolling this string.
+/// `binding_name` defaults to `"{policy_name}-binding"` -- this
+/// project has no real separate binding object the way a real cluster
+/// does, but the real message format always includes one, so this
+/// invents a plausible one rather than quietly dropping half the
+/// real shape.
+pub fn policy_denied(policy_name: &str, reason: impl Into<String>) -> axum::response::Response {
+    status_error(
+        StatusCode::FORBIDDEN,
+        "Forbidden",
+        format!(
+            "ValidatingAdmissionPolicy '{policy_name}' with binding '{policy_name}-binding' \
+             denied request: {}",
+            reason.into()
+        ),
+    )
+}
+
 /// 404 Not Found, `reason: NotFound`: no object of this kind exists with
 /// this name/namespace -- the same shape a real cluster returns for
 /// `kubectl get`/`kubectl logs` against a resource that doesn't exist.
@@ -146,6 +173,30 @@ mod tests {
         assert_eq!(json["code"], 401);
         assert_eq!(json["message"], "authentication required");
         assert!(json["metadata"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_policy_denied_shape() {
+        let response = policy_denied(
+            "kube-shim.brawer.ch/require-active-deadline",
+            "spec.activeDeadlineSeconds must be set",
+        );
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["reason"], "Forbidden");
+        assert_eq!(json["code"], 403);
+        // Exact real ValidatingAdmissionPolicy denial shape (verified
+        // hands-on against the real Kubernetes docs and multiple real
+        // examples) -- single quotes, "denied request" with no "the".
+        assert_eq!(
+            json["message"],
+            "ValidatingAdmissionPolicy 'kube-shim.brawer.ch/require-active-deadline' with \
+             binding 'kube-shim.brawer.ch/require-active-deadline-binding' denied request: \
+             spec.activeDeadlineSeconds must be set"
+        );
     }
 
     #[tokio::test]
