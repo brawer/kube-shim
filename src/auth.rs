@@ -1,8 +1,11 @@
-//! Bearer-token authentication middleware for the authenticated `:6443`
-//! API. Every route behind this middleware requires a valid
-//! `Authorization: Bearer <token>` header, checked against a list of
-//! configured tokens (see `config::ApiToken`) so a token can be rotated
-//! with an overlap window instead of one atomic cutover.
+//! Bearer-token authentication middleware for the authenticated `:443`
+//! API (`app::authenticated_router`; the public status page/health
+//! endpoints added in Phase 15 are a separate sub-router this
+//! middleware is never applied to). Every route behind this middleware
+//! requires a valid `Authorization: Bearer <token>` header, checked
+//! against a list of configured tokens (see `config::ApiToken`) so a
+//! token can be rotated with an overlap window instead of one atomic
+//! cutover.
 
 use crate::config::ApiToken;
 use crate::k8s_status::unauthorized;

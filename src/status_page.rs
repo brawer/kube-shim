@@ -452,6 +452,40 @@ mod tests {
         assert!(body.contains("BudgetToppedUp"));
     }
 
+    /// A `CronJob` run skipped for insufficient budget
+    /// (`reconcile::schedule::create_job_run`) has no job row of its
+    /// own to show in "Running jobs" -- the whole point of its event
+    /// being recorded at all (see that function's own docs) is that
+    /// it must still show up here, and visibly so, not blend in with
+    /// routine `Normal` transitions.
+    #[tokio::test]
+    async fn test_render_highlights_budget_skip_events_as_warnings() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        record_event(
+            &pool,
+            None,
+            "BudgetSkip",
+            "CronJob default/nightly-import: skipping this run, estimated cost \
+             (1.2000 EUR) exceeds the current budget balance -- will retry next tick",
+            "Warning",
+        )
+        .await
+        .unwrap();
+
+        let response = router(pool, Arc::new(TickHealth::new()))
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_text(response).await;
+        assert!(body.contains("BudgetSkip"));
+        assert!(body.contains("<tr class=\"warning\">"));
+    }
+
     #[tokio::test]
     async fn test_livez_always_ok() {
         let response = livez().await.into_response();
