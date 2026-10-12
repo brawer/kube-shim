@@ -1001,14 +1001,17 @@ curl -k https://kube-shim.brawer.ch/api/v1
 - **`/livez` deliberately checks nothing at all, not even the DB** -- a real anti-pattern this project avoids repeating: a liveness probe that depends on a downstream dependency causes exactly the wrong reaction to a transient blip (a container orchestrator killing/restarting a process that was never actually stuck). Readiness is what dependency health is for.
 - **Explicit allowlist enforced by what the SQL itself selects, not by a later filter** -- `status_page::running_jobs`/`recent_events` name exactly the columns rendered (`name`/`namespace`/`cronjob_name`/`status`/`created_at` for jobs; `reason`/`message`/`timestamp`/`type` plus a left-joined job name/namespace for events) and nothing else; `worker_ssh_ip`/`volume_id`/`worker_vm_id`/raw `spec` JSON are never in the query result at all, so there's nothing to accidentally forget to filter out. Verified hands-on against a real dev server seeded with a job carrying a real-shaped `worker_ssh_ip`/`volume_id`: neither appeared anywhere in the rendered page.
 - `workload::plan_for_resource_requests` factored out of `pricing::charge_breakdown_for_duration` (the "defaults to 1 CPU/1GB, then picks the smallest fitting plan" convention `handle_vm_pending` also uses) so the status page's own "VM size" column reuses the exact same real sizing logic rather than a second, possibly-drifting copy of the same two `.unwrap_or(...)` calls.
-- `src/admission.rs`'s/`api::job::create_job`'s pre-existing module docs re-pointed from `:6443` to `:443` (stale since an earlier phase renamed the port) while already touching `app.rs` for this phase's own restructuring.
+- **A real, project-specific gap this phase was explicitly supposed to close, caught by re-reading this project's own prior design note before starting rather than after**: a `CronJob` run skipped at admission time for insufficient budget (`reconcile::schedule::create_job_run`, Phase 14b's pivot away from a `BudgetWait` job object) previously left *only* a `tracing::warn!` log line — no job row exists to attach an event to, so there was nothing a public, DB-only status page could ever show for it, indistinguishable from a healthy `CronJob` with nothing due yet. Fixed by also calling `record_event(pool, None, "BudgetSkip", ..., "Warning")` (the same job-independent-event shape `api::budget`'s own `SettingsChanged`/`BudgetToppedUp` events already use) right alongside the log line. The status page's "Recent events" table renders any `Warning`-typed event with a highlighted `tr.warning` row (`status_page::render_html`), so a starved `CronJob` is now visibly flagged there, not just inferable from "a job that should have run recently didn't."
+- `src/app.rs`'s own module doc comment corrected from the stale `:6443` (an earlier phase renamed the port to `:443`) while already touching it for this phase's restructuring; `src/auth.rs`'s module doc had the identical staleness and was corrected too, found by grepping the whole tree for `:6443` rather than assuming `app.rs` was the only place it had drifted.
 
 **Verified hands-on against a real dev server, not just unit tests:** seeded real jobs (one with a real-shaped `worker_ssh_ip`/`volume_id`, matching what Phase 9/8 actually populate) and real event rows, confirmed the rendered page shows job/event history correctly and never includes either sensitive field; confirmed `/livez`/`/readyz`/`/healthz` all return real `200`s once the real reconciliation loop has ticked; confirmed `POST /` returns `405` (a registered path with no handler for that method -- axum's real behavior, more precise than the plan's own "404" guess, which this implementation doesn't force a mismatch with); confirmed via `smoke-test.sh` (extended with these same checks) and a real integration test suite running through the actual TLS listener, not just in isolation.
 
 **Files created/modified:**
-- `src/status_page.rs` (new) -- `render`/`livez`/`readyz`, plus the HTML templating and the three private query functions; 7 tests
+- `src/status_page.rs` (new) -- `render`/`livez`/`readyz`, plus the HTML templating and the three private query functions; 8 tests
 - `src/app.rs` -- split into `authenticated_router`/`public_router`, merged by `build_router`; stale `:6443` doc comment corrected
+- `src/auth.rs` -- same stale `:6443` doc comment corrected
 - `src/reconcile/mod.rs` -- `TickHealth` (new), threaded through `run`/`run_with_interval`
+- `src/reconcile/schedule.rs` -- `create_job_run`'s budget-skip path now also records a `BudgetSkip`/`Warning` event, not just a log line (see the finding above); its existing test extended to assert on it
 - `src/workload.rs` -- `plan_for_resource_requests` (new), `pricing::mod.rs` updated to use it instead of its own inline copy
 - `src/main.rs` -- constructs and threads `Arc<TickHealth>` through both `reconcile::run` and `app::build_router`
 - `src/lib.rs` -- `pub mod status_page;`
@@ -1016,7 +1019,7 @@ curl -k https://kube-shim.brawer.ch/api/v1
 - `smoke-test.sh` -- extended with the same real checks against the real release binary
 - `deploy/kube-shim.container` -- deliberately *not* modified; see the `:8080` finding above
 
-**Testing:** 316 lib tests (7 net new, `status_page`) + all integration tests passing (4 net new, in `auth_integration_test.rs`); `cargo fmt --check`/`cargo clippy --all-targets -- -D warnings` clean; `./smoke-test.sh` passing; real end-to-end dev-server verification per above.
+**Testing:** 317 lib tests (8 net new) + all integration tests passing (4 net new, in `auth_integration_test.rs`); `cargo fmt --check`/`cargo clippy --all-targets -- -D warnings` clean; `./smoke-test.sh` passing; real end-to-end dev-server verification per above.
 
 ---
 

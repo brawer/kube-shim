@@ -5,7 +5,7 @@
 //! at all.
 
 use crate::pricing;
-use crate::reconcile::job::active_deadline_seconds;
+use crate::reconcile::job::{active_deadline_seconds, record_event};
 use crate::reconcile::JobContext;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -133,8 +133,13 @@ async fn last_scheduled_time(
 /// here instead of a `BudgetWait` state the run would otherwise sit
 /// in after being created anyway. Returns whether a row was actually
 /// created (`schedule_due_jobs` only counts those); a skip is logged
-/// at `warn` (there's no job object to attach an event to, since none
-/// was created) and otherwise silent -- see `last_scheduled_time`'s
+/// at `warn` *and* recorded as a job-independent `Warning` event (same
+/// `record_event(pool, None, ...)` shape `api::budget`'s own events
+/// use) -- there's no job object to attach it to, since none was
+/// created, but it must still be queryable (Phase 15's public status
+/// page surfaces recent events; a skip that only ever hit a log line
+/// would be invisible there, indistinguishable from a healthy
+/// CronJob that simply has nothing due yet). See `last_scheduled_time`'s
 /// own docs for why skipping needs no extra retry logic of its own.
 async fn create_job_run(
     pool: &SqlitePool,
@@ -163,12 +168,14 @@ async fn create_job_run(
         )
         .await?;
         if !sufficient {
-            tracing::warn!(
+            let message = format!(
                 "CronJob {namespace}/{cronjob_name}: skipping this run, estimated cost \
                  ({:.4} {main_currency}) exceeds the current budget balance -- will retry \
                  next tick",
                 estimated_cost.unwrap_or(0.0)
             );
+            tracing::warn!("{message}");
+            record_event(pool, None, "BudgetSkip", &message, "Warning").await?;
             return Ok(false);
         }
         estimated_cost
@@ -310,6 +317,18 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count, 0);
+
+        // No job row exists to attach an event to, but the skip must
+        // still be queryable (Phase 15's status page surfaces recent
+        // events) -- not just a log line nothing else can see.
+        let (reason, event_type, job_id): (String, String, Option<String>) =
+            sqlx::query_as("SELECT reason, type, job_id FROM events WHERE reason = 'BudgetSkip'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reason, "BudgetSkip");
+        assert_eq!(event_type, "Warning");
+        assert_eq!(job_id, None);
     }
 
     #[tokio::test]
