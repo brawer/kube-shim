@@ -382,12 +382,28 @@ pub async fn effective_main_currency(pool: &SqlitePool, fallback: &str) -> Resul
 /// this reason; settling lazily on read is simpler and always
 /// correct-as-of-now, not just correct-as-of-the-last-tick.
 ///
-/// `None` if `budget_state` has never been seeded. A no-op (returns
-/// the stored balance unchanged, doesn't touch `last_accrual_at`)
-/// when `budget_daily_rate <= 0.0` -- this project's own "budgeting
+/// `None` if `budget_state` has never been seeded. When
+/// `budget_daily_rate <= 0.0` -- this project's own "budgeting
 /// disabled" convention (also `ShimConfig::default()`'s own value, so
 /// an already-deployed instance that's never configured a budget
-/// keeps behaving exactly as before this phase existed).
+/// keeps behaving exactly as before this phase existed) -- the
+/// balance itself is left unchanged, but `last_accrual_at` is still
+/// advanced to now.
+///
+/// **That `last_accrual_at` refresh is deliberate, not an
+/// afterthought -- found live, not by a unit test.** An earlier
+/// version left it untouched while disabled, reasoning "nothing
+/// accrued, nothing to persist." That broke the moment real
+/// budgeting got enabled on `kube-shim.brawer.ch` after sitting
+/// disabled for about two days: the very next settle computed
+/// elapsed time against that two-day-old stale timestamp and granted
+/// a full two days' worth of backdated accrual for free. "Disabled"
+/// must mean "no accrual happens going forward," not "stop the
+/// clock" -- advancing the timestamp (with zero accrual) every time
+/// anything settles, even while disabled, is what makes enabling
+/// budgeting later start counting from the moment it's actually
+/// enabled, not from however long it happened to sit disabled before
+/// that.
 pub async fn settle_accrual(pool: &SqlitePool) -> Result<Option<(f64, BudgetSettings)>> {
     let Some(row) = fetch_budget_row(pool).await? else {
         return Ok(None);
@@ -397,10 +413,14 @@ pub async fn settle_accrual(pool: &SqlitePool) -> Result<Option<(f64, BudgetSett
         budget_daily_rate: row.budget_daily_rate,
         budget_rollover_cap_days: row.budget_rollover_cap_days,
     };
+    let now = Utc::now().timestamp();
     if row.budget_daily_rate <= 0.0 {
+        sqlx::query("UPDATE budget_state SET last_accrual_at = ? WHERE id = 1")
+            .bind(now)
+            .execute(pool)
+            .await?;
         return Ok(Some((row.balance, settings)));
     }
-    let now = Utc::now().timestamp();
     let elapsed_days = (now - row.last_accrual_at).max(0) as f64 / 86400.0;
     let cap = row.budget_daily_rate * row.budget_rollover_cap_days as f64;
     let room_left_below_cap = (cap - row.balance).max(0.0);
@@ -1079,17 +1099,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_settle_accrual_is_a_noop_when_disabled() {
+    async fn test_settle_accrual_balance_is_a_noop_when_disabled() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
         let now = chrono::Utc::now().timestamp();
         let long_ago = now - 30 * 86400;
         seed_budget_row(&pool, 5.0, long_ago, "EUR", 0.0, 7).await;
 
         let (balance, _) = settle_accrual(&pool).await.unwrap().unwrap();
+        // The balance itself doesn't move while disabled.
         assert_eq!(balance, 5.0);
-        // last_accrual_at must also be left untouched.
+    }
+
+    #[tokio::test]
+    async fn test_settle_accrual_still_advances_the_timestamp_while_disabled() {
+        // The real bug this guards against, found live against
+        // kube-shim.brawer.ch, not by a unit test: budgeting had sat
+        // disabled for ~2 days. The moment it was enabled (PATCH
+        // /settings), the very next settle computed elapsed time
+        // against that 2-day-old stale last_accrual_at and granted
+        // ~2 days of backdated accrual for free. Advancing
+        // last_accrual_at every settle, even while disabled (with
+        // zero accrual), is what prevents that: enabling budgeting
+        // later must start counting from the moment it's enabled, not
+        // from however long it sat disabled before that.
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let two_days_ago = now - 2 * 86400;
+        seed_budget_row(&pool, 0.0, two_days_ago, "EUR", 0.0, 7).await;
+
+        // Settle once while still disabled.
+        let (balance, _) = settle_accrual(&pool).await.unwrap().unwrap();
+        assert_eq!(balance, 0.0);
         let row = fetch_budget_row(&pool).await.unwrap().unwrap();
-        assert_eq!(row.last_accrual_at, long_ago);
+        assert!(
+            row.last_accrual_at > two_days_ago,
+            "last_accrual_at must advance even while disabled"
+        );
+
+        // Enabling it now (via patch_settings, the real call site that
+        // triggered this live) must not retroactively credit the two
+        // disabled days.
+        patch_settings(
+            &pool,
+            SettingsPatch {
+                budget_daily_rate: Some(2.0),
+                budget_rollover_cap_days: None,
+                main_currency: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (balance, _) = settle_accrual(&pool).await.unwrap().unwrap();
+        assert!(
+            balance < 0.01,
+            "enabling budgeting must not retroactively accrue for time spent disabled, got {balance}"
+        );
     }
 
     #[tokio::test]
