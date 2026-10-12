@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.6](https://github.com/brawer/kube-shim/compare/v0.2.5...v0.2.6) (2026-10-12)
+
+
+### 🆕 Enhancements
+
+* Phase 15 -- public status page + health endpoints ([65cf688](https://github.com/brawer/kube-shim/commit/65cf68841234052e75111be1494ebcdc7f913715))
+
+
+### 🐞 Bug Fixes
+
+* record a queryable event when a CronJob run is skipped for budget ([51da41e](https://github.com/brawer/kube-shim/commit/51da41e8978806c6fa2e03a913eea9e89b760e0d))
+* settle_accrual must advance last_accrual_at even while disabled ([07b8899](https://github.com/brawer/kube-shim/commit/07b8899d1f62708358ff06f4294eef6936c01c2b))
+
 ## [0.2.5](https://github.com/brawer/kube-shim/compare/v0.2.4...v0.2.5) (2026-10-11)
 
 
