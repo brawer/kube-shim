@@ -92,6 +92,23 @@ pub fn smallest_fitting_server_plan(cpu_cores: u32, memory_gb: u32) -> Option<&'
         .min_by_key(|plan| (plan.cpu_cores, plan.memory_gb))
 }
 
+/// Same defaulting convention `handle_vm_pending` uses when actually
+/// sizing a worker VM -- a job with no explicit `resources.requests`
+/// gets the smallest real plan (1 CPU / 1GB), not an arbitrary guess.
+/// `pub(crate)`: shared by `pricing::charge_breakdown_for_duration`
+/// (cost estimates must size against the exact plan that'll really be
+/// provisioned) and `status_page` (Phase 15, showing the same real VM
+/// size on the public status page) -- one real default, not two
+/// copies of `.unwrap_or(1000)`/`.unwrap_or(1024)` that could drift.
+pub(crate) fn plan_for_resource_requests(
+    cpu_millicores: Option<u32>,
+    memory_mb: Option<u32>,
+) -> Option<&'static ServerPlan> {
+    let cpu_cores = cpu_millicores.unwrap_or(1000).div_ceil(1000);
+    let memory_gb = memory_mb.unwrap_or(1024).div_ceil(1024);
+    smallest_fitting_server_plan(cpu_cores, memory_gb)
+}
+
 /// Parses a Kubernetes CPU resource quantity (`resources.requests.cpu`,
 /// e.g. `"2"` or `"500m"` for 500 millicores) into millicores, the same
 /// integer-precision unit Kubernetes itself uses internally -- real

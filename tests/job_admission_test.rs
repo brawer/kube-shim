@@ -35,6 +35,7 @@ async fn test_router() -> axum::Router {
             provider_name: "UpCloud".to_string(),
             invoice_issuer_name: "UpCloud Ltd".to_string(),
         }),
+        Arc::new(kube_shim::reconcile::TickHealth::new()),
     )
 }
 

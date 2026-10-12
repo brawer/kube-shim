@@ -16,7 +16,9 @@ pub use job::JobContext;
 
 use crate::ssh;
 use anyhow::Result;
+use chrono::Utc;
 use sqlx::SqlitePool;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -53,6 +55,48 @@ const METRICS_POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// cadence matches reality rather than polling needlessly often.
 const PRICING_SYNC_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// How long since the job-tick loop's own last pass (success *or*
+/// failure -- a tick that returned an `Err` still proves the loop
+/// itself is alive and responsive, not hung) before `/readyz` (Phase
+/// 15) considers it unhealthy. Generous relative to `FALLBACK_INTERVAL`
+/// (10s) so one slow tick (a real UpCloud call taking a few seconds)
+/// doesn't flap readiness, while still catching a genuinely
+/// hung/panicked loop within a minute.
+const TICK_STALE_THRESHOLD_SECS: i64 = 60;
+
+/// Shared with the public status page (Phase 15) so `/readyz` can
+/// report a real signal -- whether the reconciliation loop is
+/// actually still ticking -- rather than a hardcoded `200 OK`.
+/// `Arc<TickHealth>` is cloned into both `run` (which records every
+/// tick) and `app::build_router`'s public sub-router (which only ever
+/// reads it). A plain `AtomicI64`, not behind a `Mutex`: one writer
+/// (the job-tick loop), many readers (concurrent `/readyz` requests),
+/// no need for anything heavier.
+#[derive(Default)]
+pub struct TickHealth(AtomicI64);
+
+impl TickHealth {
+    pub fn new() -> Self {
+        Self(AtomicI64::new(0))
+    }
+
+    /// `pub(crate)`: also called directly by `status_page`'s own tests
+    /// to simulate a tick having landed, without needing to spin up
+    /// the real loop.
+    pub(crate) fn record(&self) {
+        self.0.store(Utc::now().timestamp(), Ordering::Relaxed);
+    }
+
+    /// `false` both before the very first tick has ever landed (the
+    /// loop hasn't actually started doing anything yet -- a real,
+    /// if brief, "not ready") and once the most recent one is older
+    /// than `TICK_STALE_THRESHOLD_SECS`.
+    pub fn is_healthy(&self) -> bool {
+        let last = self.0.load(Ordering::Relaxed);
+        last != 0 && Utc::now().timestamp() - last < TICK_STALE_THRESHOLD_SECS
+    }
+}
+
 /// Runs forever, driving the reconciliation loop: one pass immediately,
 /// then one every time either the fallback interval elapses or `notify`
 /// fires, whichever comes first. Callers wake it immediately by calling
@@ -69,7 +113,12 @@ const PRICING_SYNC_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// through to both `job::advance_all()` (via the job tick) and
 /// `orphan_scan::scan_and_clean()` (via its own loop) -- see their own
 /// docs (Phase 7/8).
-pub async fn run(pool: SqlitePool, notify: Arc<Notify>, ctx: JobContext) {
+pub async fn run(
+    pool: SqlitePool,
+    notify: Arc<Notify>,
+    ctx: JobContext,
+    tick_health: Arc<TickHealth>,
+) {
     tokio::spawn(run_orphan_scan_loop(
         pool.clone(),
         ctx.clone(),
@@ -85,7 +134,7 @@ pub async fn run(pool: SqlitePool, notify: Arc<Notify>, ctx: JobContext) {
         ctx.clone(),
         PRICING_SYNC_INTERVAL,
     ));
-    run_with_interval(pool, notify, FALLBACK_INTERVAL, ctx).await
+    run_with_interval(pool, notify, FALLBACK_INTERVAL, ctx, tick_health).await
 }
 
 /// One pass immediately (matching the job loop's own eager-first-tick
@@ -151,6 +200,7 @@ async fn run_with_interval(
     notify: Arc<Notify>,
     interval_duration: Duration,
     ctx: JobContext,
+    tick_health: Arc<TickHealth>,
 ) {
     let mut interval = tokio::time::interval(interval_duration);
 
@@ -163,6 +213,11 @@ async fn run_with_interval(
         if let Err(err) = tick(&pool, &ctx).await {
             tracing::error!("reconciliation tick failed: {err:?}");
         }
+        // Recorded regardless of success/failure -- a tick that
+        // returned an Err still proves the loop itself is alive and
+        // responsive, which is what /readyz (Phase 15) actually needs
+        // to know.
+        tick_health.record();
     }
 }
 
@@ -221,7 +276,14 @@ mod tests {
         // below happens quickly, it can only be because Notify woke the
         // loop, not because the fallback tick happened to land first.
         tokio::spawn(async move {
-            run_with_interval(loop_pool, loop_notify, Duration::from_secs(30), mock_ctx()).await;
+            run_with_interval(
+                loop_pool,
+                loop_notify,
+                Duration::from_secs(30),
+                mock_ctx(),
+                Arc::new(TickHealth::new()),
+            )
+            .await;
         });
 
         // tokio::time::interval's *first* tick fires immediately (by

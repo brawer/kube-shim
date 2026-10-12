@@ -174,6 +174,36 @@ else
     check "GET /apis/batch/v1 discovery with a valid token returns APIResourceList (got kind: $batch_v1_kind)" "fail"
 fi
 
+# Phase 15: the public status page/health endpoints -- no Authorization
+# header sent at all, since that's the entire point.
+for path in "/" "/statusz" "/livez"; do
+    status_code="$(curl -sk -o /dev/null -w '%{http_code}' "$BASE_URL${path}")"
+    if [[ "$status_code" == "200" ]]; then
+        check "GET $path with no token returns 200" "ok"
+    else
+        check "GET $path with no token returns 200 (got: $status_code)" "fail"
+    fi
+done
+
+# /healthz and /readyz may legitimately be 503 this soon after startup
+# (the reconciliation loop's first tick is asynchronous), but must
+# never be 401 -- no-token access is what's being checked here.
+for path in "/healthz" "/readyz"; do
+    status_code="$(curl -sk -o /dev/null -w '%{http_code}' "$BASE_URL${path}")"
+    if [[ "$status_code" == "401" ]]; then
+        check "GET $path with no token is not 401 (got: $status_code)" "fail"
+    else
+        check "GET $path with no token is not 401 (got: $status_code)" "ok"
+    fi
+done
+
+status_page_body="$(curl -sk "$BASE_URL/")"
+if [[ "$status_page_body" != *"worker_ssh"* && "$status_page_body" != *"${TOKEN}"* ]]; then
+    check "public status page never leaks the worker SSH key or a bearer token" "ok"
+else
+    check "public status page never leaks the worker SSH key or a bearer token" "fail"
+fi
+
 echo ""
 if [[ "$FAILURES" -eq 0 ]]; then
     echo "=== All checks passed ==="
