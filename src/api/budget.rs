@@ -262,7 +262,11 @@ mod tests {
         assert_eq!(body["main_currency"], "EUR");
         assert_eq!(body["budget_daily_rate"], 2.0);
         assert_eq!(body["budget_rollover_cap_days"], 7);
-        assert!((body["balance"].as_f64().unwrap() - 10.0).abs() < 1e-6);
+        // Widened from 1e-6: real accrual (2.0/day) lands in the real
+        // seconds between seed's own last_accrual_at and this request's
+        // internal settle_accrual call -- same class of drift as
+        // pricing::mod's own budget tests (see ac7db27).
+        assert!((body["balance"].as_f64().unwrap() - 10.0).abs() < 2e-3);
     }
 
     #[tokio::test]
@@ -347,7 +351,10 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response).await;
-        assert!((body["balance"].as_f64().unwrap() - 25.0).abs() < 1e-6);
+        // Widened from 1e-6: same real-accrual-drift reason as
+        // test_get_settings_returns_the_live_balance_and_settings
+        // above (see ac7db27).
+        assert!((body["balance"].as_f64().unwrap() - 25.0).abs() < 2e-3);
 
         let (reason, message): (String, String) =
             sqlx::query_as("SELECT reason, message FROM events WHERE job_id IS NULL")
