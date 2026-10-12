@@ -199,6 +199,7 @@ mod tests {
                 provider_name: "UpCloud".to_string(),
                 invoice_issuer_name: "UpCloud Ltd".to_string(),
             }),
+            Arc::new(crate::reconcile::TickHealth::new()),
         )
     }
 

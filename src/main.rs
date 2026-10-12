@@ -123,7 +123,16 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    tokio::spawn(reconcile::run(pool.clone(), notify.clone(), job_context));
+    // Shared with the public `/readyz` (Phase 15) so it can report a
+    // real signal -- whether this loop is actually still ticking --
+    // rather than a hardcoded 200.
+    let tick_health = Arc::new(reconcile::TickHealth::new());
+    tokio::spawn(reconcile::run(
+        pool.clone(),
+        notify.clone(),
+        job_context,
+        tick_health.clone(),
+    ));
 
     // Build router. The worker SSH private key is handed in separately
     // (not via JobContext, which is reconcile-loop-only) -- `api::logs`
@@ -146,6 +155,7 @@ async fn main() -> Result<()> {
         notify,
         worker_ssh,
         cost_report_config,
+        tick_health,
     );
 
     let addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port)

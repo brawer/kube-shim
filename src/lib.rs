@@ -14,6 +14,7 @@ pub mod pricing;
 pub mod providers;
 pub mod reconcile;
 pub mod ssh;
+pub mod status_page;
 pub mod tls;
 pub mod volumes;
 pub mod workload;

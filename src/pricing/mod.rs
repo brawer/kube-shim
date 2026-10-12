@@ -96,9 +96,7 @@ async fn charge_breakdown_for_duration(
     // the worker VM -- the cost estimate must size against the exact
     // plan that'll really be provisioned, not a differently-rounded
     // guess of its own.
-    let cpu_cores = cpu_millicores.unwrap_or(1000).div_ceil(1000);
-    let memory_gb = memory_mb.unwrap_or(1024).div_ceil(1024);
-    let Some(plan) = workload::smallest_fitting_server_plan(cpu_cores, memory_gb) else {
+    let Some(plan) = workload::plan_for_resource_requests(cpu_millicores, memory_mb) else {
         return Ok(None);
     };
 

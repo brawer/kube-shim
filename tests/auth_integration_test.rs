@@ -42,6 +42,7 @@ async fn start_server(api_tokens: Vec<ApiToken>) -> String {
             provider_name: "UpCloud".to_string(),
             invoice_issuer_name: "UpCloud Ltd".to_string(),
         }),
+        Arc::new(kube_shim::reconcile::TickHealth::new()),
     );
 
     let std_listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
@@ -249,4 +250,107 @@ async fn test_expired_token_rejected_but_other_token_still_works() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+}
+
+/// Phase 15: the public status page/health endpoints must work with
+/// *no* `Authorization` header at all -- that's the entire point, a
+/// phone browser or an uptime monitor won't send one.
+#[tokio::test]
+async fn test_public_status_page_and_health_endpoints_need_no_token() {
+    let base_url = start_server(vec![ApiToken {
+        token: "correct-token".to_string(),
+        expires_at: None,
+    }])
+    .await;
+
+    for path in ["/", "/statusz", "/livez"] {
+        let resp = insecure_client()
+            .get(format!("{base_url}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "GET {path} with no token");
+    }
+
+    // /healthz and /readyz specifically: 503 is also a legitimate real
+    // answer here (this test server only builds the router -- it never
+    // spawns reconcile::run, so the loop has genuinely never ticked),
+    // but it must never be a 401 -- no-token access is what's being
+    // tested, not readiness itself.
+    for path in ["/healthz", "/readyz"] {
+        let resp = insecure_client()
+            .get(format!("{base_url}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), 401, "GET {path} with no token");
+    }
+}
+
+/// The public sub-router must not accidentally widen the authenticated
+/// API's own exemption -- merging two routers is exactly the kind of
+/// refactor that could silently do that.
+#[tokio::test]
+async fn test_public_router_does_not_widen_the_authenticated_apis_exemption() {
+    let base_url = start_server(vec![ApiToken {
+        token: "correct-token".to_string(),
+        expires_at: None,
+    }])
+    .await;
+
+    let resp = insecure_client()
+        .get(format!("{base_url}/api/v1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+/// GET-only by construction (`status_page`'s own docs) -- no route for
+/// any other method was ever registered on these paths, so there's no
+/// write path here for a future bug to expose.
+#[tokio::test]
+async fn test_public_status_page_rejects_non_get_methods() {
+    let base_url = start_server(vec![ApiToken {
+        token: "correct-token".to_string(),
+        expires_at: None,
+    }])
+    .await;
+
+    for path in ["/", "/statusz", "/healthz", "/livez", "/readyz"] {
+        let resp = insecure_client()
+            .post(format!("{base_url}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status() == 404 || resp.status() == 405,
+            "POST {path} should not succeed, got {}",
+            resp.status()
+        );
+    }
+}
+
+/// The page itself must never leak anything genuinely secret -- the
+/// explicit allowlist `status_page`'s own docs describe. Exercises it
+/// through the real router/real TLS listener, not just the handler in
+/// isolation (`status_page::tests` already covers that).
+#[tokio::test]
+async fn test_public_status_page_never_leaks_worker_ssh_private_key() {
+    let base_url = start_server(vec![ApiToken {
+        token: "correct-token".to_string(),
+        expires_at: None,
+    }])
+    .await;
+
+    let body = insecure_client()
+        .get(format!("{base_url}/"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!body.contains("BEGIN OPENSSH PRIVATE KEY"));
+    assert!(!body.contains("correct-token"));
 }

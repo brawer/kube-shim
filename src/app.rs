@@ -1,8 +1,16 @@
-//! Builds the authenticated `:6443` API router. Kept here (rather than
-//! only in `main.rs`) so integration tests exercise the exact same router
-//! construction the real binary uses, instead of a hand-rolled duplicate.
+//! Builds the `:443` app: the authenticated API sub-router (Phase 2's
+//! bearer-token middleware, CORS) merged with the public, unauthenticated
+//! status-page sub-router (Phase 15) -- two separately-constructed
+//! `Router`s, not one router with routes individually opted out of auth,
+//! so a bug in route registration can't accidentally leave a new
+//! authenticated-API route unprotected or a new public route behind a
+//! token real uptime monitors/phone browsers won't have. Kept here
+//! (rather than only in `main.rs`) so integration tests exercise the
+//! exact same router construction the real binary uses, instead of a
+//! hand-rolled duplicate.
 
-use crate::{api, auth, config, ssh};
+use crate::reconcile::TickHealth;
+use crate::{api, auth, config, ssh, status_page};
 use axum::{
     http::{HeaderName, HeaderValue},
     middleware,
@@ -37,7 +45,8 @@ pub fn server_header_layer() -> SetResponseHeaderLayer<HeaderValue> {
 /// of the reconciliation loop's own `JobContext`. `cost_report_config`
 /// (Phase 14a) is the same pattern again, for `api::cost_report`'s own
 /// need for `resource_prefix`/`zone`/`main_currency`.
-pub fn build_router(
+#[allow(clippy::too_many_arguments)]
+fn authenticated_router(
     pool: sqlx::SqlitePool,
     api_tokens: Arc<Vec<config::ApiToken>>,
     notify: Arc<Notify>,
@@ -134,9 +143,12 @@ pub fn build_router(
         )
         // Rolling budget guard (Phase 14b) -- `notify` (already layered
         // below for `create_cronjob`) wakes the reconciliation loop
-        // immediately on either call, so a job in `BudgetWait` doesn't
-        // wait for the fallback tick to notice a new top-up/settings
-        // change.
+        // immediately on either call. The budget guard rejects at
+        // admission time now, not via a job sitting around waiting
+        // (see `pricing::check_budget`'s own docs), so this specifically
+        // speeds up a CronJob-spawned run that was skipped for
+        // insufficient budget -- it gets retried right away instead of
+        // waiting up to the fallback tick.
         .route(
             "/apis/cost.kube-shim.brawer.ch/v1/settings",
             get(api::budget::get_settings).patch(api::budget::patch_settings),
@@ -150,15 +162,55 @@ pub fn build_router(
         .layer(Extension(cost_report_config))
         .layer(CorsLayer::permissive())
         // Runs before CORS and before any handler, so an unauthenticated
-        // request never reaches application logic at all.
+        // request never reaches application logic at all. Scoped to
+        // just this sub-router -- the public status page/health
+        // endpoints below are merged in separately, outside this
+        // middleware's reach entirely, not exempted route-by-route.
         .layer(middleware::from_fn_with_state(
             api_tokens,
             auth::require_bearer_token,
         ))
-        // Truly outermost: applied to every response, auth failures
-        // included -- which version answered a request isn't sensitive,
-        // and is exactly what you want to see on a 401 while debugging a
-        // stale deployment.
-        .layer(server_header_layer())
         .with_state(pool)
+}
+
+/// The public, unauthenticated sub-router (Phase 15) -- `/`/`/statusz`
+/// plus `/healthz`/`/livez`/`/readyz`. See `status_page`'s own
+/// top-level docs for why this is GET-only by construction and what
+/// it does (and deliberately does not) render. Never passes through
+/// `authenticated_router`'s bearer-token middleware at all, since it's
+/// a separate `Router` merged in alongside it, not a route inside it
+/// with an auth check skipped.
+fn public_router(pool: sqlx::SqlitePool, tick_health: Arc<TickHealth>) -> Router {
+    Router::new()
+        .route("/", get(status_page::render))
+        .route("/statusz", get(status_page::render))
+        .route("/healthz", get(status_page::readyz))
+        .route("/livez", get(status_page::livez))
+        .route("/readyz", get(status_page::readyz))
+        .layer(Extension(tick_health))
+        .with_state(pool)
+}
+
+/// Builds the full `:443` app: `authenticated_router` merged with
+/// `public_router`, with the `Server:` header (`server_header_layer`)
+/// applied outermost to both -- the one thing every response, success
+/// or failure, authenticated or not, should carry.
+#[allow(clippy::too_many_arguments)]
+pub fn build_router(
+    pool: sqlx::SqlitePool,
+    api_tokens: Arc<Vec<config::ApiToken>>,
+    notify: Arc<Notify>,
+    worker_ssh: Arc<ssh::WorkerSshConfig>,
+    cost_report_config: Arc<api::cost_report::CostReportConfig>,
+    tick_health: Arc<TickHealth>,
+) -> Router {
+    authenticated_router(
+        pool.clone(),
+        api_tokens,
+        notify,
+        worker_ssh,
+        cost_report_config,
+    )
+    .merge(public_router(pool, tick_health))
+    .layer(server_header_layer())
 }
