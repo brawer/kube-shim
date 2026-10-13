@@ -39,7 +39,7 @@ async fn scan_and_clean_volumes(pool: &SqlitePool, ctx: &JobContext) -> Result<u
     .into_iter()
     .collect();
 
-    let ours_prefix = format!("{}-vol-", ctx.resource_prefix);
+    let ours_prefix = crate::naming::volume_prefix(&ctx.resource_prefix);
     let mut cleaned = 0;
 
     for volume in remote_volumes {
@@ -81,7 +81,7 @@ async fn scan_and_clean_servers(pool: &SqlitePool, ctx: &JobContext) -> Result<u
             .into_iter()
             .collect();
 
-    let ours_prefix = format!("{}-worker-", ctx.resource_prefix);
+    let ours_prefix = crate::naming::worker_prefix(&ctx.resource_prefix);
     let mut cleaned = 0;
 
     for server in remote_servers {

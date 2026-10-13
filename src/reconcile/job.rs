@@ -630,7 +630,7 @@ async fn handle_volume_pending(
         return Ok(true);
     }
 
-    let title = format!("{}-vol-{name}", ctx.resource_prefix);
+    let title = crate::naming::volume_title(&ctx.resource_prefix, namespace, name);
 
     // Phase 11: idempotency -- a crash between create_volume() succeeding
     // and insert_job_volume() committing below would otherwise create a
@@ -646,7 +646,7 @@ async fn handle_volume_pending(
                  creating a duplicate",
                 found.id
             );
-            insert_job_volume(pool, job_id, size_gb, tier, &found.id).await?;
+            insert_job_volume(pool, job_id, size_gb, tier, &found.id, &found.title).await?;
             return Ok(true);
         }
     }
@@ -664,7 +664,7 @@ async fn handle_volume_pending(
                 "job {namespace}/{name}: created volume {} ({size_gb}GB, {tier:?})",
                 volume.id
             );
-            insert_job_volume(pool, job_id, size_gb, tier, &volume.id).await?;
+            insert_job_volume(pool, job_id, size_gb, tier, &volume.id, &volume.title).await?;
             Ok(true)
         }
         Err(err) => {
@@ -759,7 +759,7 @@ async fn handle_vm_pending(
         }
     };
 
-    let title = format!("{}-worker-{name}", ctx.resource_prefix);
+    let title = crate::naming::worker_title(&ctx.resource_prefix, namespace, name);
 
     // Phase 11: idempotency -- same reasoning as handle_volume_pending's
     // own check. A crash between create_server() succeeding and
@@ -1322,13 +1322,14 @@ async fn insert_job_volume(
     size_gb: u32,
     tier: volumes::StorageTier,
     provider_volume_id: &str,
+    provider_volume_name: &str,
 ) -> Result<()> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().timestamp();
     sqlx::query(
         r#"
-        INSERT INTO job_volumes (id, job_id, size_gb, storage_class_name, provider_volume_id, mount_point, created_at)
-        VALUES (?, ?, ?, ?, ?, NULL, ?)
+        INSERT INTO job_volumes (id, job_id, size_gb, storage_class_name, provider_volume_id, provider_volume_name, mount_point, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
         "#,
     )
     .bind(id)
@@ -1336,6 +1337,7 @@ async fn insert_job_volume(
     .bind(size_gb)
     .bind(tier.class_name())
     .bind(provider_volume_id)
+    .bind(provider_volume_name)
     .bind(now)
     .execute(pool)
     .await?;
@@ -1893,7 +1895,7 @@ mod tests {
         assert_eq!(worker_vm_id.as_deref(), Some("srv-real-1"));
         assert_eq!(
             worker_vm_name.as_deref(),
-            Some("kube-shim-test-worker-job-one")
+            Some("kube-shim-test-worker-default-job-one")
         );
     }
 
@@ -2812,7 +2814,7 @@ mod tests {
                 "/1.3/storage/normal",
                 axum::routing::get(|| async {
                     axum::Json(serde_json::json!({"storages": {"storage": [
-                        {"uuid": "vol-existing", "size": 1, "tier": "maxiops", "title": "kube-shim-test-vol-job-one", "zone": "de-fra1"}
+                        {"uuid": "vol-existing", "size": 1, "tier": "maxiops", "title": "kube-shim-test-vol-default-job-one", "zone": "de-fra1"}
                     ]}}))
                 }),
             )
@@ -2855,6 +2857,71 @@ mod tests {
         assert_eq!(provider_volume_id, "vol-existing");
     }
 
+    /// Phase 16: a job named identically to one in a *different*
+    /// namespace must never have the Phase 11 idempotency-reuse check
+    /// above alias onto that other namespace's volume -- `name` alone
+    /// is only unique per-namespace (`api::job::create_job`'s own
+    /// uniqueness check), so the title built from it must include
+    /// `namespace` too (see `naming`'s own docs for the bug this
+    /// closes). The existing volume here is titled for "staging",
+    /// this job is "default" -- real creation must still happen.
+    #[tokio::test]
+    async fn test_volume_pending_does_not_reuse_another_namespaces_identically_named_job() {
+        let create_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let create_called_clone = create_called.clone();
+        let app = axum::Router::new()
+            .route(
+                "/1.3/storage/normal",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({"storages": {"storage": [
+                        {"uuid": "vol-other-ns", "size": 1, "tier": "maxiops", "title": "kube-shim-test-vol-staging-job-one", "zone": "de-fra1"}
+                    ]}}))
+                }),
+            )
+            .route(
+                "/1.3/storage",
+                axum::routing::post(move || {
+                    create_called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                    async {
+                        axum::Json(serde_json::json!({"storage": {
+                            "uuid": "vol-new", "size": 1, "tier": "maxiops",
+                            "title": "kube-shim-test-vol-default-job-one", "zone": "de-fra1"
+                        }}))
+                    }
+                }),
+            );
+        let provider = crate::providers::upcloud::tests::mock_server(app).await;
+        let mut ctx = mock_ctx(false);
+        ctx.provider = Arc::new(provider);
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
+             VALUES ('j1', 'job-one', 'default', ?, 'VolumePending', ?, ?, 1)",
+        )
+        .bind(ephemeral_volume_spec())
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let advanced = advance_all(&pool, &ctx).await.unwrap();
+        assert_eq!(advanced, 1);
+        assert!(
+            create_called.load(std::sync::atomic::Ordering::SeqCst),
+            "must create its own volume, never alias onto another namespace's"
+        );
+
+        let provider_volume_id: String =
+            sqlx::query_scalar("SELECT provider_volume_id FROM job_volumes WHERE job_id = 'j1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(provider_volume_id, "vol-new");
+    }
+
     #[tokio::test]
     async fn test_vm_pending_reuses_existing_untracked_server_instead_of_duplicating() {
         let create_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2864,7 +2931,7 @@ mod tests {
                 "/1.3/server",
                 axum::routing::get(|| async {
                     axum::Json(serde_json::json!({"servers": {"server": [
-                        {"uuid": "srv-existing", "title": "kube-shim-test-worker-job-one", "state": "started", "zone": "de-fra1"}
+                        {"uuid": "srv-existing", "title": "kube-shim-test-worker-default-job-one", "state": "started", "zone": "de-fra1"}
                     ]}}))
                 })
                 .post(move || {
