@@ -1,0 +1,38 @@
+[server]
+host = "0.0.0.0"
+port = 8443
+tls_cert_path = "/data/cert.pem"
+tls_key_path = "/data/key.pem"
+hostname = "${hostname}"
+acme_directory = "${acme_directory}"
+%{ if acme_contact_email != null ~}
+acme_contact_email = "${acme_contact_email}"
+%{ endif ~}
+acme_cache_dir = "/data/acme-cache"
+
+%{ for token in api_tokens ~}
+[[server.api_tokens]]
+token = "${token}"
+
+%{ endfor ~}
+[database]
+path = "/data/db.sqlite"
+
+[upcloud]
+token = "${upcloud_runtime_token}"
+dry_run = ${dry_run}
+zone = "${zone}"
+worker_template_uuid = "${worker_template_uuid}"
+worker_ssh_public_keys = ["${worker_ssh_public_key}"]
+worker_ssh_private_key = """
+${worker_ssh_private_key}
+"""
+
+[reconciliation]
+interval_secs = ${reconciliation_interval_secs}
+
+[shim]
+resource_prefix = "${resource_prefix}"
+main_currency = "${main_currency}"
+budget_daily_rate = ${budget_daily_rate}
+budget_rollover_cap_days = ${budget_rollover_cap_days}

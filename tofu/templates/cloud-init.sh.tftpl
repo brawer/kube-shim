@@ -1,0 +1,83 @@
+#!/bin/bash
+set -e
+
+# kube-shim first-boot provisioning, run automatically via UpCloud's
+# user_data mechanism (cloud-init executes this as root on first boot).
+# Adapted from bootstrap/provision.sh's own already-verified steps --
+# see that script's comments for the "why" behind each one; this
+# version additionally automates the steps provision.sh prints as
+# manual "Next steps" instructions for a human to run themselves
+# (copying the quadlet unit, starting the service), since there's no
+# interactive operator here to do that.
+
+exec > >(tee /var/log/kube-shim-cloud-init.log) 2>&1
+echo "=== kube-shim cloud-init starting at $(date -u) ==="
+
+SERVICE_USER="kube-shim"
+
+apt-get update
+apt-get upgrade -y
+apt-get install -y curl openssl podman systemd-container
+
+echo 'net.ipv4.ip_unprivileged_port_start=80' > /etc/sysctl.d/99-podman-unprivileged-ports.conf
+sysctl --system >/dev/null
+
+if ! id "$SERVICE_USER" >/dev/null 2>&1; then
+    useradd --system --create-home --shell /bin/bash "$SERVICE_USER"
+fi
+
+if ! grep -q "^$SERVICE_USER:" /etc/subuid 2>/dev/null; then
+    usermod --add-subuids 200000-265535 --add-subgids 200000-265535 "$SERVICE_USER"
+fi
+
+loginctl enable-linger "$SERVICE_USER"
+
+USER_HOME=$(getent passwd "$SERVICE_USER" | cut -d: -f6)
+DATA_DIR="$USER_HOME/kube-shim-data"
+QUADLET_DIR="$USER_HOME/.config/containers/systemd"
+mkdir -p "$DATA_DIR" "$QUADLET_DIR"
+
+echo "Generating self-signed fallback TLS certificate..."
+openssl req -x509 -newkey rsa:4096 -keyout "$DATA_DIR/key.pem" -out "$DATA_DIR/cert.pem" \
+    -days 365 -nodes -subj "/CN=localhost"
+
+echo "Writing config.toml..."
+cat > "$DATA_DIR/config.toml" << 'KUBE_SHIM_CONFIG_EOF'
+${config_toml_content}
+KUBE_SHIM_CONFIG_EOF
+
+echo "Writing quadlet unit..."
+echo "${quadlet_unit_content_base64}" | base64 -d > "$QUADLET_DIR/kube-shim.container"
+
+chown -R "$SERVICE_USER:$SERVICE_USER" "$USER_HOME/kube-shim-data" "$USER_HOME/.config"
+
+echo "Fixing data directory ownership for the container's own UID 1000..."
+SERVICE_UID=$(id -u "$SERVICE_USER")
+cd /
+sudo -u "$SERVICE_USER" -H env XDG_RUNTIME_DIR="/run/user/$SERVICE_UID" \
+    podman unshare chown -R 1000:1000 "$DATA_DIR"
+
+echo "Starting kube-shim.service as $SERVICE_USER..."
+# machinectl shell -- the same mechanism provision.sh's own "Next
+# steps" instructs a human to run interactively -- properly
+# initializes the service user's systemd --user session (including
+# $XDG_RUNTIME_DIR), which a plain `sudo -u $SERVICE_USER systemctl
+# --user ...` does not. loginctl enable-linger above should mean the
+# user manager is already up by the time this runs, but retry a few
+# times regardless in case of a first-boot timing race -- this exact
+# step has not been verified against a real, live apply yet (unlike
+# every other step here, lifted directly from provision.sh's own
+# hands-on-verified sequence), so if first-boot provisioning ever
+# stalls here, this is the first thing to check by hand.
+for attempt in $(seq 1 10); do
+    if machinectl shell "$SERVICE_USER@" /bin/bash -c \
+        "systemctl --user daemon-reload && systemctl --user enable --now kube-shim.service && systemctl --user enable --now podman-auto-update.timer"
+    then
+        echo "kube-shim.service started."
+        break
+    fi
+    echo "machinectl shell not ready yet (attempt $attempt/10), retrying in 5s..."
+    sleep 5
+done
+
+echo "=== kube-shim cloud-init finished at $(date -u) ==="
