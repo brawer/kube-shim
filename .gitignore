@@ -38,3 +38,17 @@ Thumbs.db
 # Build artifacts
 dist/
 build/
+
+# OpenTofu -- .terraform.lock.hcl (provider version pins) IS tracked,
+# same reproducibility reasoning as Cargo.lock above; everything else
+# here is either a local provider-binary cache or may contain real
+# secrets (state can embed sensitive resource attributes in plain
+# text, e.g. the minted bearer tokens/private key -- see tofu/README.md).
+tofu/.terraform/
+tofu/**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+crash.*.log
