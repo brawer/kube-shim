@@ -42,6 +42,12 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     // `ChargePeriodEnd`, not an approximation from a column that keeps
     // moving after the job itself actually finished.
     ("jobs", "completed_at", "INTEGER"),
+    // Phase 16: the real UpCloud title a job's ephemeral volume was
+    // created with -- same reasoning as `jobs.worker_vm_name` (already
+    // tracked since Phase 9), for the same "easy lookup without
+    // re-deriving the naming convention by hand" reason, now extended
+    // to volumes too.
+    ("job_volumes", "provider_volume_name", "TEXT"),
 ];
 
 pub async fn run(pool: &SqlitePool) -> Result<()> {

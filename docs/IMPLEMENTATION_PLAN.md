@@ -1023,7 +1023,7 @@ curl -k https://kube-shim.brawer.ch/api/v1
 
 ---
 
-### Phase 16: Resource Naming + Cleanup (Days 16-17)
+### Phase 16: Resource Naming + Cleanup (Days 16-17) — ✅ Complete
 **Goal:** Identify resources created by this shim instance specifically, and enable manual cleanup.
 
 **Deliverables:**
@@ -1052,6 +1052,25 @@ curl -H "Authorization: Bearer $TOKEN" https://api.upcloud.com/1.3/storage | jq 
 ./cleanup-orphans.sh
 # Should delete only this instance's volumes/VMs older than 7 days
 ```
+
+**What was actually built, with the real findings/corrections this plan's own text didn't anticipate:**
+
+- **Resource-prefix-based naming and orphan-scan matching were already real and shipped, well ahead of this phase** -- `resource_prefix` has been threaded into both the volume and worker-VM title (`{resource_prefix}-vol-...`/`{resource_prefix}-worker-...`) and into `orphan_scan`'s own prefix match since Phase 8/9, not hardcoded as this phase's own plan text assumed. Confirmed by re-reading the actual code before writing anything, the same way earlier phases have repeatedly found pieces of a "future" phase already done. This phase's real work turned out to be a correctness fix on top of that, not building it from scratch.
+- **A real, exploitable naming bug, found by re-checking this convention against `api::job::create_job`'s own uniqueness rule while writing `src/naming.rs` -- not from an observed failure**: a job's `name` is only ever checked for uniqueness *within* its namespace (`WHERE name = ? AND namespace = ?`, matching real Kubernetes), but the volume/worker-VM title built from it used `name` alone, with no `namespace`. Two jobs named identically in different namespaces (an entirely ordinary scenario -- e.g. two teams' namespaces each running a job called `nightly-sync`) would generate the exact same UpCloud resource title. The Phase 11 idempotency-reuse check (`handle_volume_pending`/`handle_vm_pending`'s own "does a resource titled exactly this already exist? reuse it instead of creating a duplicate") would then find the *other* namespace's job's resource and silently alias onto it -- two logically distinct jobs ending up sharing one real volume or worker VM. Fixed by centralizing the convention in the new `src/naming.rs` (`volume_title`/`worker_title`/`volume_prefix`/`worker_prefix`) with `namespace` included, and reproduced the exact scenario in a new regression test (`test_volume_pending_does_not_reuse_another_namespaces_identically_named_job`: an existing volume titled for `staging/job-one`, a new job `default/job-one` -- asserts a real, separate volume gets created, not a reuse). One narrow case is intentionally left unguarded -- see `naming.rs`'s own docs for why (a dash-position ambiguity between namespace/name pairs, vs. the readability/length cost of a UUID suffix).
+- **"Database tracks resource names for easy lookup" was half-true**: `jobs.worker_vm_name` was already tracked (Phase 9), but `job_volumes` had no equivalent column for its own real UpCloud title. Added `job_volumes.provider_volume_name` via a real migration (`src/db/migrations.rs`'s `ADDED_COLUMNS`, not a `schema.sql` edit -- editing an already-shipped `CREATE TABLE` is a no-op against a database that predates the edit, per that module's own docs), populated in both `handle_volume_pending` branches from the provider's own echoed-back title (`volume.title`/`found.title`), matching the `worker_vm_name` precedent exactly rather than inventing a second, different convention.
+- **`bootstrap/cleanup-orphans.sh`'s "older than 7 days" criterion required checking what UpCloud's real API actually returns, not assuming a `created` field exists everywhere**: confirmed against UpCloud's own API docs that `GET /storage` (the list endpoint) only includes a `created` timestamp on backup-type storage objects, not the normal-tier volumes this project actually creates -- there is no reliable per-volume age signal available via the public API at all. `GET /server/{uuid}` (a detail fetch, not the list) does include a real `created` unix timestamp, confirmed the same way, so servers *are* age-filtered against the threshold. Volumes are listed as orphan candidates (prefix + zone match, untracked) with their age explicitly reported as unknown rather than silently treated as always-eligible or never-eligible. Dry-run by default; `--yes` required to actually delete anything. Verified against local, synthetic fixtures (a fake `curl` returning canned JSON, a scratch SQLite db) covering tracked-exclusion, prefix-matching, zone-scoping, and the age threshold on both sides of 7 days -- deliberately *not* run against the real UpCloud account/token, consistent with this project's own heightened care around that specific credential.
+- Drive-by: `src/config.rs`'s `ShimConfig` doc comments referenced stale phase numbers (`Phase 13`/`Phase 15`) for fields shipped under Phase 14a/14b/8-9 -- corrected while already touching this struct's neighboring `resource_prefix` field.
+
+**Files created/modified:**
+- `src/naming.rs` (new) -- `volume_title`/`worker_title`/`volume_prefix`/`worker_prefix`; 5 tests
+- `src/reconcile/job.rs` -- `handle_volume_pending`/`handle_vm_pending` use `naming::` instead of their own inline `format!`; `insert_job_volume` gains `provider_volume_name`; 1 new regression test, 3 existing test title strings updated
+- `src/db/migrations.rs` -- `job_volumes.provider_volume_name` (new column)
+- `src/reconcile/orphan_scan.rs` -- uses `naming::volume_prefix`/`naming::worker_prefix` instead of its own inline `format!`
+- `src/lib.rs` -- `pub mod naming;`
+- `src/config.rs` -- stale phase-number doc comments corrected
+- `bootstrap/cleanup-orphans.sh` (new) -- manual orphan cleanup, `resource_prefix`+zone-aware, age-filtered where UpCloud's API actually supports it
+
+**Testing:** 323 lib tests (6 net new) passing; `cargo fmt --check`/`cargo clippy --all-targets -- -D warnings` clean; `cleanup-orphans.sh` verified against local synthetic fixtures (see above), `shellcheck`-clean.
 
 ---
 

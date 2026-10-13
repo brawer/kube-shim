@@ -21,10 +21,11 @@ pub struct Config {
     /// Shim-wide settings that aren't specific to the HTTP server, the
     /// database, or any one cloud provider. Optional in TOML (defaults to
     /// `ShimConfig::default()` if the whole `[shim]` table is absent) --
-    /// see Phase 5, which only reserves this shape; nothing reads
-    /// `budget_daily_rate`/`budget_rollover_cap_days`/`main_currency` yet
-    /// (Phase 13), and `resource_prefix` isn't threaded through naming
-    /// until Phase 15.
+    /// this shape was only reserved in Phase 5; `budget_daily_rate`/
+    /// `budget_rollover_cap_days`/`main_currency` are read starting
+    /// Phase 14a/14b, and `resource_prefix` is threaded through naming
+    /// starting Phase 8/9 (orphan scan, VM/volume titles), each field's
+    /// own doc comment below has the specifics.
     #[serde(default)]
     pub shim: ShimConfig,
 }
@@ -170,19 +171,19 @@ pub struct ShimConfig {
     /// Prefix on every cloud resource this shim instance creates (volumes,
     /// VMs, ...), so more than one independent kube-shim instance can run
     /// against the same cloud account without naming collisions or
-    /// cross-instance orphan-scan interference (Phase 15).
+    /// cross-instance orphan-scan interference (Phase 16).
     #[serde(default = "default_resource_prefix")]
     pub resource_prefix: String,
     /// The currency cost figures are reported in -- the operator's own
     /// choice (e.g. "CHF"), converted from the cloud provider's real
-    /// EUR-denominated spend via the ECB's daily reference rate (Phase 13).
+    /// EUR-denominated spend via the ECB's daily reference rate (Phase 14a).
     #[serde(default = "default_main_currency")]
     pub main_currency: String,
-    /// Rolling budget accrual rate, in `main_currency` per day (Phase 13).
+    /// Rolling budget accrual rate, in `main_currency` per day (Phase 14b).
     #[serde(default)]
     pub budget_daily_rate: f64,
     /// Caps how many days of unspent `budget_daily_rate` can accrue before
-    /// it stops growing further (Phase 13).
+    /// it stops growing further (Phase 14b).
     #[serde(default = "default_budget_rollover_cap_days")]
     pub budget_rollover_cap_days: u32,
 }
