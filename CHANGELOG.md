@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.7](https://github.com/brawer/kube-shim/compare/v0.2.6...v0.2.7) (2026-10-13)
+
+
+### 🆕 Enhancements
+
+* Phase 16 -- resource naming correctness fix + manual orphan cleanup ([e25adf6](https://github.com/brawer/kube-shim/commit/e25adf6d26038c01853058c4551d19ee49bec413))
+
+
+### 🐞 Bug Fixes
+
+* widen two more budget test tolerances missed by ac7db27 ([aced007](https://github.com/brawer/kube-shim/commit/aced007c1fcb2aef5176bb118d1d1d8515f792b9))
+
 ## [0.2.6](https://github.com/brawer/kube-shim/compare/v0.2.5...v0.2.6) (2026-10-12)
 
 
