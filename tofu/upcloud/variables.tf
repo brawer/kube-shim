@@ -40,14 +40,14 @@ variable "operator_ssh_public_keys" {
   type        = list(string)
 }
 
-variable "ssh_allowed_source_ips" {
+variable "ssh_allowed_source_ipv4_ranges" {
   description = "IPv4 CIDR ranges allowed to reach the host's SSH port (22) at all. Defaults to open (0.0.0.0/0) -- tighten this to your own known IP ranges once you have them. This is a network-level filter only, evaluated before a connection is even accepted; it's independent of (and no substitute for) the SSH key authentication that still governs who can log in once a connection from an allowed range gets through."
   type        = list(string)
   default     = ["0.0.0.0/0"]
 }
 
 variable "ssh_allowed_source_ipv6_ranges" {
-  description = "Same as ssh_allowed_source_ips, for IPv6. Defaults to open (::/0)."
+  description = "Same as ssh_allowed_source_ipv4_ranges, for IPv6. Defaults to open (::/0)."
   type        = list(string)
   default     = ["::/0"]
 }
@@ -122,3 +122,20 @@ variable "reconciliation_interval_secs" {
   type        = number
   default     = 10
 }
+
+# Deliberately commented out, not deleted (kept from an earlier pass
+# at review's own request): intended to let deploy/kube-shim.container's
+# Image=... line be overridden to pin an explicit version instead of
+# always tracking :latest. Re-enabling this means that line can no
+# longer be read verbatim via file() -- it needs to become a real
+# template placeholder instead, which would break
+# bootstrap/provision.sh's existing manual copy-the-file-as-is flow
+# for the one real deployment that still uses it today. Revisit once
+# that deployment has been migrated onto this OpenTofu module instead
+# (tracked to land in a follow-up PR, not this one).
+#
+# variable "kube_shim_image_tag" {
+#   description = "Image tag for ghcr.io/brawer/kube-shim. \"latest\" (default) matches deploy/kube-shim.container's own checked-in AutoUpdate=registry behavior; pin an explicit version (e.g. \"v0.2.7\") for a deliberate, manually-updated deployment instead."
+#   type        = string
+#   default     = "latest"
+# }

@@ -116,7 +116,7 @@ resource "upcloud_firewall_rules" "kube_shim" {
   server_id = upcloud_server.kube_shim.id
 
   dynamic "firewall_rule" {
-    for_each = var.ssh_allowed_source_ips
+    for_each = var.ssh_allowed_source_ipv4_ranges
     content {
       action                 = "accept"
       direction              = "in"
