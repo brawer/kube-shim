@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.8](https://github.com/brawer/kube-shim/compare/v0.2.7...v0.2.8) (2026-10-15)
+
+
+### 🆕 Enhancements
+
+* add tofu/ -- a reusable OpenTofu module to provision kube-shim on UpCloud ([12c8724](https://github.com/brawer/kube-shim/commit/12c87243675e8a0c1e539dc0985090666cc95e76))
+
+
+### 🐞 Bug Fixes
+
+* address review on the OpenTofu module (real bug + dual-stack + cleanup) ([1f1c710](https://github.com/brawer/kube-shim/commit/1f1c7109719093b965c869fe0e30cc5346fe2980))
+* address second round of review on the OpenTofu module ([6045d4d](https://github.com/brawer/kube-shim/commit/6045d4d834cfc7cea647273e615e87aee85dce98))
+
 ## [0.2.7](https://github.com/brawer/kube-shim/compare/v0.2.6...v0.2.7) (2026-10-13)
 
 
