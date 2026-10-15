@@ -1,4 +1,4 @@
-# kube-shim OpenTofu module
+# kube-shim OpenTofu module (UpCloud)
 
 Provisions a single, fully-bootstrapped `kube-shim` instance on UpCloud:
 the host itself (podman, the unprivileged-port sysctl, the dedicated
@@ -14,12 +14,17 @@ configuration (e.g. a separate infrastructure repo that also defines
 your real `CronJob`s against the instance this creates) -- it has no
 `provider` blocks of its own, by Terraform/OpenTofu convention.
 
+Lives at `tofu/upcloud/`, not `tofu/`, so a future module targeting a
+different VPS provider can sit alongside it at `tofu/<provider>/`
+without this one having to move later.
+
 ## What this module does NOT do
 
 - **Create a DNS record.** UpCloud's own OpenTofu provider has nothing
   to do with DNS, and providers vary, so this is left to your root
-  config -- point your own provider's record at this module's
-  `public_ipv4` output.
+  config -- point your own provider's A/AAAA records at this module's
+  `public_ipv4`/`public_ipv6` outputs. The host itself is provisioned
+  dual-stack regardless of whether you wire up both.
 - **Mint a scoped UpCloud API token for the shim's own runtime use.**
   UpCloud's OpenTofu provider has no resource for creating a
   sub-account/API-scoped credential (checked against the provider's
@@ -46,7 +51,13 @@ provider "upcloud" {
 }
 
 module "kube_shim" {
-  source = "github.com/brawer/kube-shim//tofu"
+  # The `//` is intentional, not a typo: Terraform/OpenTofu's own
+  # module-source syntax for "this module lives in a subdirectory of
+  # a larger repo" is `<repo-url>//<path-within-repo>` -- the part
+  # before `//` is what actually gets cloned, the part after says
+  # where inside it to look. A single slash would instead look for a
+  # (nonexistent) GitHub repo literally named `kube-shim/tofu`.
+  source = "github.com/brawer/kube-shim//tofu/upcloud"
 
   hostname                 = "kube-shim.example.com"
   operator_ssh_public_keys = ["ssh-ed25519 AAAA... you@yourlaptop"]
@@ -55,8 +66,12 @@ module "kube_shim" {
   budget_daily_rate        = 2.5
 }
 
-output "kube_shim_public_ip" {
+output "kube_shim_public_ipv4" {
   value = module.kube_shim.public_ipv4
+}
+
+output "kube_shim_public_ipv6" {
+  value = module.kube_shim.public_ipv6
 }
 
 output "kube_shim_api_tokens" {
@@ -82,7 +97,10 @@ start-vs-renewal failure handling). The real sequence:
 
 1. `tofu apply` with `acme_directory = "staging"` and whatever
    `hostname` you intend to use.
-2. Point your DNS record at the resulting `public_ipv4` output.
+2. Point your DNS record(s) at the resulting `public_ipv4`/`public_ipv6`
+   outputs (an A record is enough; add the AAAA record too if you
+   want DNS to actually prefer IPv6 for clients that support it --
+   either way, the host answers HTTPS on both).
 3. Once that resolves, set `acme_directory = "production"` and
    `tofu apply` again (this updates `user_data` in place rather than
    destroying/recreating the server, but whether that alone is

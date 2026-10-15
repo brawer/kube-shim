@@ -47,8 +47,22 @@ resource "upcloud_server" "kube_shim" {
     size    = 25
   }
 
+  # Dual-stack: two separate "public" interfaces, not one interface
+  # with two addresses -- confirmed against the upcloud provider's own
+  # acceptance-test fixtures (ip_address_family defaults to IPv4 when
+  # omitted; a second interface with it set to "IPv6" is the real,
+  # working shape for a dual-stack public-facing server). Index 1/2
+  # pinned explicitly so a later edit here can't accidentally reorder
+  # which interface index[0]/index[1] below refer to.
   network_interface {
-    type = "public"
+    type  = "public"
+    index = 1
+  }
+
+  network_interface {
+    type              = "public"
+    index             = 2
+    ip_address_family = "IPv6"
   }
 
   login {
@@ -67,7 +81,12 @@ resource "upcloud_server" "kube_shim" {
       upcloud_runtime_token = var.upcloud_runtime_token
       dry_run               = var.dry_run
       zone                  = var.zone
-      worker_template_uuid  = var.worker_template_uuid
+      # Not a variable: config.rs's own docs confirm this UUID is a
+      # public, account-independent UpCloud template shared across
+      # every account/zone, not something a real deployment has ever
+      # needed to override -- a knob with no real use isn't worth the
+      # module's own surface area (flagged in review).
+      worker_template_uuid = "01000000-0000-4000-8000-000030240200"
       # trimspace: public_key_openssh has a trailing newline, which
       # would land inside a single-line TOML basic string
       # (worker_ssh_public_keys = ["..."]) -- a literal embedded
@@ -89,7 +108,7 @@ resource "upcloud_server" "kube_shim" {
     # cloud-init.sh.tftpl already, with no systemd-template syntax
     # of its own (`%h`, `%i`) needing to survive that; base64 sidesteps
     # any need to reason about escaping either layer.
-    quadlet_unit_content_base64 = base64encode(file("${path.module}/../deploy/kube-shim.container"))
+    quadlet_unit_content_base64 = base64encode(file("${path.module}/../../deploy/kube-shim.container"))
   })
 }
 
@@ -112,7 +131,22 @@ resource "upcloud_firewall_rules" "kube_shim" {
       # common "just my one IP" case correctly too.
       source_address_start = cidrhost(firewall_rule.value, 0)
       source_address_end   = cidrhost(firewall_rule.value, -1)
-      comment              = "SSH management access"
+      comment              = "SSH management access (IPv4)"
+    }
+  }
+
+  dynamic "firewall_rule" {
+    for_each = var.ssh_allowed_source_ipv6_ranges
+    content {
+      action                 = "accept"
+      direction              = "in"
+      family                 = "IPv6"
+      protocol               = "tcp"
+      destination_port_start = "22"
+      destination_port_end   = "22"
+      source_address_start   = cidrhost(firewall_rule.value, 0)
+      source_address_end     = cidrhost(firewall_rule.value, -1)
+      comment                = "SSH management access (IPv6)"
     }
   }
 
@@ -125,7 +159,19 @@ resource "upcloud_firewall_rules" "kube_shim" {
     destination_port_end   = "443"
     source_address_start   = "0.0.0.0"
     source_address_end     = "255.255.255.255"
-    comment                = "Authenticated API + public status page (HTTPS)"
+    comment                = "Authenticated API + public status page (HTTPS, IPv4)"
+  }
+
+  firewall_rule {
+    action                 = "accept"
+    direction              = "in"
+    family                 = "IPv6"
+    protocol               = "tcp"
+    destination_port_start = "443"
+    destination_port_end   = "443"
+    source_address_start   = "::"
+    source_address_end     = "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"
+    comment                = "Authenticated API + public status page (HTTPS, IPv6)"
   }
 
   firewall_rule {
@@ -137,13 +183,37 @@ resource "upcloud_firewall_rules" "kube_shim" {
     destination_port_end   = "80"
     source_address_start   = "0.0.0.0"
     source_address_end     = "255.255.255.255"
-    comment                = "ACME HTTP-01 challenge responder"
+    comment                = "ACME HTTP-01 challenge responder (IPv4)"
   }
 
   firewall_rule {
-    action    = "deny"
+    action                 = "accept"
+    direction              = "in"
+    family                 = "IPv6"
+    protocol               = "tcp"
+    destination_port_start = "80"
+    destination_port_end   = "80"
+    source_address_start   = "::"
+    source_address_end     = "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"
+    comment                = "ACME HTTP-01 challenge responder (IPv6)"
+  }
+
+  # "drop", not "deny" -- the only two valid `action` values the real
+  # provider accepts are accept|drop (confirmed against its own schema
+  # docs after review caught this; `tofu validate` doesn't catch a
+  # wrong-but-well-typed enum string, since the schema itself types
+  # this field as a plain, unconstrained string).
+  firewall_rule {
+    action    = "drop"
     direction = "in"
     family    = "IPv4"
-    comment   = "Deny everything else inbound"
+    comment   = "Drop everything else inbound (IPv4)"
+  }
+
+  firewall_rule {
+    action    = "drop"
+    direction = "in"
+    family    = "IPv6"
+    comment   = "Drop everything else inbound (IPv6)"
   }
 }

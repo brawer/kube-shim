@@ -41,9 +41,15 @@ variable "operator_ssh_public_keys" {
 }
 
 variable "ssh_allowed_source_ips" {
-  description = "CIDR ranges allowed to reach the host's SSH port (22). Defaults to open (0.0.0.0/0) -- tighten this to your own known IP ranges once you have them; UpCloud's firewall_rule block doesn't support SSH key auth as a substitute for this, only network-level filtering."
+  description = "IPv4 CIDR ranges allowed to reach the host's SSH port (22) at all. Defaults to open (0.0.0.0/0) -- tighten this to your own known IP ranges once you have them. This is a network-level filter only, evaluated before a connection is even accepted; it's independent of (and no substitute for) the SSH key authentication that still governs who can log in once a connection from an allowed range gets through."
   type        = list(string)
   default     = ["0.0.0.0/0"]
+}
+
+variable "ssh_allowed_source_ipv6_ranges" {
+  description = "Same as ssh_allowed_source_ips, for IPv6. Defaults to open (::/0)."
+  type        = list(string)
+  default     = ["::/0"]
 }
 
 variable "upcloud_runtime_token" {
@@ -68,12 +74,6 @@ variable "dry_run" {
   description = "config.toml's [upcloud] dry_run. Leave true to stand up and verify this module itself without provisioning any real worker VMs/volumes yet."
   type        = bool
   default     = false
-}
-
-variable "worker_template_uuid" {
-  description = "OS template UUID worker VMs' boot disks are cloned from (config.toml's [upcloud] worker_template_uuid). The shim's own default (a public, account-independent UUID) is almost always correct -- see config.rs's own docs."
-  type        = string
-  default     = "01000000-0000-4000-8000-000030240200"
 }
 
 variable "resource_prefix" {
@@ -115,12 +115,6 @@ variable "api_token_count" {
   EOT
   type        = number
   default     = 1
-}
-
-variable "kube_shim_image_tag" {
-  description = "Image tag for ghcr.io/brawer/kube-shim. \"latest\" (default) matches deploy/kube-shim.container's own checked-in AutoUpdate=registry behavior; pin an explicit version (e.g. \"v0.2.7\") for a deliberate, manually-updated deployment instead."
-  type        = string
-  default     = "latest"
 }
 
 variable "reconciliation_interval_secs" {

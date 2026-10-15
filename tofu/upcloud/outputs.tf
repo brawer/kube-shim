@@ -3,6 +3,11 @@ output "public_ipv4" {
   value       = upcloud_server.kube_shim.network_interface[0].ip_address
 }
 
+output "public_ipv6" {
+  description = "The host's public IPv6 address. Point an AAAA record at this too, if your DNS provider/zone supports one, for real dual-stack reachability -- this module provisions and firewalls the IPv6 side (see main.tf) regardless of whether you wire up AAAA."
+  value       = upcloud_server.kube_shim.network_interface[1].ip_address
+}
+
 output "server_id" {
   description = "UpCloud UUID of the host, e.g. for `upctl server show` or building a kubernetes_provider config that also needs to reference it directly."
   value       = upcloud_server.kube_shim.id
