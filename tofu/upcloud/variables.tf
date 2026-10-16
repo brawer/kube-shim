@@ -4,9 +4,9 @@ variable "hostname" {
     (config.toml's server.hostname). This module does NOT create the
     DNS record -- that's the calling config's job, using whatever DNS
     provider it has (see this module's own README). Point that record
-    at this module's public_ipv4 output, then run `tofu apply` again
-    once it resolves, so ACME's cold-start issuance (which fails the
-    whole boot if DNS isn't ready yet) succeeds on first try.
+    at this module's public_ipv4 output promptly after the first
+    apply; until it resolves, kube-shim's cold-start ACME issuance
+    fails and systemd keeps restarting it until it succeeds.
   EOT
   type        = string
 }
@@ -18,7 +18,7 @@ variable "acme_contact_email" {
 }
 
 variable "acme_directory" {
-  description = "\"staging\" (default, higher rate limits, untrusted cert chain -- safe while first verifying this module) or \"production\"."
+  description = "\"staging\" (default, higher rate limits, untrusted cert chain -- for throwaway test instances) or \"production\". Set this to its final value from the first apply: changing it later replaces the server (user_data is RequiresReplace), most likely with new IP addresses."
   type        = string
   default     = "staging"
 }
@@ -111,7 +111,9 @@ variable "api_token_count" {
     (see the api_tokens output), then lower it back down to retire the
     old one(s) -- random_password's own indexing means raising the
     count only ever adds a new token at the end, never reshuffles an
-    existing one's value.
+    existing one's value. Note that each change replaces the server
+    (user_data is RequiresReplace), most likely with new IP addresses
+    -- see README.md's "Rotating credentials".
   EOT
   type        = number
   default     = 1

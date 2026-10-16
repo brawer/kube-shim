@@ -86,55 +86,60 @@ bearer token, and define your real `CronJob`/`Secret` resources
 against it the same way this project's own `docs/IMPLEMENTATION_PLAN.md`
 testing sections do by hand with `curl`/`kubectl`.
 
-## First apply: DNS is a two-step dance
+## Every input change replaces the server
 
-`acme_directory` defaults to `"staging"` specifically so a first
-`tofu apply` can succeed before DNS exists at all (staging issuance
-doesn't require real-world reachability the same way; even so, the
-very first `config.toml` written still has `hostname` set, so a cold
-boot blocks on ACME regardless -- see `config.rs`'s own docs on cold-
-start-vs-renewal failure handling). The real sequence:
+All of this module's inputs end up in the server's `user_data` (via
+`config.toml.tftpl` and `cloud-init.sh.tftpl`), and the UpCloud
+provider marks `user_data` as `RequiresReplace`. So changing any input
+after the first apply (`acme_directory`, `api_token_count`, the
+runtime token, budget settings, ...) **destroys and recreates the
+host**, most likely with new public IP addresses. Plan for that: after
+such an apply, point DNS at the new `public_ipv4`/`public_ipv6`
+outputs again. The host's local data (SQLite database, ACME cache) does
+not survive, so replace it while no worker VMs are running, or they may
+be orphaned (see the Phase 16 manual orphan cleanup).
 
-1. `tofu apply` with `acme_directory = "staging"` and whatever
-   `hostname` you intend to use.
+## First apply: DNS
+
+Because flipping `acme_directory` later means a new server (see
+above), set it to whatever you actually want from the very first
+apply, normally `"production"`. The `"staging"` default is only meant
+for throwaway test instances.
+
+1. `tofu apply` with your real `hostname` and `acme_directory`.
 2. Point your DNS record(s) at the resulting `public_ipv4`/`public_ipv6`
    outputs (an A record is enough; add the AAAA record too if you
    want DNS to actually prefer IPv6 for clients that support it --
-   either way, the host answers HTTPS on both).
-3. Once that resolves, set `acme_directory = "production"` and
-   `tofu apply` again (this updates `user_data` in place rather than
-   destroying/recreating the server, but whether that alone is
-   enough to make the host pick up the new `config.toml` -- vs.
-   needing an explicit reboot -- hasn't been verified; see the same
-   caveat under "Rotating credentials" below).
+   either way, the host answers HTTPS on both). Do this promptly.
+3. Wait. Until DNS resolves to the new host, the first certificate
+   can't be issued: `acme::setup()` gives up after its 5-minute
+   cold-start timeout, the process exits, and systemd restarts it 10 s
+   later (`Restart=on-failure` in `deploy/kube-shim.container`), so it
+   keeps retrying on its own. Every failed attempt counts against
+   Let's Encrypt's failed-validation limit (5 per hostname per hour),
+   so a slow DNS update can delay issuance by up to an hour.
 
 ## Rotating credentials
 
-Bump `api_token_count`, `tofu apply` (adds a new token without
-touching the existing one(s) -- `random_password`'s own indexing means
-a higher count only ever appends), migrate your `kubernetes_provider`/
-`kubectl` config to `module.kube_shim.api_tokens[<new index>]`, then
-lower `api_token_count` back down and `tofu apply` once more to retire
-the old one.
-
-**Unverified: whether a `tofu apply` that only changes `user_data`
-(as a token-count change does, through `config_toml_content`) alone
-is enough, or whether the host needs an explicit reboot for
-cloud-init to re-run against the new `user_data`.** UpCloud's own
-provider docs don't say whether changing `user_data` on an existing,
-running server actually re-triggers its execution, or only takes
-effect from the next boot `cloud-init` would run anyway -- not
-checked against a real apply yet. Until that's confirmed, treat a
-credential rotation as needing a manual `upctl server restart` (or
-the equivalent reboot through the control panel) right after
-`tofu apply`, and confirm the new `config.toml` actually landed
-(`journalctl -u kube-shim.service`) before relying on it.
+Bump `api_token_count` and `tofu apply`. `random_password`'s own
+indexing means a higher count only ever appends, so the existing
+token(s) keep their values. But this changes `user_data`, which
+**replaces the server** (see above): expect new IP addresses and a
+fresh ACME issuance, and update DNS again. Then migrate your
+`kubernetes_provider`/`kubectl` config to
+`module.kube_shim.api_tokens[<new index>]`, lower `api_token_count`
+back down, and `tofu apply` once more (another replacement) to retire
+the old one. The overlap window this was designed for therefore
+doesn't really exist yet. Avoiding the replacements would need a
+stable address (e.g. an `upcloud_floating_ip_address`) or a way to
+push config changes other than `user_data`, neither of which this
+module has yet.
 
 There's no equivalent rotation knob for `worker_ssh`
 (`tls_private_key`) or `upcloud_runtime_token` -- replacing either
 means `tofu taint`/`-replace` on the `tls_private_key.worker_ssh`
 resource, or simply passing a new `upcloud_runtime_token` value,
-followed by an apply.
+followed by an apply (again replacing the server).
 
 ## State contains real secrets -- treat it accordingly
 
