@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.9](https://github.com/brawer/kube-shim/compare/v0.2.8...v0.2.9) (2026-10-16)
+
+
+### 📚 Documentation
+
+* **tofu:** user_data is RequiresReplace -- any input change replaces the server ([b58d048](https://github.com/brawer/kube-shim/commit/b58d048766b5f596f1707fa472b8cf52d371c7c1))
+
 ## [0.2.8](https://github.com/brawer/kube-shim/compare/v0.2.7...v0.2.8) (2026-10-15)
 
 
