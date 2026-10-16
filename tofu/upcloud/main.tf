@@ -72,6 +72,10 @@ resource "upcloud_server" "kube_shim" {
     password_delivery = "none"
   }
 
+  # user_data is RequiresReplace in the UpCloud provider: any change to
+  # what's rendered here (i.e. to almost any module input) destroys and
+  # recreates this server. See README.md's "Every input change replaces
+  # the server".
   user_data = templatefile("${path.module}/templates/cloud-init.sh.tftpl", {
     config_toml_content = templatefile("${path.module}/templates/config.toml.tftpl", {
       hostname              = var.hostname
