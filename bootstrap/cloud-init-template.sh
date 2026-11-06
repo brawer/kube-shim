@@ -38,11 +38,13 @@ CPU_LIMIT=$(echo '__KUBESHIM_CPU_LIMIT_B64__' | base64 -d)
 MEMORY_LIMIT=$(echo '__KUBESHIM_MEMORY_LIMIT_B64__' | base64 -d)
 # Run options (issue #86, src/run_options.rs), each empty when unset:
 # fsGroup, `--user` value ("uid" or "uid:gid"), "true" for
-# readOnlyRootFilesystem, "true" for runAsNonRoot, and the scratch
-# volume's `-v` argument.
+# readOnlyRootFilesystem, "true" for runAsNonRoot, "true" for
+# allowPrivilegeEscalation: false, and the scratch volume's `-v`
+# argument (with `idmap`, see below).
 FS_GROUP=$(echo '__KUBESHIM_FS_GROUP_B64__' | base64 -d)
 RUN_AS_USER=$(echo '__KUBESHIM_RUN_AS_USER_B64__' | base64 -d)
 READ_ONLY_ROOT=$(echo '__KUBESHIM_READ_ONLY_ROOT_B64__' | base64 -d)
+NO_NEW_PRIVILEGES=$(echo '__KUBESHIM_NO_NEW_PRIVILEGES_B64__' | base64 -d)
 RUN_AS_NON_ROOT=$(echo '__KUBESHIM_RUN_AS_NON_ROOT_B64__' | base64 -d)
 SCRATCH_VOLUME=$(echo '__KUBESHIM_SCRATCH_VOLUME_B64__' | base64 -d)
 
@@ -91,6 +93,15 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq podman >> "$STATUS_FILE" 2>&1
 
+# The container always runs in its own user namespace (`--userns auto`
+# below), so root inside it is an unprivileged uid on this VM and a
+# container escape doesn't get VM root. podman picks those uids from the
+# `containers` user's subordinate ranges, which a fresh VM doesn't have;
+# this is the range podman's own docs suggest (the upper half of the
+# 32-bit uid space, clear of every uid the VM itself uses).
+echo "containers:2147483647:2147483648" >> /etc/subuid
+echo "containers:2147483647:2147483648" >> /etc/subgid
+
 # Wait for the container config the shim delivers over SSH (its
 # `ContainerConfiguring` state, src/cloud_init.rs's UPLOAD_*_COMMAND):
 # `env` in `podman run --env-file` format, `secret-env` (variables the
@@ -127,7 +138,13 @@ RESOURCE_ARGS=()
 [ -n "$CPU_LIMIT" ] && RESOURCE_ARGS+=(--cpus "$CPU_LIMIT")
 [ -n "$MEMORY_LIMIT" ] && RESOURCE_ARGS+=(--memory "$MEMORY_LIMIT")
 
-SECURITY_ARGS=()
+# The scratch volume is mounted with `idmap` (in SCRATCH_VOLUME), so a
+# file owned by uid/gid N on this VM (fsGroup's chgrp above) is owned by
+# N inside the container too. The namespace gets the whole range above:
+# this VM only ever runs this one container, and that way any uid a job
+# names (runAsUser up to 2^31 - 1) or an image's USER uses is mapped.
+SECURITY_ARGS=(--userns auto:size=2147483648)
+[ "$NO_NEW_PRIVILEGES" = true ] && SECURITY_ARGS+=(--security-opt no-new-privileges)
 [ -n "$FS_GROUP" ] && SECURITY_ARGS+=(--group-add "$FS_GROUP")
 [ -n "$RUN_AS_USER" ] && SECURITY_ARGS+=(--user "$RUN_AS_USER")
 [ "$READ_ONLY_ROOT" = true ] && SECURITY_ARGS+=(--read-only)
