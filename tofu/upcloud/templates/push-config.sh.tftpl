@@ -1,0 +1,64 @@
+#!/bin/bash
+# Installs the config.toml and quadlet unit that terraform_data.push_config
+# staged in /tmp/kube-shim-push, then restarts kube-shim.service. Runs as
+# the image's admin user (sudo), on both brand-new and long-running hosts.
+set -euo pipefail
+
+STAGE=/tmp/kube-shim-push
+SERVICE_USER="kube-shim"
+IMAGE="${image}"
+trap 'rm -rf "$STAGE"' EXIT
+
+# On a brand-new host, first-boot cloud-init may still be running. Its
+# exit status is ignored on purpose: the steps below fail on their own if
+# the host isn't actually set up.
+echo "Waiting for cloud-init to finish..."
+sudo cloud-init status --wait >/dev/null || true
+
+USER_HOME=$(getent passwd "$SERVICE_USER" | cut -d: -f6)
+SERVICE_UID=$(id -u "$SERVICE_USER")
+DATA_DIR="$USER_HOME/kube-shim-data"
+QUADLET="$USER_HOME/.config/containers/systemd/kube-shim.container"
+
+as_service_user() {
+    (cd / && sudo -u "$SERVICE_USER" -H env XDG_RUNTIME_DIR="/run/user/$SERVICE_UID" "$@")
+}
+
+systemctl_user() {
+    sudo systemctl --user --machine="$SERVICE_USER@" "$@"
+}
+
+# Pull before touching anything, so a mistyped or unpublished tag fails
+# the apply while the old version keeps running.
+echo "Pulling $IMAGE..."
+as_service_user podman pull --quiet "$IMAGE" >/dev/null
+
+# config.toml is owned by the container's UID 1000 as mapped into the
+# service user's subuid range (see cloud-init.sh.tftpl), so take owner
+# and mode from the file being replaced. mv keeps the swap atomic.
+echo "Installing config.toml..."
+sudo install -m 600 "$STAGE/config.toml" "$DATA_DIR/config.toml.new"
+sudo chown --reference="$DATA_DIR/config.toml" "$DATA_DIR/config.toml.new"
+sudo chmod --reference="$DATA_DIR/config.toml" "$DATA_DIR/config.toml.new"
+sudo mv "$DATA_DIR/config.toml.new" "$DATA_DIR/config.toml"
+
+echo "Installing quadlet unit..."
+sudo install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 644 \
+    "$STAGE/kube-shim.container" "$QUADLET"
+
+echo "Restarting kube-shim.service..."
+systemctl_user daemon-reload
+systemctl_user restart kube-shim.service
+
+for attempt in $(seq 1 12); do
+    if systemctl_user is-active --quiet kube-shim.service; then
+        echo "kube-shim.service is active, running $IMAGE."
+        exit 0
+    fi
+    echo "Not active yet (attempt $attempt/12), retrying in 5s..."
+    sleep 5
+done
+
+systemctl_user status --no-pager kube-shim.service || true
+echo "kube-shim.service did not become active." >&2
+exit 1

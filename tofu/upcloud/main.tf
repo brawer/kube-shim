@@ -34,6 +34,51 @@ resource "tls_private_key" "worker_ssh" {
   algorithm = "ED25519"
 }
 
+locals {
+  config_toml = templatefile("${path.module}/templates/config.toml.tftpl", {
+    hostname              = var.hostname
+    acme_directory        = var.acme_directory
+    acme_contact_email    = var.acme_contact_email
+    api_tokens            = [for t in random_password.api_token : t.result]
+    upcloud_runtime_token = var.upcloud_runtime_token
+    dry_run               = var.dry_run
+    zone                  = var.zone
+    # Not a variable: config.rs's own docs confirm this UUID is a
+    # public, account-independent UpCloud template shared across
+    # every account/zone, not something a real deployment has ever
+    # needed to override -- a knob with no real use isn't worth the
+    # module's own surface area (flagged in review).
+    worker_template_uuid = "01000000-0000-4000-8000-000030240200"
+    # trimspace: public_key_openssh has a trailing newline, which
+    # would land inside a single-line TOML basic string
+    # (worker_ssh_public_keys = ["..."]) -- a literal embedded
+    # newline there is invalid TOML, not just untidy, and config.toml
+    # would fail to parse at startup. Caught by actually rendering
+    # this template and checking the output, not by inspection alone.
+    worker_ssh_public_key        = trimspace(tls_private_key.worker_ssh.public_key_openssh)
+    worker_ssh_private_key       = tls_private_key.worker_ssh.private_key_openssh
+    reconciliation_interval_secs = var.reconciliation_interval_secs
+    resource_prefix              = var.resource_prefix
+    main_currency                = var.main_currency
+    budget_daily_rate            = var.budget_daily_rate
+    budget_rollover_cap_days     = var.budget_rollover_cap_days
+  })
+
+  # deploy/kube-shim.container is read verbatim from this repo (one copy,
+  # shared with bootstrap/provision.sh's manual flow) and the image tag is
+  # swapped in here, so the checked-in file stays usable as-is. A pinned
+  # tag also drops AutoUpdate=registry, so podman-auto-update.timer
+  # leaves that container alone.
+  quadlet_unit_source = file("${path.module}/../../deploy/kube-shim.container")
+  default_image_line  = "Image=${local.image_repository}:latest\n"
+  image_repository    = "ghcr.io/brawer/kube-shim"
+  image               = "${local.image_repository}:${var.image_tag}"
+  quadlet_unit = var.image_tag == "latest" ? local.quadlet_unit_source : replace(
+    replace(local.quadlet_unit_source, local.default_image_line, "Image=${local.image}\n"),
+    "AutoUpdate=registry\n", ""
+  )
+}
+
 resource "upcloud_server" "kube_shim" {
   hostname = "${var.resource_prefix}.local"
   title    = "${var.resource_prefix}-host"
@@ -72,48 +117,21 @@ resource "upcloud_server" "kube_shim" {
     password_delivery = "none"
   }
 
-  # user_data is RequiresReplace in the UpCloud provider: any change to
-  # what's rendered here (i.e. to almost any module input) destroys and
-  # recreates this server. See README.md's "Every input change replaces
-  # the server".
+  # user_data is RequiresReplace in the UpCloud provider, so it only
+  # seeds a brand-new host and later changes to it are ignored. Updates
+  # to config.toml or the quadlet unit reach an existing host through
+  # terraform_data.push_config below instead, over SSH, without
+  # replacing it. See README.md's "Updating in place".
   user_data = templatefile("${path.module}/templates/cloud-init.sh.tftpl", {
-    config_toml_content = templatefile("${path.module}/templates/config.toml.tftpl", {
-      hostname              = var.hostname
-      acme_directory        = var.acme_directory
-      acme_contact_email    = var.acme_contact_email
-      api_tokens            = [for t in random_password.api_token : t.result]
-      upcloud_runtime_token = var.upcloud_runtime_token
-      dry_run               = var.dry_run
-      zone                  = var.zone
-      # Not a variable: config.rs's own docs confirm this UUID is a
-      # public, account-independent UpCloud template shared across
-      # every account/zone, not something a real deployment has ever
-      # needed to override -- a knob with no real use isn't worth the
-      # module's own surface area (flagged in review).
-      worker_template_uuid = "01000000-0000-4000-8000-000030240200"
-      # trimspace: public_key_openssh has a trailing newline, which
-      # would land inside a single-line TOML basic string
-      # (worker_ssh_public_keys = ["..."]) -- a literal embedded
-      # newline there is invalid TOML, not just untidy, and config.toml
-      # would fail to parse at startup. Caught by actually rendering
-      # this template and checking the output, not by inspection alone.
-      worker_ssh_public_key        = trimspace(tls_private_key.worker_ssh.public_key_openssh)
-      worker_ssh_private_key       = tls_private_key.worker_ssh.private_key_openssh
-      reconciliation_interval_secs = var.reconciliation_interval_secs
-      resource_prefix              = var.resource_prefix
-      main_currency                = var.main_currency
-      budget_daily_rate            = var.budget_daily_rate
-      budget_rollover_cap_days     = var.budget_rollover_cap_days
-    })
-    # base64, not embedded raw: deploy/kube-shim.container is read
-    # verbatim from this same repo (so there is exactly one copy of
-    # it, never a second one drifting out of sync inside this
-    # module) and passed through an *outer* heredoc in
-    # cloud-init.sh.tftpl already, with no systemd-template syntax
-    # of its own (`%h`, `%i`) needing to survive that; base64 sidesteps
-    # any need to reason about escaping either layer.
-    quadlet_unit_content_base64 = base64encode(file("${path.module}/../../deploy/kube-shim.container"))
+    config_toml_content = local.config_toml
+    # base64, not embedded raw: avoids any escaping concerns across the
+    # outer heredoc in cloud-init.sh.tftpl.
+    quadlet_unit_content_base64 = base64encode(local.quadlet_unit)
   })
+
+  lifecycle {
+    ignore_changes = [user_data]
+  }
 }
 
 resource "upcloud_firewall_rules" "kube_shim" {
@@ -219,5 +237,67 @@ resource "upcloud_firewall_rules" "kube_shim" {
     direction = "in"
     family    = "IPv6"
     comment   = "Drop everything else inbound (IPv6)"
+  }
+}
+
+# Pushes config.toml and the quadlet unit to the host over SSH and
+# restarts kube-shim.service, whenever either one changes (and once for
+# a brand-new host, which is a no-op apart from the restart). This is
+# what lets config and image-tag changes land in place even though
+# user_data can't change without replacing the server. See
+# templates/push-config.sh.tftpl for what runs on the host.
+resource "terraform_data" "push_config" {
+  # Hashes, not the contents: config.toml holds secrets, and state only
+  # needs to notice that something changed.
+  triggers_replace = {
+    server_id    = upcloud_server.kube_shim.id
+    config_toml  = sha256(local.config_toml)
+    quadlet_unit = sha256(local.quadlet_unit)
+  }
+
+  depends_on = [upcloud_firewall_rules.kube_shim]
+
+  lifecycle {
+    precondition {
+      condition     = var.image_tag == "latest" || strcontains(local.quadlet_unit_source, local.default_image_line)
+      error_message = "deploy/kube-shim.container no longer has an \"${trimspace(local.default_image_line)}\" line, so image_tag can't be substituted into it."
+    }
+  }
+
+  connection {
+    type        = "ssh"
+    host        = upcloud_server.kube_shim.network_interface[0].ip_address
+    user        = "admin"
+    private_key = var.operator_ssh_private_key
+    agent       = var.operator_ssh_private_key == null
+    # A brand-new host needs a little while before sshd answers.
+    timeout = "15m"
+  }
+
+  # Staging directory only the admin user can read: config.toml holds
+  # the bearer tokens, the runtime token and the worker SSH key.
+  provisioner "remote-exec" {
+    inline = ["rm -rf /tmp/kube-shim-push && install -d -m 700 /tmp/kube-shim-push"]
+  }
+
+  provisioner "file" {
+    content     = local.config_toml
+    destination = "/tmp/kube-shim-push/config.toml"
+  }
+
+  provisioner "file" {
+    content     = local.quadlet_unit
+    destination = "/tmp/kube-shim-push/kube-shim.container"
+  }
+
+  provisioner "file" {
+    content = templatefile("${path.module}/templates/push-config.sh.tftpl", {
+      image = local.image
+    })
+    destination = "/tmp/kube-shim-push/apply.sh"
+  }
+
+  provisioner "remote-exec" {
+    inline = ["bash /tmp/kube-shim-push/apply.sh"]
   }
 }
