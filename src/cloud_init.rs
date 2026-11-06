@@ -91,6 +91,7 @@ pub fn generate(spec: &JsonValue) -> Result<String, String> {
     } else {
         ""
     };
+    let run_as_non_root = if options.run_as_non_root { "true" } else { "" };
 
     Ok(TEMPLATE
         .replace("__KUBESHIM_IMAGE_B64__", &b64(image))
@@ -99,6 +100,7 @@ pub fn generate(spec: &JsonValue) -> Result<String, String> {
         .replace("__KUBESHIM_FS_GROUP_B64__", &b64(&fs_group))
         .replace("__KUBESHIM_RUN_AS_USER_B64__", &b64(&user))
         .replace("__KUBESHIM_READ_ONLY_ROOT_B64__", &b64(read_only_root))
+        .replace("__KUBESHIM_RUN_AS_NON_ROOT_B64__", &b64(run_as_non_root))
         .replace(
             "__KUBESHIM_SCRATCH_VOLUME_B64__",
             &b64(&options.scratch_volume),
@@ -305,6 +307,7 @@ mod tests {
             "__KUBESHIM_FS_GROUP_B64__",
             "__KUBESHIM_RUN_AS_USER_B64__",
             "__KUBESHIM_READ_ONLY_ROOT_B64__",
+            "__KUBESHIM_RUN_AS_NON_ROOT_B64__",
             "__KUBESHIM_SCRATCH_VOLUME_B64__",
         ] {
             assert!(
@@ -316,6 +319,7 @@ mod tests {
         assert_eq!(decode_between(&script, "FS_GROUP=$(echo "), "");
         assert_eq!(decode_between(&script, "RUN_AS_USER=$(echo "), "");
         assert_eq!(decode_between(&script, "READ_ONLY_ROOT=$(echo "), "");
+        assert_eq!(decode_between(&script, "RUN_AS_NON_ROOT=$(echo "), "");
         assert_eq!(
             decode_between(&script, "SCRATCH_VOLUME=$(echo "),
             "/scratch:/scratch"
@@ -326,7 +330,7 @@ mod tests {
     fn test_run_options_reach_the_script() {
         // Issue #86: the osmdiffs CronJob, plus runAsUser and a mountPath.
         let spec = json!({"template": {"spec": {
-            "securityContext": {"fsGroup": 1000, "runAsUser": 1000},
+            "securityContext": {"fsGroup": 1000, "runAsUser": 1000, "runAsNonRoot": true},
             "containers": [{
                 "image": "x",
                 "securityContext": {"readOnlyRootFilesystem": true},
@@ -338,6 +342,7 @@ mod tests {
         assert_eq!(decode_between(&script, "FS_GROUP=$(echo "), "1000");
         assert_eq!(decode_between(&script, "RUN_AS_USER=$(echo "), "1000");
         assert_eq!(decode_between(&script, "READ_ONLY_ROOT=$(echo "), "true");
+        assert_eq!(decode_between(&script, "RUN_AS_NON_ROOT=$(echo "), "true");
         assert_eq!(
             decode_between(&script, "SCRATCH_VOLUME=$(echo "),
             "/scratch:/workdir"

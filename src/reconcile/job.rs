@@ -1304,10 +1304,25 @@ async fn handle_container_running(
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default()
     } else {
-        tracing::warn!(
-            "job {namespace}/{name}: no valid container ID read from {ip}, logs unavailable"
-        );
-        String::new()
+        // No container was started: the worker script says why, if it
+        // refused to start one (runAsNonRoot's image check).
+        let start_error = ssh::exec_once(
+            &ip,
+            ctx.worker_ssh_port,
+            &ctx.worker_ssh_private_key,
+            "cat /tmp/start-error.txt",
+        )
+        .await
+        .ok()
+        .filter(|o| o.exit_status == Some(0))
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+        if start_error.is_empty() {
+            tracing::warn!(
+                "job {namespace}/{name}: no valid container ID read from {ip}, logs unavailable"
+            );
+        }
+        start_error
     };
 
     // Real cost (Phase 14a), from the job's real elapsed wall-clock
@@ -2770,6 +2785,36 @@ mod tests {
 
         // "Failed" must rejoin the normal cleanup path, same as "Succeeded".
         assert_eq!(next_state("Failed"), Some("VolumeDetaching"));
+    }
+
+    #[tokio::test]
+    async fn test_container_never_started_reports_start_error_as_logs() {
+        // runAsNonRoot's image check refused to start the container.
+        let mut responses = HashMap::new();
+        responses.insert("cat /tmp/exit-code", ("1", 0));
+        responses.insert("cat /tmp/container-id.txt", ("", 1));
+        responses.insert(
+            "cat /tmp/start-error.txt",
+            (
+                "kube-shim: runAsNonRoot is set and image x will run as root\n",
+                0,
+            ),
+        );
+        let (host, port) = crate::ssh::tests::mock_ssh_server(responses).await;
+        let mut ctx = mock_ctx(false);
+        ctx.worker_ssh_port = port;
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_job_with_ssh_ip(&pool, "ContainerRunning", &host).await;
+        assert_eq!(advance_all(&pool, &ctx).await.unwrap(), 1);
+
+        let (status, logs): (String, Option<String>) =
+            sqlx::query_as("SELECT status, cached_logs FROM jobs WHERE id = 'j1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "Failed");
+        assert!(logs.unwrap().contains("will run as root"));
     }
 
     #[tokio::test]
