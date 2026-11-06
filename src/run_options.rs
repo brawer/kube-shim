@@ -27,13 +27,21 @@
 //! scratch volume's mount (`subPath`, ...), is rejected at admission
 //! (`validate`, called from `src/admission.rs`).
 //!
+//! The one exception is a few fields set to the value that matches what
+//! kube-shim does anyway (issue #92): the OpenTofu/Terraform kubernetes
+//! provider always sends them, even when the config never mentions them.
+//! `runAsNonRoot: false`, `privileged: false`,
+//! `allowPrivilegeEscalation: true` (Kubernetes' default) and the scratch
+//! mount's `mountPropagation: "None"` are accepted; any other value for
+//! them is rejected. See the `*_NO_OP_VALUES` tables.
+//!
 //! The numbers and the mount path reach the worker's script base64-encoded
 //! like every other job-supplied value (see `src/cloud_init.rs`), and are
 //! validated here first: IDs must be integers in Kubernetes' own range
 //! (0..=2147483647), and the mount path must be an absolute path podman's
 //! `-v` can hold.
 
-use serde_json::{Map, Value as JsonValue};
+use serde_json::Value as JsonValue;
 
 /// Where the worker mounts the scratch volume on the host, and where the
 /// container sees it when no `volumeMounts[]` entry says otherwise.
@@ -46,6 +54,33 @@ const POD_SECURITY_CONTEXT_FIELDS: &[&str] = &["fsGroup", "runAsUser", "runAsGro
 const CONTAINER_SECURITY_CONTEXT_FIELDS: &[&str] =
     &["runAsUser", "runAsGroup", "readOnlyRootFilesystem"];
 const SCRATCH_MOUNT_FIELDS: &[&str] = &["name", "mountPath", "readOnly"];
+
+/// A value of an otherwise unsupported field that changes nothing, so
+/// `validate` accepts it (issue #92).
+#[derive(Debug, Clone, Copy)]
+enum NoOp {
+    Bool(bool),
+    Str(&'static str),
+}
+
+impl NoOp {
+    fn matches(self, value: &JsonValue) -> bool {
+        match (self, value) {
+            (NoOp::Bool(expected), JsonValue::Bool(b)) => expected == *b,
+            (NoOp::Str(expected), JsonValue::String(s)) => expected == s,
+            _ => false,
+        }
+    }
+}
+
+const POD_SECURITY_CONTEXT_NO_OP_VALUES: &[(&str, NoOp)] = &[("runAsNonRoot", NoOp::Bool(false))];
+const CONTAINER_SECURITY_CONTEXT_NO_OP_VALUES: &[(&str, NoOp)] = &[
+    ("runAsNonRoot", NoOp::Bool(false)),
+    ("privileged", NoOp::Bool(false)),
+    // Kubernetes' default: podman doesn't set no-new-privileges either.
+    ("allowPrivilegeEscalation", NoOp::Bool(true)),
+];
+const SCRATCH_MOUNT_NO_OP_VALUES: &[(&str, NoOp)] = &[("mountPropagation", NoOp::Str("None"))];
 
 /// A spec problem found at admission time: `field` is the offending
 /// field's path relative to the pod spec (`template.spec`), e.g.
@@ -81,12 +116,18 @@ pub struct RunOptions {
 pub fn validate(job_spec: &JsonValue) -> Result<(), SpecError> {
     let pod_spec = job_spec.pointer("/template/spec");
     if let Some(sc) = pod_spec.and_then(|p| p.get("securityContext")) {
-        reject_unknown_fields(sc, POD_SECURITY_CONTEXT_FIELDS, "securityContext")?;
+        reject_unknown_fields(
+            sc,
+            POD_SECURITY_CONTEXT_FIELDS,
+            POD_SECURITY_CONTEXT_NO_OP_VALUES,
+            "securityContext",
+        )?;
     }
     if let Some(sc) = job_spec.pointer("/template/spec/containers/0/securityContext") {
         reject_unknown_fields(
             sc,
             CONTAINER_SECURITY_CONTEXT_FIELDS,
+            CONTAINER_SECURITY_CONTEXT_NO_OP_VALUES,
             "containers[0].securityContext",
         )?;
     }
@@ -94,6 +135,7 @@ pub fn validate(job_spec: &JsonValue) -> Result<(), SpecError> {
         reject_unknown_fields(
             mount,
             SCRATCH_MOUNT_FIELDS,
+            SCRATCH_MOUNT_NO_OP_VALUES,
             &format!("containers[0].volumeMounts[{i}]"),
         )?;
     }
@@ -197,22 +239,34 @@ fn scratch_mount(job_spec: &JsonValue) -> Option<(usize, &JsonValue)> {
         .find(|(_, m)| m.get("name").and_then(JsonValue::as_str) == Some(volume_name))
 }
 
+/// Rejects any key of `value` that is neither in `supported` nor, with
+/// a matching value (or `null`), in `no_ops`. An unknown key is reported
+/// as the value of `field`; a no-op key with another value is reported
+/// as `field.key` with that value.
 fn reject_unknown_fields(
     value: &JsonValue,
     supported: &[&str],
+    no_ops: &[(&str, NoOp)],
     field: &str,
 ) -> Result<(), SpecError> {
-    match value {
-        JsonValue::Null => Ok(()),
-        JsonValue::Object(map) => {
-            first_unknown(map, supported).map_or(Ok(()), |key| Err(spec_error(field, key.as_str())))
+    let map = match value {
+        JsonValue::Null => return Ok(()),
+        JsonValue::Object(map) => map,
+        other => return Err(spec_error(field, other.to_string())),
+    };
+    for (key, v) in map {
+        if supported.contains(&key.as_str()) {
+            continue;
         }
-        other => Err(spec_error(field, other.to_string())),
+        match no_ops.iter().find(|(name, _)| name == key) {
+            None => return Err(spec_error(field, key.as_str())),
+            Some((_, no_op)) if !v.is_null() && !no_op.matches(v) => {
+                return Err(spec_error(format!("{field}.{key}"), v.to_string()))
+            }
+            Some(_) => {}
+        }
     }
-}
-
-fn first_unknown<'a>(map: &'a Map<String, JsonValue>, supported: &[&str]) -> Option<&'a String> {
-    map.keys().find(|key| !supported.contains(&key.as_str()))
+    Ok(())
 }
 
 fn id_field(
@@ -288,6 +342,92 @@ mod tests {
         assert_eq!(options.scratch_volume, "/scratch:/scratch");
     }
 
+    /// What the OpenTofu kubernetes provider (v3.5.0) sends for the
+    /// osmdiffs CronJob in brawer/production (issue #92): the HCL only
+    /// sets `fs_group`, `read_only_root_filesystem` and one
+    /// `volume_mount`, the rest are the provider's no-op defaults.
+    #[test]
+    fn test_opentofu_provider_defaults_accepted() {
+        let spec = job_spec(json!({
+            "securityContext": {"fsGroup": 1000, "runAsNonRoot": false},
+            "containers": [{
+                "image": "x",
+                "securityContext": {
+                    "allowPrivilegeEscalation": true,
+                    "privileged": false,
+                    "readOnlyRootFilesystem": true,
+                    "runAsNonRoot": false
+                },
+                "volumeMounts": [{"name": "scratch", "mountPath": "/scratch", "mountPropagation": "None"}]
+            }],
+            "volumes": [{"name": "scratch", "ephemeral": {"volumeClaimTemplate": {"spec": {}}}}]
+        }));
+        assert_eq!(validate(&spec), Ok(()));
+        let options = parse(&spec).unwrap();
+        assert_eq!(options.fs_group, Some(1000));
+        assert!(options.read_only_root_filesystem);
+        assert_eq!(options.user, None);
+        assert_eq!(options.scratch_volume, "/scratch:/scratch");
+    }
+
+    #[test]
+    fn test_no_op_fields_null_accepted() {
+        let spec = job_spec(json!({
+            "securityContext": {"runAsNonRoot": null},
+            "containers": [{
+                "image": "x",
+                "securityContext": {"privileged": null, "allowPrivilegeEscalation": null},
+                "volumeMounts": [{"name": "scratch", "mountPath": "/s", "mountPropagation": null}]
+            }],
+            "volumes": [{"name": "scratch", "ephemeral": {"volumeClaimTemplate": {"spec": {}}}}]
+        }));
+        assert_eq!(validate(&spec), Ok(()));
+    }
+
+    #[test]
+    fn test_no_op_fields_with_other_values_rejected() {
+        let cases = [
+            (
+                json!({"securityContext": {"runAsNonRoot": true}, "containers": [{"image": "x"}]}),
+                spec_error("securityContext.runAsNonRoot", "true"),
+            ),
+            (
+                json!({"containers": [{"image": "x", "securityContext": {"runAsNonRoot": true}}]}),
+                spec_error("containers[0].securityContext.runAsNonRoot", "true"),
+            ),
+            (
+                json!({"containers": [{"image": "x", "securityContext": {"privileged": true}}]}),
+                spec_error("containers[0].securityContext.privileged", "true"),
+            ),
+            (
+                json!({"containers": [{"image": "x", "securityContext": {"allowPrivilegeEscalation": false}}]}),
+                spec_error(
+                    "containers[0].securityContext.allowPrivilegeEscalation",
+                    "false",
+                ),
+            ),
+            (
+                json!({"containers": [{"image": "x", "securityContext": {"privileged": "false"}}]}),
+                spec_error("containers[0].securityContext.privileged", "\"false\""),
+            ),
+            (
+                json!({
+                    "containers": [{"image": "x", "volumeMounts": [
+                        {"name": "scratch", "mountPath": "/s", "mountPropagation": "Bidirectional"}
+                    ]}],
+                    "volumes": [{"name": "scratch", "ephemeral": {"volumeClaimTemplate": {"spec": {}}}}]
+                }),
+                spec_error(
+                    "containers[0].volumeMounts[0].mountPropagation",
+                    "\"Bidirectional\"",
+                ),
+            ),
+        ];
+        for (pod, expected) in cases {
+            assert_eq!(validate(&job_spec(pod.clone())), Err(expected), "{pod}");
+        }
+    }
+
     #[test]
     fn test_run_as_user_and_group_container_overrides_pod() {
         let spec = job_spec(json!({
@@ -344,17 +484,17 @@ mod tests {
         }));
         assert_eq!(
             validate(&spec).unwrap_err(),
-            spec_error("securityContext", "runAsNonRoot")
+            spec_error("securityContext.runAsNonRoot", "true")
         );
         // parse() itself tolerates unknown fields (see its docs).
         assert_eq!(parse(&spec).unwrap().fs_group, Some(1000));
 
         let spec = job_spec(json!({
-            "containers": [{"image": "x", "securityContext": {"privileged": true}}]
+            "containers": [{"image": "x", "securityContext": {"capabilities": {"add": ["NET_ADMIN"]}}}]
         }));
         assert_eq!(
             validate(&spec).unwrap_err(),
-            spec_error("containers[0].securityContext", "privileged")
+            spec_error("containers[0].securityContext", "capabilities")
         );
 
         // fsGroup is pod-level only, as in Kubernetes.
