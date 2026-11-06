@@ -33,7 +33,7 @@ curl http://127.0.0.1:6443/health
 # Create a secret
 curl -X POST http://127.0.0.1:6443/api/v1/namespaces/default/secrets \
   -H "Content-Type: application/json" \
-  -d '{"api_version":"v1","kind":"Secret","metadata":{"name":"my-secret"},"data":{"key":"value"}}'
+  -d '{"apiVersion":"v1","kind":"Secret","metadata":{"name":"my-secret"},"stringData":{"key":"value"}}'
 
 # List secrets
 curl http://127.0.0.1:6443/api/v1/namespaces/default/secrets

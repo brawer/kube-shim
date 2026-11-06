@@ -50,6 +50,7 @@ pub struct NodeStatus {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Node {
     pub api_version: String,
     pub kind: String,
@@ -58,6 +59,7 @@ pub struct Node {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NodeList {
     pub api_version: String,
     pub kind: String,

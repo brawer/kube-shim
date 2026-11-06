@@ -42,6 +42,7 @@ use uuid::Uuid;
 const FIELD_PREFIX: &str = "spec";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Job {
     pub api_version: String,
     pub kind: String,
@@ -71,6 +72,7 @@ pub struct JobCondition {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateJobRequest {
     pub api_version: String,
     pub kind: String,
@@ -79,6 +81,7 @@ pub struct CreateJobRequest {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JobList {
     pub api_version: String,
     pub kind: String,
@@ -282,7 +285,7 @@ pub async fn create_job(
             name: req.metadata.name,
             namespace: Some(namespace),
             uid: Some(id),
-            creation_timestamp: Some(now.to_string()),
+            creation_timestamp: Some(super::secret::rfc3339(now)),
         },
         spec: req.spec,
         status: status_for("Created", &None),
@@ -415,7 +418,7 @@ mod tests {
 
     fn create_request(name: &str, spec: JsonValue) -> axum::http::Request<axum::body::Body> {
         let body = json!({
-            "api_version": "batch/v1",
+            "apiVersion": "batch/v1",
             "kind": "Job",
             "metadata": {"name": name, "namespace": "default"},
             "spec": spec,

@@ -15,6 +15,7 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CronJob {
     pub api_version: String,
     pub kind: String,
@@ -25,6 +26,7 @@ pub struct CronJob {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateCronJobRequest {
     pub api_version: String,
     pub kind: String,
@@ -133,7 +135,7 @@ pub async fn create_cronjob(
             name: req.metadata.name,
             namespace: Some(namespace),
             uid: Some(id),
-            creation_timestamp: Some(now.to_string()),
+            creation_timestamp: Some(super::secret::rfc3339(now)),
         },
         spec: req.spec,
         status: None,
@@ -257,6 +259,7 @@ pub async fn delete_cronjob(
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ListCronJobsResponse {
     pub api_version: String,
     pub kind: String,

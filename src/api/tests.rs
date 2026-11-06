@@ -5,7 +5,7 @@ mod secret_tests {
     #[test]
     fn test_secret_serialization() {
         let secret = json!({
-            "api_version": "v1",
+            "apiVersion": "v1",
             "kind": "Secret",
             "metadata": {
                 "name": "test",
@@ -43,7 +43,7 @@ mod cronjob_tests {
     #[test]
     fn test_cronjob_serialization() {
         let cronjob = json!({
-            "api_version": "batch/v1",
+            "apiVersion": "batch/v1",
             "kind": "CronJob",
             "metadata": {
                 "name": "osmdiffs-weekly",

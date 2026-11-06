@@ -17,7 +17,7 @@ async fn test_create_and_get_secret() {
 
     // Create a secret
     let secret_data = json!({
-        "api_version": "v1",
+        "apiVersion": "v1",
         "kind": "Secret",
         "metadata": {"name": "test-secret"},
         "data": {"key": "value"}

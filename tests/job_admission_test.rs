@@ -41,7 +41,7 @@ async fn test_router() -> axum::Router {
 
 fn create_job_request(name: &str, spec: Value) -> Request<Body> {
     let body = json!({
-        "api_version": "batch/v1",
+        "apiVersion": "batch/v1",
         "kind": "Job",
         "metadata": {"name": name, "namespace": "default"},
         "spec": spec,

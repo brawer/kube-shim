@@ -176,7 +176,7 @@ async fn test_auth_protects_secret_endpoints_too() {
     let resp = insecure_client()
         .post(format!("{base_url}/api/v1/namespaces/default/secrets"))
         .json(&serde_json::json!({
-            "api_version": "v1",
+            "apiVersion": "v1",
             "kind": "Secret",
             "metadata": {"name": "leaked"},
             "data": {"password": "hunter2"}

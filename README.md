@@ -78,7 +78,7 @@ curl -k -H "Authorization: Bearer $TOKEN" https://127.0.0.1:6443/health
 curl -k -X POST https://127.0.0.1:6443/apis/batch/v1/namespaces/default/cronjobs \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{
-    "api_version": "batch/v1",
+    "apiVersion": "batch/v1",
     "kind": "CronJob",
     "metadata": {"name": "demo", "namespace": "default"},
     "spec": {

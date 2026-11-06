@@ -124,6 +124,7 @@ pub struct NodeMetricsMetadata {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NodeMetrics {
     pub api_version: String,
     pub kind: String,
@@ -134,6 +135,7 @@ pub struct NodeMetrics {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NodeMetricsList {
     pub api_version: String,
     pub kind: String,
@@ -196,6 +198,7 @@ pub struct ContainerMetrics {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PodMetrics {
     pub api_version: String,
     pub kind: String,
@@ -206,6 +209,7 @@ pub struct PodMetrics {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PodMetricsList {
     pub api_version: String,
     pub kind: String,
