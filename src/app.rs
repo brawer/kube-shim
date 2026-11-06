@@ -10,7 +10,7 @@
 //! hand-rolled duplicate.
 
 use crate::reconcile::TickHealth;
-use crate::{api, auth, config, ssh, status_page};
+use crate::{api, auth, config, metrics_export, ssh, status_page};
 use axum::{
     http::{HeaderName, HeaderValue},
     middleware,
@@ -174,7 +174,7 @@ fn authenticated_router(
 }
 
 /// The public, unauthenticated sub-router (Phase 15) -- `/`/`/statusz`
-/// plus `/healthz`/`/livez`/`/readyz`. See `status_page`'s own
+/// plus `/healthz`/`/livez`/`/readyz`, and `/metrics` (Phase 18). See `status_page`'s own
 /// top-level docs for why this is GET-only by construction and what
 /// it does (and deliberately does not) render. Never passes through
 /// `authenticated_router`'s bearer-token middleware at all, since it's
@@ -187,6 +187,9 @@ fn public_router(pool: sqlx::SqlitePool, tick_health: Arc<TickHealth>) -> Router
         .route("/healthz", get(status_page::readyz))
         .route("/livez", get(status_page::livez))
         .route("/readyz", get(status_page::readyz))
+        // Phase 18: Prometheus scrape target, unauthenticated for the
+        // same reason as the health endpoints -- see `metrics_export`.
+        .route("/metrics", get(metrics_export::render))
         .layer(Extension(tick_health))
         .with_state(pool)
 }

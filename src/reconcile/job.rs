@@ -126,7 +126,7 @@ use uuid::Uuid;
 /// pending object. Every row that exists in this table has therefore
 /// already been admitted -- there's no "waiting to find out" state to
 /// represent here.
-const STATE_SEQUENCE: &[&str] = &[
+pub(crate) const STATE_SEQUENCE: &[&str] = &[
     "Created",
     "VolumePending",
     "VolumeCreating",

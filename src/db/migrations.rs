@@ -54,6 +54,17 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     // instead of re-deriving a plan that might differ by then. NULL
     // until the VM is created (or for jobs from before this column).
     ("jobs", "worker_plan", "TEXT"),
+    // Phase 18: a worker VM's virtual-memory stats, from /proc/vmstat
+    // (cumulative counters since boot) and /proc/meminfo (bytes), for
+    // `/metrics`. All NULL when that part of a sample didn't parse --
+    // see `reconcile::metrics_collector`'s own docs.
+    ("worker_metrics", "pgfault", "INTEGER"),
+    ("worker_metrics", "pgmajfault", "INTEGER"),
+    ("worker_metrics", "pswpin", "INTEGER"),
+    ("worker_metrics", "pswpout", "INTEGER"),
+    ("worker_metrics", "mapped_bytes", "INTEGER"),
+    ("worker_metrics", "cached_bytes", "INTEGER"),
+    ("worker_metrics", "anon_bytes", "INTEGER"),
 ];
 
 pub async fn run(pool: &SqlitePool) -> Result<()> {

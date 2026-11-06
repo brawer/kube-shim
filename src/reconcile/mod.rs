@@ -13,14 +13,15 @@ pub mod schedule;
 pub mod startup;
 
 pub use job::JobContext;
+pub(crate) use job::STATE_SEQUENCE;
 
 use crate::ssh;
 use anyhow::Result;
 use chrono::Utc;
 use sqlx::SqlitePool;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 /// Fallback cadence, used alongside (not instead of) `Notify`-based
@@ -69,22 +70,57 @@ const TICK_STALE_THRESHOLD_SECS: i64 = 60;
 /// actually still ticking -- rather than a hardcoded `200 OK`.
 /// `Arc<TickHealth>` is cloned into both `run` (which records every
 /// tick) and `app::build_router`'s public sub-router (which only ever
-/// reads it). A plain `AtomicI64`, not behind a `Mutex`: one writer
-/// (the job-tick loop), many readers (concurrent `/readyz` requests),
-/// no need for anything heavier.
-#[derive(Default)]
-pub struct TickHealth(AtomicI64);
+/// reads it). Plain atomics, not behind a `Mutex`: one writer per
+/// field (the loop that owns it), many readers (concurrent
+/// `/readyz`/`/metrics` requests), no need for anything heavier.
+///
+/// Phase 18 widened this from "when did the job tick last run" to the
+/// per-loop counters `/metrics` (`metrics_export`) serves -- it was
+/// already the one object shared between every background loop and the
+/// public router, so the self-instrumentation rides along on it instead
+/// of threading a second `Arc` through the same two places.
+pub struct TickHealth {
+    /// Unix seconds this process started (well, when this was built,
+    /// which `main.rs` does right at startup) -- for
+    /// `kubeshim_process_start_time_seconds`/uptime.
+    started_at: i64,
+    /// The job-tick loop (`run_with_interval`).
+    pub(crate) tick: LoopStats,
+    /// `run_orphan_scan_loop`.
+    pub(crate) orphan_scan: LoopStats,
+    /// `run_metrics_poll_loop`.
+    pub(crate) metrics_poll: LoopStats,
+    /// `run_pricing_sync_loop`.
+    pub(crate) pricing_sync: LoopStats,
+}
+
+impl Default for TickHealth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl TickHealth {
     pub fn new() -> Self {
-        Self(AtomicI64::new(0))
+        Self {
+            started_at: Utc::now().timestamp(),
+            tick: LoopStats::default(),
+            orphan_scan: LoopStats::default(),
+            metrics_poll: LoopStats::default(),
+            pricing_sync: LoopStats::default(),
+        }
     }
 
     /// `pub(crate)`: also called directly by `status_page`'s own tests
     /// to simulate a tick having landed, without needing to spin up
-    /// the real loop.
+    /// the real loop. Records a successful, zero-duration tick.
+    #[cfg(test)]
     pub(crate) fn record(&self) {
-        self.0.store(Utc::now().timestamp(), Ordering::Relaxed);
+        self.tick.record(true, Duration::ZERO);
+    }
+
+    pub(crate) fn started_at(&self) -> i64 {
+        self.started_at
     }
 
     /// `false` both before the very first tick has ever landed (the
@@ -92,8 +128,53 @@ impl TickHealth {
     /// if brief, "not ready") and once the most recent one is older
     /// than `TICK_STALE_THRESHOLD_SECS`.
     pub fn is_healthy(&self) -> bool {
-        let last = self.0.load(Ordering::Relaxed);
+        let last = self.tick.last_run_at();
         last != 0 && Utc::now().timestamp() - last < TICK_STALE_THRESHOLD_SECS
+    }
+}
+
+/// One background loop's own run counters, for `/metrics` (Phase 18).
+/// Durations are kept in whole microseconds so they fit an atomic
+/// integer; `/metrics` converts back to seconds.
+#[derive(Default)]
+pub(crate) struct LoopStats {
+    last_run_at: AtomicI64,
+    successes: AtomicU64,
+    failures: AtomicU64,
+    duration_micros_total: AtomicU64,
+}
+
+impl LoopStats {
+    /// Called once per pass, success or failure -- a failed pass still
+    /// proves the loop itself is alive, which is what `/readyz` needs.
+    pub(crate) fn record(&self, success: bool, elapsed: Duration) {
+        self.last_run_at
+            .store(Utc::now().timestamp(), Ordering::Relaxed);
+        if success {
+            self.successes.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.failures.fetch_add(1, Ordering::Relaxed);
+        }
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.duration_micros_total
+            .fetch_add(micros, Ordering::Relaxed);
+    }
+
+    /// Unix seconds of the most recent pass, or `0` if none yet.
+    pub(crate) fn last_run_at(&self) -> i64 {
+        self.last_run_at.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn successes(&self) -> u64 {
+        self.successes.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn failures(&self) -> u64 {
+        self.failures.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn duration_seconds_total(&self) -> f64 {
+        self.duration_micros_total.load(Ordering::Relaxed) as f64 / 1e6
     }
 }
 
@@ -123,16 +204,19 @@ pub async fn run(
         pool.clone(),
         ctx.clone(),
         ORPHAN_SCAN_INTERVAL,
+        tick_health.clone(),
     ));
     tokio::spawn(run_metrics_poll_loop(
         pool.clone(),
         ctx.clone(),
         METRICS_POLL_INTERVAL,
+        tick_health.clone(),
     ));
     tokio::spawn(run_pricing_sync_loop(
         pool.clone(),
         ctx.clone(),
         PRICING_SYNC_INTERVAL,
+        tick_health.clone(),
     ));
     run_with_interval(pool, notify, FALLBACK_INTERVAL, ctx, tick_health).await
 }
@@ -142,13 +226,23 @@ pub async fn run(
 /// last restarted), then one every `interval_duration` thereafter, with
 /// no `Notify` wake-up: nothing the shim does itself needs an untracked
 /// volume cleaned up sooner than the next scheduled scan.
-async fn run_orphan_scan_loop(pool: SqlitePool, ctx: JobContext, interval_duration: Duration) {
+async fn run_orphan_scan_loop(
+    pool: SqlitePool,
+    ctx: JobContext,
+    interval_duration: Duration,
+    tick_health: Arc<TickHealth>,
+) {
     let mut interval = tokio::time::interval(interval_duration);
 
     loop {
         interval.tick().await;
 
-        match orphan_scan::scan_and_clean(&pool, &ctx).await {
+        let start = Instant::now();
+        let result = orphan_scan::scan_and_clean(&pool, &ctx).await;
+        tick_health
+            .orphan_scan
+            .record(result.is_ok(), start.elapsed());
+        match result {
             Ok(cleaned) if cleaned > 0 => {
                 tracing::warn!("orphan scan: cleaned up {cleaned} untracked volume(s)")
             }
@@ -162,7 +256,12 @@ async fn run_orphan_scan_loop(pool: SqlitePool, ctx: JobContext, interval_durati
 /// every `interval_duration` thereafter, no `Notify` wake-up (a job
 /// becoming `ContainerRunning` doesn't need its first real sample any
 /// sooner than the next scheduled poll).
-async fn run_metrics_poll_loop(pool: SqlitePool, ctx: JobContext, interval_duration: Duration) {
+async fn run_metrics_poll_loop(
+    pool: SqlitePool,
+    ctx: JobContext,
+    interval_duration: Duration,
+    tick_health: Arc<TickHealth>,
+) {
     let ssh_config = ssh::WorkerSshConfig {
         private_key: ctx.worker_ssh_private_key.clone(),
         port: ctx.worker_ssh_port,
@@ -172,9 +271,13 @@ async fn run_metrics_poll_loop(pool: SqlitePool, ctx: JobContext, interval_durat
     loop {
         interval.tick().await;
 
-        match metrics_collector::poll_once(&pool, &ssh_config).await {
-            Ok(_) => {}
-            Err(err) => tracing::error!("metrics poll failed: {err:?}"),
+        let start = Instant::now();
+        let result = metrics_collector::poll_once(&pool, &ssh_config).await;
+        tick_health
+            .metrics_poll
+            .record(result.is_ok(), start.elapsed());
+        if let Err(err) = result {
+            tracing::error!("metrics poll failed: {err:?}");
         }
     }
 }
@@ -183,13 +286,23 @@ async fn run_metrics_poll_loop(pool: SqlitePool, ctx: JobContext, interval_durat
 /// freshly-started shim has real pricing to estimate the very first
 /// job's cost against, not an empty cache for up to a day), then one
 /// every `interval_duration` thereafter.
-async fn run_pricing_sync_loop(pool: SqlitePool, ctx: JobContext, interval_duration: Duration) {
+async fn run_pricing_sync_loop(
+    pool: SqlitePool,
+    ctx: JobContext,
+    interval_duration: Duration,
+    tick_health: Arc<TickHealth>,
+) {
     let mut interval = tokio::time::interval(interval_duration);
 
     loop {
         interval.tick().await;
 
-        if let Err(err) = pricing::sync_pricing_and_rates(&pool, &ctx).await {
+        let start = Instant::now();
+        let result = pricing::sync_pricing_and_rates(&pool, &ctx).await;
+        tick_health
+            .pricing_sync
+            .record(result.is_ok(), start.elapsed());
+        if let Err(err) = result {
             tracing::error!("pricing/exchange-rate sync failed: {err:?}");
         }
     }
@@ -210,14 +323,16 @@ async fn run_with_interval(
             _ = notify.notified() => {}
         }
 
-        if let Err(err) = tick(&pool, &ctx).await {
-            tracing::error!("reconciliation tick failed: {err:?}");
-        }
+        let start = Instant::now();
+        let result = tick(&pool, &ctx).await;
         // Recorded regardless of success/failure -- a tick that
         // returned an Err still proves the loop itself is alive and
         // responsive, which is what /readyz (Phase 15) actually needs
-        // to know.
-        tick_health.record();
+        // to know. /metrics (Phase 18) tells the two apart.
+        tick_health.tick.record(result.is_ok(), start.elapsed());
+        if let Err(err) = result {
+            tracing::error!("reconciliation tick failed: {err:?}");
+        }
     }
 }
 
@@ -387,7 +502,12 @@ mod tests {
 
         // A short interval stands in for ORPHAN_SCAN_INTERVAL here --
         // waiting out the real 5 minutes would make this test useless.
-        tokio::spawn(run_orphan_scan_loop(pool, ctx, Duration::from_millis(20)));
+        tokio::spawn(run_orphan_scan_loop(
+            pool,
+            ctx,
+            Duration::from_millis(20),
+            Arc::new(TickHealth::new()),
+        ));
 
         tokio::time::sleep(Duration::from_millis(150)).await;
         let calls = call_count.load(Ordering::SeqCst);
