@@ -27,6 +27,9 @@ set -u
 STATUS_FILE=/tmp/job-status.txt
 CONTAINER_ID_FILE=/tmp/container-id.txt
 EXIT_CODE_FILE=/tmp/exit-code
+# Why the container was never started (runAsNonRoot's image check); the
+# shim reports it as the job's logs when there's no container to ask.
+START_ERROR_FILE=/tmp/start-error.txt
 
 echo "Waiting for volume..." > "$STATUS_FILE"
 
@@ -35,10 +38,12 @@ CPU_LIMIT=$(echo '__KUBESHIM_CPU_LIMIT_B64__' | base64 -d)
 MEMORY_LIMIT=$(echo '__KUBESHIM_MEMORY_LIMIT_B64__' | base64 -d)
 # Run options (issue #86, src/run_options.rs), each empty when unset:
 # fsGroup, `--user` value ("uid" or "uid:gid"), "true" for
-# readOnlyRootFilesystem, and the scratch volume's `-v` argument.
+# readOnlyRootFilesystem, "true" for runAsNonRoot, and the scratch
+# volume's `-v` argument.
 FS_GROUP=$(echo '__KUBESHIM_FS_GROUP_B64__' | base64 -d)
 RUN_AS_USER=$(echo '__KUBESHIM_RUN_AS_USER_B64__' | base64 -d)
 READ_ONLY_ROOT=$(echo '__KUBESHIM_READ_ONLY_ROOT_B64__' | base64 -d)
+RUN_AS_NON_ROOT=$(echo '__KUBESHIM_RUN_AS_NON_ROOT_B64__' | base64 -d)
 SCRATCH_VOLUME=$(echo '__KUBESHIM_SCRATCH_VOLUME_B64__' | base64 -d)
 
 # The job's ephemeral volume, if it requested one, is attached by the shim
@@ -126,6 +131,34 @@ SECURITY_ARGS=()
 [ -n "$FS_GROUP" ] && SECURITY_ARGS+=(--group-add "$FS_GROUP")
 [ -n "$RUN_AS_USER" ] && SECURITY_ARGS+=(--user "$RUN_AS_USER")
 [ "$READ_ONLY_ROOT" = true ] && SECURITY_ARGS+=(--read-only)
+
+# runAsNonRoot, the kubelet's way: with a runAsUser the shim has already
+# rejected uid 0 at admission; without one, the image's USER decides,
+# and only a numeric, non-zero uid passes (empty means root, and a user
+# name can't be verified without looking inside the image).
+if [ "$RUN_AS_NON_ROOT" = true ] && [ -z "$RUN_AS_USER" ]; then
+    START_ERROR=""
+    # Pulled the way `podman run` would (its default --pull=missing).
+    if ! podman image exists "$IMAGE" && ! podman pull -q "$IMAGE" > /dev/null 2>> "$STATUS_FILE"; then
+        START_ERROR="kube-shim: failed to pull $IMAGE"
+    else
+        IMAGE_USER=$(podman image inspect --format '{{.Config.User}}' "$IMAGE")
+        IMAGE_UID=${IMAGE_USER%%:*}
+        if [ -z "$IMAGE_UID" ]; then
+            START_ERROR="kube-shim: runAsNonRoot is set and image $IMAGE will run as root (it sets no USER)"
+        elif ! [[ "$IMAGE_UID" =~ ^[0-9]+$ ]]; then
+            START_ERROR="kube-shim: runAsNonRoot is set and image $IMAGE has non-numeric user ($IMAGE_UID), cannot verify user is non-root"
+        elif [ $((10#$IMAGE_UID)) -eq 0 ]; then
+            START_ERROR="kube-shim: runAsNonRoot is set and image $IMAGE will run as root (USER $IMAGE_USER)"
+        fi
+    fi
+    if [ -n "$START_ERROR" ]; then
+        rm -f "$CONFIG_DIR/env" "$CONFIG_DIR/secret-env"
+        echo "$START_ERROR" | tee -a "$STATUS_FILE" > "$START_ERROR_FILE"
+        echo 1 > "$EXIT_CODE_FILE"
+        exit 0
+    fi
+fi
 
 echo "Starting container..." >> "$STATUS_FILE"
 # --env-file, not one `-e NAME=VALUE` per variable, so Secret values

@@ -18,6 +18,11 @@
 //! - `containers[0].securityContext.readOnlyRootFilesystem`:
 //!   `podman run --read-only`. podman then still mounts tmpfs on `/tmp`,
 //!   `/var/tmp`, `/run` and `/dev/shm` (its `--read-only-tmpfs` default).
+//! - `runAsNonRoot`, at pod level and on the container (the container's
+//!   value wins), checked like the kubelet does: a `runAsUser` of 0 is
+//!   rejected at admission, and without any `runAsUser` the worker
+//!   refuses to start the container unless the image's `USER` is a
+//!   numeric, non-zero uid (an empty or named user can't be verified).
 //! - `containers[0].volumeMounts[]` for the job's ephemeral volume:
 //!   `mountPath` and `readOnly`. Without such a mount the volume stays
 //!   at `/scratch`, as before.
@@ -30,8 +35,8 @@
 //! The one exception is a few fields set to the value that matches what
 //! kube-shim does anyway (issue #92): the OpenTofu/Terraform kubernetes
 //! provider always sends them, even when the config never mentions them.
-//! `runAsNonRoot: false`, `privileged: false`,
-//! `allowPrivilegeEscalation: true` (Kubernetes' default) and the scratch
+//! `privileged: false`, `allowPrivilegeEscalation: true` (Kubernetes'
+//! default) and the scratch
 //! mount's `mountPropagation: "None"` are accepted; any other value for
 //! them is rejected. See the `*_NO_OP_VALUES` tables.
 //!
@@ -50,9 +55,14 @@ pub const DEFAULT_SCRATCH_MOUNT_PATH: &str = "/scratch";
 /// Kubernetes' own upper bound for `runAsUser`/`runAsGroup`/`fsGroup`.
 const MAX_ID: u64 = 2_147_483_647;
 
-const POD_SECURITY_CONTEXT_FIELDS: &[&str] = &["fsGroup", "runAsUser", "runAsGroup"];
-const CONTAINER_SECURITY_CONTEXT_FIELDS: &[&str] =
-    &["runAsUser", "runAsGroup", "readOnlyRootFilesystem"];
+const POD_SECURITY_CONTEXT_FIELDS: &[&str] =
+    &["fsGroup", "runAsUser", "runAsGroup", "runAsNonRoot"];
+const CONTAINER_SECURITY_CONTEXT_FIELDS: &[&str] = &[
+    "runAsUser",
+    "runAsGroup",
+    "runAsNonRoot",
+    "readOnlyRootFilesystem",
+];
 const SCRATCH_MOUNT_FIELDS: &[&str] = &["name", "mountPath", "readOnly"];
 
 /// A value of an otherwise unsupported field that changes nothing, so
@@ -73,9 +83,8 @@ impl NoOp {
     }
 }
 
-const POD_SECURITY_CONTEXT_NO_OP_VALUES: &[(&str, NoOp)] = &[("runAsNonRoot", NoOp::Bool(false))];
+const POD_SECURITY_CONTEXT_NO_OP_VALUES: &[(&str, NoOp)] = &[];
 const CONTAINER_SECURITY_CONTEXT_NO_OP_VALUES: &[(&str, NoOp)] = &[
-    ("runAsNonRoot", NoOp::Bool(false)),
     ("privileged", NoOp::Bool(false)),
     // Kubernetes' default: podman doesn't set no-new-privileges either.
     ("allowPrivilegeEscalation", NoOp::Bool(true)),
@@ -104,6 +113,9 @@ pub struct RunOptions {
     pub fs_group: Option<u32>,
     /// `--user`: `"<uid>"` or `"<uid>:<gid>"`.
     pub user: Option<String>,
+    /// `runAsNonRoot`: when `user` is `None`, the worker checks the
+    /// image's `USER` before starting the container.
+    pub run_as_non_root: bool,
     /// `--read-only`.
     pub read_only_root_filesystem: bool,
     /// `-v`'s argument for the scratch volume, e.g. `/scratch:/workdir`
@@ -172,17 +184,28 @@ pub fn parse(job_spec: &JsonValue) -> Result<RunOptions, SpecError> {
         }
     };
 
-    let read_only_root_filesystem =
-        match container_sc.and_then(|sc| sc.get("readOnlyRootFilesystem")) {
-            None | Some(JsonValue::Null) => false,
-            Some(JsonValue::Bool(b)) => *b,
-            Some(other) => {
-                return Err(spec_error(
-                    "containers[0].securityContext.readOnlyRootFilesystem",
-                    other.to_string(),
-                ))
-            }
+    let pod_non_root = bool_field(pod_sc, "runAsNonRoot", "securityContext")?;
+    let container_non_root = bool_field(
+        container_sc,
+        "runAsNonRoot",
+        "containers[0].securityContext",
+    )?;
+    let run_as_non_root = container_non_root.or(pod_non_root).unwrap_or(false);
+    if run_as_non_root && container_user.or(pod_user) == Some(0) {
+        let field = if container_user.is_some() {
+            "containers[0].securityContext.runAsUser"
+        } else {
+            "securityContext.runAsUser"
         };
+        return Err(spec_error(field, "0 (runAsNonRoot is set)"));
+    }
+
+    let read_only_root_filesystem = bool_field(
+        container_sc,
+        "readOnlyRootFilesystem",
+        "containers[0].securityContext",
+    )?
+    .unwrap_or(false);
 
     let scratch_volume = match scratch_mount(job_spec) {
         None => format!("{DEFAULT_SCRATCH_MOUNT_PATH}:{DEFAULT_SCRATCH_MOUNT_PATH}"),
@@ -215,6 +238,7 @@ pub fn parse(job_spec: &JsonValue) -> Result<RunOptions, SpecError> {
     Ok(RunOptions {
         fs_group,
         user,
+        run_as_non_root,
         read_only_root_filesystem,
         scratch_volume,
     })
@@ -284,6 +308,18 @@ fn id_field(
     }
 }
 
+fn bool_field(
+    security_context: Option<&JsonValue>,
+    key: &str,
+    prefix: &str,
+) -> Result<Option<bool>, SpecError> {
+    match security_context.and_then(|sc| sc.get(key)) {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::Bool(b)) => Ok(Some(*b)),
+        Some(other) => Err(spec_error(format!("{prefix}.{key}"), other.to_string())),
+    }
+}
+
 /// Absolute, not `/` itself, no `.`/`..` components, and nothing podman's
 /// `-v src:dst[:options]` syntax would misread (`:`) or a C string can't
 /// hold (NUL).
@@ -325,6 +361,7 @@ mod tests {
             RunOptions {
                 fs_group: None,
                 user: None,
+                run_as_non_root: false,
                 read_only_root_filesystem: false,
                 scratch_volume: "/scratch:/scratch".to_string(),
             }
@@ -388,14 +425,6 @@ mod tests {
     fn test_no_op_fields_with_other_values_rejected() {
         let cases = [
             (
-                json!({"securityContext": {"runAsNonRoot": true}, "containers": [{"image": "x"}]}),
-                spec_error("securityContext.runAsNonRoot", "true"),
-            ),
-            (
-                json!({"containers": [{"image": "x", "securityContext": {"runAsNonRoot": true}}]}),
-                spec_error("containers[0].securityContext.runAsNonRoot", "true"),
-            ),
-            (
                 json!({"containers": [{"image": "x", "securityContext": {"privileged": true}}]}),
                 spec_error("containers[0].securityContext.privileged", "true"),
             ),
@@ -445,6 +474,71 @@ mod tests {
     }
 
     #[test]
+    fn test_run_as_non_root() {
+        // Off unless set; the container's value wins over the pod's.
+        let spec = job_spec(json!({"containers": [{"image": "x"}]}));
+        assert!(!parse(&spec).unwrap().run_as_non_root);
+        let spec = job_spec(json!({
+            "securityContext": {"runAsNonRoot": true},
+            "containers": [{"image": "x"}]
+        }));
+        assert_eq!(validate(&spec), Ok(()));
+        assert!(parse(&spec).unwrap().run_as_non_root);
+        let spec = job_spec(json!({
+            "securityContext": {"runAsNonRoot": true},
+            "containers": [{"image": "x", "securityContext": {"runAsNonRoot": false, "runAsUser": 0}}]
+        }));
+        assert_eq!(validate(&spec), Ok(()));
+        assert!(!parse(&spec).unwrap().run_as_non_root);
+
+        // A non-zero runAsUser satisfies it, at either level.
+        let spec = job_spec(json!({
+            "securityContext": {"runAsUser": 1000},
+            "containers": [{"image": "x", "securityContext": {"runAsNonRoot": true}}]
+        }));
+        assert_eq!(validate(&spec), Ok(()));
+        let options = parse(&spec).unwrap();
+        assert!(options.run_as_non_root);
+        assert_eq!(options.user.as_deref(), Some("1000"));
+    }
+
+    #[test]
+    fn test_run_as_non_root_with_root_user_rejected() {
+        let spec = job_spec(json!({
+            "securityContext": {"runAsNonRoot": true, "runAsUser": 0},
+            "containers": [{"image": "x"}]
+        }));
+        assert_eq!(
+            validate(&spec),
+            Err(spec_error(
+                "securityContext.runAsUser",
+                "0 (runAsNonRoot is set)"
+            ))
+        );
+        let spec = job_spec(json!({
+            "securityContext": {"runAsNonRoot": true, "runAsUser": 1000},
+            "containers": [{"image": "x", "securityContext": {"runAsUser": 0}}]
+        }));
+        assert_eq!(
+            validate(&spec),
+            Err(spec_error(
+                "containers[0].securityContext.runAsUser",
+                "0 (runAsNonRoot is set)"
+            ))
+        );
+        let spec = job_spec(json!({
+            "containers": [{"image": "x", "securityContext": {"runAsNonRoot": "yes"}}]
+        }));
+        assert_eq!(
+            validate(&spec),
+            Err(spec_error(
+                "containers[0].securityContext.runAsNonRoot",
+                "\"yes\""
+            ))
+        );
+    }
+
+    #[test]
     fn test_run_as_group_without_user_rejected() {
         let spec = job_spec(json!({
             "containers": [{"image": "x", "securityContext": {"runAsGroup": 1000}}]
@@ -479,12 +573,12 @@ mod tests {
     #[test]
     fn test_unsupported_security_context_fields_rejected() {
         let spec = job_spec(json!({
-            "securityContext": {"fsGroup": 1000, "runAsNonRoot": true},
+            "securityContext": {"fsGroup": 1000, "seccompProfile": {"type": "RuntimeDefault"}},
             "containers": [{"image": "x"}]
         }));
         assert_eq!(
             validate(&spec).unwrap_err(),
-            spec_error("securityContext.runAsNonRoot", "true")
+            spec_error("securityContext", "seccompProfile")
         );
         // parse() itself tolerates unknown fields (see its docs).
         assert_eq!(parse(&spec).unwrap().fs_group, Some(1000));
