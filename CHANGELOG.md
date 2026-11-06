@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/brawer/kube-shim/compare/v0.3.0...v0.3.1) (2026-11-06)
+
+
+### 🐞 Bug Fixes
+
+* accept the no-op securityContext/volumeMount defaults the OpenTofu kubernetes provider sends ([e5009be](https://github.com/brawer/kube-shim/commit/e5009be45b968ebc26f8bcbae0fffc6d9a9e6b04)), closes [#92](https://github.com/brawer/kube-shim/issues/92)
+
 ## [0.3.0](https://github.com/brawer/kube-shim/compare/v0.2.9...v0.3.0) (2026-11-06)
 
 
