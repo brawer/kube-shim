@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.4](https://github.com/brawer/kube-shim/compare/v0.3.3...v0.3.4) (2026-11-06)
+
+
+### 🆕 Enhancements
+
+* **tofu:** update config and image tag in place over SSH ([d477fcf](https://github.com/brawer/kube-shim/commit/d477fcf23ffd9196ad46a7c4fcbc72618023fcb8))
+
 ## [0.3.3](https://github.com/brawer/kube-shim/compare/v0.3.2...v0.3.3) (2026-11-06)
 
 
