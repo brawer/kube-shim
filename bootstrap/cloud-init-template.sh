@@ -70,8 +70,9 @@ apt-get install -y -qq podman >> "$STATUS_FILE" 2>&1
 
 # Wait for the container config the shim delivers over SSH (its
 # `ContainerConfiguring` state, src/cloud_init.rs's UPLOAD_*_COMMAND):
-# `env` in `podman run --env-file` format, `command`/`args` as
-# NUL-terminated entries, each written root-only and renamed into place,
+# `env` in `podman run --env-file` format, `secret-env` (variables the
+# env file can't hold, e.g. a multi-line PEM key) and `command`/`args`
+# as NUL-terminated entries, each written root-only and renamed into place,
 # then `ready` last. No timeout of our own: the shim fails and deletes a
 # job (and this VM) that gets stuck before its container starts.
 CONFIG_DIR=/run/kube-shim
@@ -81,6 +82,19 @@ until [ -e "$CONFIG_DIR/ready" ]; do
 done
 mapfile -d '' -t COMMAND < "$CONFIG_DIR/command"
 mapfile -d '' -t ARGS < "$CONFIG_DIR/args"
+
+# Each secret-env NAME/VALUE pair becomes a podman secret, exposed to the
+# container as an env var with the exact value (line breaks included).
+# The value only ever goes through printf (a builtin) and a pipe, never
+# argv, so it stays out of the process list too.
+mapfile -d '' -t SECRET_ENV < "$CONFIG_DIR/secret-env"
+SECRET_ARGS=()
+for ((i = 0; i + 1 < ${#SECRET_ENV[@]}; i += 2)); do
+    SECRET_NAME="kube-shim-env-$i"
+    printf '%s' "${SECRET_ENV[i+1]}" | podman secret create "$SECRET_NAME" - > /dev/null
+    SECRET_ARGS+=(--secret "$SECRET_NAME,type=env,target=${SECRET_ENV[i]}")
+done
+unset SECRET_ENV
 
 # Empty CPU_LIMIT/MEMORY_LIMIT means the job's spec had no
 # resources.limits.cpu/.memory set -- omit the flag entirely rather than
@@ -93,10 +107,10 @@ RESOURCE_ARGS=()
 echo "Starting container..." >> "$STATUS_FILE"
 # --env-file, not one `-e NAME=VALUE` per variable, so Secret values
 # never show up in this VM's process list.
-CONTAINER_ID=$(podman run -d -v /scratch:/scratch "${RESOURCE_ARGS[@]}" --env-file "$CONFIG_DIR/env" "$IMAGE" "${COMMAND[@]}" "${ARGS[@]}")
+CONTAINER_ID=$(podman run -d -v /scratch:/scratch "${RESOURCE_ARGS[@]}" --env-file "$CONFIG_DIR/env" "${SECRET_ARGS[@]}" "$IMAGE" "${COMMAND[@]}" "${ARGS[@]}")
 echo "$CONTAINER_ID" > "$CONTAINER_ID_FILE"
 # podman has copied the env into the container's own config by now.
-rm -f "$CONFIG_DIR/env"
+rm -f "$CONFIG_DIR/env" "$CONFIG_DIR/secret-env"
 
 podman wait "$CONTAINER_ID" > /dev/null
 EXIT_CODE=$(podman inspect "$CONTAINER_ID" --format '{{.State.ExitCode}}')

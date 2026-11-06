@@ -41,13 +41,16 @@ pub const CONFIG_DIR: &str = "/run/kube-shim";
 /// The fixed remote commands `reconcile::job` runs (with the file's
 /// contents on stdin) to deliver each file: written root-only (`umask
 /// 077`) and renamed into place, so the template never reads a
-/// half-written file. `READY_COMMAND` goes last, once all three exist.
+/// half-written file. `READY_COMMAND` goes last, once all four exist.
 pub const UPLOAD_ENV_COMMAND: &str = "umask 077 && mkdir -p /run/kube-shim && \
      cat > /run/kube-shim/env.part && mv -f /run/kube-shim/env.part /run/kube-shim/env";
 pub const UPLOAD_COMMAND_COMMAND: &str = "umask 077 && mkdir -p /run/kube-shim && \
      cat > /run/kube-shim/command.part && mv -f /run/kube-shim/command.part /run/kube-shim/command";
 pub const UPLOAD_ARGS_COMMAND: &str = "umask 077 && mkdir -p /run/kube-shim && \
      cat > /run/kube-shim/args.part && mv -f /run/kube-shim/args.part /run/kube-shim/args";
+pub const UPLOAD_SECRET_ENV_COMMAND: &str = "umask 077 && mkdir -p /run/kube-shim && \
+     cat > /run/kube-shim/secret-env.part && \
+     mv -f /run/kube-shim/secret-env.part /run/kube-shim/secret-env";
 pub const READY_COMMAND: &str = "umask 077 && cat > /run/kube-shim/ready";
 
 /// Builds the real `user_data` script for a job's worker VM, from
@@ -87,12 +90,19 @@ pub fn first_container(spec: &JsonValue) -> Result<&JsonValue, String> {
         .ok_or_else(|| "job spec has no template.spec.containers[0]".to_string())
 }
 
-/// The three files the worker's container is started from, delivered
-/// over SSH (see the module docs).
+/// The files the worker's container is started from, delivered over SSH
+/// (see the module docs).
 #[derive(Debug, PartialEq, Eq)]
 pub struct ContainerConfig {
     /// `podman run --env-file` format: one `NAME=VALUE` per line.
     pub env_file: Vec<u8>,
+    /// Variables `--env-file` can't hold (a line break, or longer than
+    /// one of its lines may be -- a PEM key, say), as NUL-terminated
+    /// `NAME`, `VALUE` pairs. The worker turns each into a podman secret
+    /// (`podman secret create`, value on stdin) and passes it with
+    /// `--secret ...,type=env,target=NAME`, which sets the variable to
+    /// the exact bytes.
+    pub secret_env: Vec<u8>,
     /// `command`/`args` after Kubernetes' `$(VAR)` expansion, each entry
     /// NUL-terminated (read back with `mapfile -d ''`), so an entry can
     /// hold any text, newlines included.
@@ -103,15 +113,19 @@ pub struct ContainerConfig {
 /// podman's `--env-file` parser reads one variable per line, takes
 /// everything after the first `=` literally (no quoting), skips lines
 /// starting with `#`, strips leading whitespace from the name, and a
-/// line longer than 64KiB fails to parse. Anything it can't represent
-/// is refused here, loudly, rather than delivered mangled.
+/// line longer than 64KiB fails to parse. A value it can't hold goes to
+/// `secret_env` instead; a name it can't hold is refused, loudly.
 const MAX_ENV_FILE_LINE: usize = 60 * 1024;
+
+/// podman's own limit on a secret's size.
+const MAX_SECRET_ENV_VALUE: usize = 512 * 1024;
 
 pub fn container_config(
     container: &JsonValue,
     env: &[(String, String)],
 ) -> Result<ContainerConfig, String> {
     let mut env_file = Vec::new();
+    let mut secret_env = Vec::new();
     for (name, value) in env {
         if name.starts_with([' ', '#']) {
             return Err(format!(
@@ -119,20 +133,28 @@ pub fn container_config(
                  (not representable in podman's --env-file)"
             ));
         }
-        if value.contains(['\n', '\r']) {
-            return Err(format!(
-                "environment variable {name} contains a line break, which podman's \
-                 --env-file can't represent"
-            ));
-        }
         let line = format!("{name}={value}\n");
-        if line.len() > MAX_ENV_FILE_LINE {
+        if !value.contains(['\n', '\r']) && line.len() <= MAX_ENV_FILE_LINE {
+            env_file.extend_from_slice(line.as_bytes());
+            continue;
+        }
+        if name.contains(',') {
+            // `--secret` options are comma-separated.
             return Err(format!(
-                "environment variable {name} is longer than {MAX_ENV_FILE_LINE} bytes, \
-                 podman's --env-file limit"
+                "environment variable {name:?} has a multi-line or very long value, which \
+                 is only supported for names without ','"
             ));
         }
-        env_file.extend_from_slice(line.as_bytes());
+        if value.len() > MAX_SECRET_ENV_VALUE {
+            return Err(format!(
+                "environment variable {name} is longer than {MAX_SECRET_ENV_VALUE} bytes, \
+                 podman's limit for a secret"
+            ));
+        }
+        secret_env.extend_from_slice(name.as_bytes());
+        secret_env.push(0);
+        secret_env.extend_from_slice(value.as_bytes());
+        secret_env.push(0);
     }
 
     let nul_terminated = |field: &str| -> Result<Vec<u8>, String> {
@@ -150,6 +172,7 @@ pub fn container_config(
 
     Ok(ContainerConfig {
         env_file,
+        secret_env,
         command: nul_terminated("command")?,
         args: nul_terminated("args")?,
     })
@@ -332,21 +355,40 @@ mod tests {
     }
 
     #[test]
-    fn test_container_config_refuses_what_env_file_cannot_hold() {
+    fn test_container_config_multi_line_and_long_values_go_to_secret_env() {
         let container = json!({"image": "x"});
+        let pem = "-----BEGIN KEY-----\nabc def\r\n-----END KEY-----\n";
+        let long = "x".repeat(MAX_ENV_FILE_LINE);
+        let env = pairs(&[("A", "1"), ("PEM", pem), ("LONG", &long), ("B", "2")]);
+        let config = container_config(&container, &env).unwrap();
+
+        assert_eq!(config.env_file, b"A=1\nB=2\n".to_vec());
+        let mut expected = Vec::new();
+        for part in ["PEM", pem, "LONG", &long] {
+            expected.extend_from_slice(part.as_bytes());
+            expected.push(0);
+        }
+        assert_eq!(config.secret_env, expected);
+    }
+
+    #[test]
+    fn test_container_config_refuses_what_podman_cannot_hold() {
+        let container = json!({"image": "x"});
+        let too_big = "x".repeat(MAX_SECRET_ENV_VALUE + 1);
         for env in [
-            pairs(&[("PEM", "line1\nline2")]),
-            pairs(&[("CR", "a\rb")]),
             pairs(&[("#COMMENT", "x")]),
             pairs(&[(" LEADING", "x")]),
+            pairs(&[("A,B", "multi\nline")]),
+            pairs(&[("BIG", &too_big)]),
         ] {
             assert!(
                 container_config(&container, &env).is_err(),
-                "{env:?} must be refused"
+                "{:?} must be refused",
+                env[0].0
             );
         }
-        let huge = "x".repeat(MAX_ENV_FILE_LINE);
-        assert!(container_config(&container, &pairs(&[("BIG", &huge)])).is_err());
+        // A comma is fine in a plain one-line variable.
+        assert!(container_config(&container, &pairs(&[("A,B", "x")])).is_ok());
     }
 
     #[test]
