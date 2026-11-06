@@ -113,8 +113,9 @@ echo "Starting server..."
 SERVER_PID=$!
 
 # Poll for readiness instead of a fixed sleep -- CI runners vary in speed.
+# Up to 30 s: on a slow runner, database setup alone has taken over 5 s.
 READY=0
-for _ in $(seq 1 50); do
+for _ in $(seq 1 300); do
     if curl -sk -o /dev/null -H "Authorization: Bearer ${TOKEN}" "$BASE_URL/health" 2>/dev/null; then
         READY=1
         break
