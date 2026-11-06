@@ -18,7 +18,7 @@ variable "acme_contact_email" {
 }
 
 variable "acme_directory" {
-  description = "\"staging\" (default, higher rate limits, untrusted cert chain -- for throwaway test instances) or \"production\". Set this to its final value from the first apply: changing it later replaces the server (user_data is RequiresReplace), most likely with new IP addresses."
+  description = "\"staging\" (default, higher rate limits, untrusted cert chain -- for throwaway test instances) or \"production\". Changing it later is applied in place over SSH (see README.md's \"Updating in place\")."
   type        = string
   default     = "staging"
 }
@@ -111,9 +111,9 @@ variable "api_token_count" {
     (see the api_tokens output), then lower it back down to retire the
     old one(s) -- random_password's own indexing means raising the
     count only ever adds a new token at the end, never reshuffles an
-    existing one's value. Note that each change replaces the server
-    (user_data is RequiresReplace), most likely with new IP addresses
-    -- see README.md's "Rotating credentials".
+    existing one's value. Each change is applied in place over SSH,
+    keeping the server and its IP addresses -- see README.md's
+    "Rotating credentials".
   EOT
   type        = number
   default     = 1
@@ -125,19 +125,34 @@ variable "reconciliation_interval_secs" {
   default     = 10
 }
 
-# Deliberately commented out, not deleted (kept from an earlier pass
-# at review's own request): intended to let deploy/kube-shim.container's
-# Image=... line be overridden to pin an explicit version instead of
-# always tracking :latest. Re-enabling this means that line can no
-# longer be read verbatim via file() -- it needs to become a real
-# template placeholder instead, which would break
-# bootstrap/provision.sh's existing manual copy-the-file-as-is flow
-# for the one real deployment that still uses it today. Revisit once
-# that deployment has been migrated onto this OpenTofu module instead
-# (tracked to land in a follow-up PR, not this one).
-#
-# variable "kube_shim_image_tag" {
-#   description = "Image tag for ghcr.io/brawer/kube-shim. \"latest\" (default) matches deploy/kube-shim.container's own checked-in AutoUpdate=registry behavior; pin an explicit version (e.g. \"v0.2.7\") for a deliberate, manually-updated deployment instead."
-#   type        = string
-#   default     = "latest"
-# }
+variable "image_tag" {
+  description = <<-EOT
+    Tag of ghcr.io/brawer/kube-shim to run. "latest" (default) keeps
+    deploy/kube-shim.container's checked-in AutoUpdate=registry
+    behavior, rolling forward on every release. An explicit release
+    tag (e.g. "v0.3.3") pins that version and drops AutoUpdate, so the
+    host only changes version when this value changes. Changing it
+    updates the host in place over SSH (see README.md's "Updating in
+    place"); it does not replace the server.
+  EOT
+  type        = string
+  default     = "latest"
+
+  validation {
+    condition     = can(regex("^(latest|v[0-9]+\\.[0-9]+\\.[0-9]+)$", var.image_tag))
+    error_message = "image_tag must be \"latest\" or a release tag such as \"v0.3.3\"."
+  }
+}
+
+variable "operator_ssh_private_key" {
+  description = <<-EOT
+    Private key matching one of operator_ssh_public_keys, used by
+    `tofu apply` to SSH into the host as its admin user and push
+    config.toml and the quadlet unit (see README.md's "Updating in
+    place"). Leave null (default) to use your running SSH agent
+    instead. Only used for the connection, never stored on the host.
+  EOT
+  type        = string
+  default     = null
+  sensitive   = true
+}
