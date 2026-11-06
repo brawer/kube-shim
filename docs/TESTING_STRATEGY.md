@@ -356,16 +356,16 @@ Create `tests/fixtures.rs`:
 ```rust
 pub fn create_test_secret(name: &str) -> serde_json::Value {
     serde_json::json!({
-        "api_version": "v1",
+        "apiVersion": "v1",
         "kind": "Secret",
         "metadata": {"name": name},
-        "data": {"key": "test-value"}
+        "stringData": {"key": "test-value"}
     })
 }
 
 pub fn create_test_cronjob(name: &str) -> serde_json::Value {
     serde_json::json!({
-        "api_version": "batch/v1",
+        "apiVersion": "batch/v1",
         "kind": "CronJob",
         "metadata": {"name": name},
         "spec": {

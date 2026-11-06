@@ -23,6 +23,7 @@ use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InvolvedObjectRef {
     pub api_version: String,
     pub kind: String,
@@ -31,6 +32,7 @@ pub struct InvolvedObjectRef {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Event {
     pub api_version: String,
     pub kind: String,
@@ -38,35 +40,25 @@ pub struct Event {
     pub involved_object: InvolvedObjectRef,
     pub reason: String,
     pub message: String,
-    /// `serde(rename = "type")`, not the `type_field`-stays-unrenamed
-    /// convention `api::secret::Secret` uses -- that field has never
-    /// round-tripped through anything real, where `kubectl describe`
-    /// actually reads this one to decide whether to print a line as a
-    /// plain `Normal` event or call out a `Warning`.
+    /// `kubectl describe` reads this to decide whether to print a line
+    /// as a plain `Normal` event or call out a `Warning`.
     #[serde(rename = "type")]
     pub event_type: String,
-    /// `serde(rename)`, not snake_case like every other field here --
-    /// verified hands-on that it has to be: `kubectl describe pod`'s own
-    /// Events table computes its "Age" column by unmarshaling this
-    /// field through client-go's typed `v1.Event` struct (real
-    /// `firstTimestamp`/`lastTimestamp` JSON tags), not by passing it
-    /// through opaquely the way `reason`/`message` are -- snake_case
-    /// here silently produced "<unknown>" instead of an error, which is
-    /// what made this easy to miss without actually running `kubectl
-    /// describe` against it.
+    /// `kubectl describe pod`'s Events table computes its "Age" column
+    /// by unmarshaling this field through client-go's typed `v1.Event`
+    /// struct; a wrong field name silently renders as "<unknown>".
     ///
     /// Always equal to `last_timestamp`: this project records one row
     /// per occurrence rather than collapsing repeats into a `count` (see
     /// `reconcile::job::record_event`'s own docs), so there's never a
     /// first/last spread to report within a single `Event` object.
-    #[serde(rename = "firstTimestamp")]
     pub first_timestamp: String,
-    #[serde(rename = "lastTimestamp")]
     pub last_timestamp: String,
     pub count: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EventList {
     pub api_version: String,
     pub kind: String,
@@ -121,14 +113,10 @@ pub async fn list_events(
             let event_type: String = row.get(4);
             let job_name: String = row.get(5);
             let job_namespace: String = row.get(6);
-            // RFC 3339, not the raw-epoch-seconds-as-a-string convention
-            // this project's other `creation_timestamp` fields use
-            // (Secret/CronJob) -- those predate this module and nothing
-            // depends on this new one matching them. `kubectl describe
-            // pod`'s Events table computes its own "Age" column by
-            // parsing this field as a real timestamp; verified hands-on
-            // that the epoch-seconds form renders as "<unknown>" there,
-            // where RFC 3339 renders correctly.
+            // RFC 3339: `kubectl describe pod`'s Events table computes
+            // its "Age" column by parsing this field as a real
+            // timestamp; verified hands-on that the epoch-seconds form
+            // renders as "<unknown>" there.
             let timestamp = chrono::DateTime::from_timestamp(timestamp, 0)
                 .map(|dt| dt.to_rfc3339())
                 .unwrap_or_default();

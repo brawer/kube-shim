@@ -20,6 +20,7 @@ pub struct PodStatus {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Pod {
     pub api_version: String,
     pub kind: String,

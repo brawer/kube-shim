@@ -3,6 +3,8 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -10,6 +12,7 @@ use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ObjectMeta {
     pub name: String,
     pub namespace: Option<String>,
@@ -20,21 +23,82 @@ pub struct ObjectMeta {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Secret {
     pub api_version: String,
     pub kind: String,
     pub metadata: ObjectMeta,
     pub data: JsonValue,
-    #[serde(default)]
-    pub type_field: Option<String>,
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub secret_type: Option<String>,
 }
 
+/// What `kubectl apply`/`kubectl create secret` and OpenTofu's
+/// `kubernetes_secret` send. `data` values are base64-encoded;
+/// `stringData` values are plain text and get merged into `data`
+/// (base64-encoded, winning over a `data` key of the same name), as in
+/// Kubernetes. `type` is accepted but not stored: every Secret here is
+/// reported as `Opaque`.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateSecretRequest {
     pub api_version: String,
     pub kind: String,
     pub metadata: ObjectMeta,
-    pub data: JsonValue,
+    #[serde(default)]
+    pub data: Option<JsonValue>,
+    #[serde(default)]
+    pub string_data: Option<JsonValue>,
+    #[serde(rename = "type", default)]
+    pub secret_type: Option<String>,
+}
+
+const SECRET_TYPE: &str = "Opaque";
+
+/// Merges `stringData` into `data` the way Kubernetes does: each
+/// `stringData` value is base64-encoded and replaces a `data` entry of
+/// the same key. Both must be objects of strings, and `data` values
+/// must be valid base64 (rejected here, as Kubernetes does, rather than
+/// only when a job later reads them).
+fn merge_string_data(
+    data: Option<JsonValue>,
+    string_data: Option<JsonValue>,
+) -> Result<JsonValue, String> {
+    let mut merged = match data {
+        None | Some(JsonValue::Null) => serde_json::Map::new(),
+        Some(JsonValue::Object(map)) => map,
+        Some(_) => return Err("data must be an object".to_string()),
+    };
+    for (key, value) in &merged {
+        let JsonValue::String(encoded) = value else {
+            return Err(format!("data.{key} must be a string"));
+        };
+        if BASE64.decode(encoded).is_err() {
+            return Err(format!(
+                "data.{key} is not base64-encoded (use stringData for plain values)"
+            ));
+        }
+    }
+    match string_data {
+        None | Some(JsonValue::Null) => {}
+        Some(JsonValue::Object(map)) => {
+            for (key, value) in map {
+                let JsonValue::String(plain) = value else {
+                    return Err(format!("stringData.{key} must be a string"));
+                };
+                merged.insert(key, JsonValue::String(BASE64.encode(plain)));
+            }
+        }
+        Some(_) => return Err("stringData must be an object".to_string()),
+    }
+    Ok(JsonValue::Object(merged))
+}
+
+/// RFC 3339, the format `metav1.Time` (and so client-go) parses.
+pub(crate) fn rfc3339(timestamp: i64) -> String {
+    chrono::DateTime::from_timestamp(timestamp, 0)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_default()
 }
 
 pub async fn create_secret(
@@ -48,8 +112,10 @@ pub async fn create_secret(
         .unwrap_or_else(|| "default".to_string());
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().timestamp();
+    let data =
+        merge_string_data(req.data, req.string_data).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let data_json =
-        serde_json::to_string(&req.data).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        serde_json::to_string(&data).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     sqlx::query(
         r#"
@@ -75,10 +141,10 @@ pub async fn create_secret(
             name: req.metadata.name,
             namespace: Some(namespace),
             uid: Some(id),
-            creation_timestamp: Some(now.to_string()),
+            creation_timestamp: Some(rfc3339(now)),
         },
-        data: req.data,
-        type_field: None,
+        data,
+        secret_type: Some(SECRET_TYPE.to_string()),
     };
 
     Ok((StatusCode::CREATED, Json(secret)))
@@ -116,7 +182,7 @@ pub async fn get_secret(
             creation_timestamp: None,
         },
         data,
-        type_field: None,
+        secret_type: Some(SECRET_TYPE.to_string()),
     };
 
     Ok(Json(secret))
@@ -156,7 +222,7 @@ pub async fn list_secrets(
                     creation_timestamp: None,
                 },
                 data,
-                type_field: None,
+                secret_type: Some(SECRET_TYPE.to_string()),
             }
         })
         .collect();
@@ -192,6 +258,7 @@ pub async fn delete_secret(
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ListSecretsResponse {
     pub api_version: String,
     pub kind: String,

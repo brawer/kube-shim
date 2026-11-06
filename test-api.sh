@@ -29,10 +29,10 @@ echo "4. Creating a secret..."
 curl $INSECURE -H "$AUTH" -X POST $BASE_URL/api/v1/namespaces/default/secrets \
   -H "Content-Type: application/json" \
   -d '{
-    "api_version": "v1",
+    "apiVersion": "v1",
     "kind": "Secret",
     "metadata": {"name": "test-secret-123"},
-    "data": {"username": "admin", "password": "secret123"}
+    "stringData": {"username": "admin", "password": "secret123"}
   }' | jq .
 echo ""
 
@@ -51,7 +51,7 @@ echo "7. Creating a CronJob..."
 curl $INSECURE -H "$AUTH" -X POST $BASE_URL/apis/batch/v1/namespaces/default/cronjobs \
   -H "Content-Type: application/json" \
   -d '{
-    "api_version": "batch/v1",
+    "apiVersion": "batch/v1",
     "kind": "CronJob",
     "metadata": {"name": "test-cronjob"},
     "spec": {

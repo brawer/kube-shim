@@ -38,7 +38,7 @@ async fn test_router() -> axum::Router {
 
 fn create_cronjob_request(name: &str, spec: Value) -> Request<Body> {
     let body = json!({
-        "api_version": "batch/v1",
+        "apiVersion": "batch/v1",
         "kind": "CronJob",
         "metadata": {"name": name, "namespace": "default"},
         "spec": spec,
