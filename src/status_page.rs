@@ -21,9 +21,8 @@
 //! event reasons/messages, cost figures), not "whatever happened to be
 //! convenient to query."
 
-use crate::reconcile::job::extract_resource_requests;
+use crate::pricing;
 use crate::reconcile::TickHealth;
-use crate::{pricing, workload};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -66,12 +65,14 @@ struct RunningJob {
     cronjob_name: Option<String>,
     status: String,
     created_at: i64,
-    plan_name: Option<&'static str>,
+    /// The plan the job's worker VM was created with (issue #85);
+    /// `None` until the VM exists.
+    plan_name: Option<String>,
 }
 
 async fn running_jobs(pool: &SqlitePool) -> anyhow::Result<Vec<RunningJob>> {
     let rows = sqlx::query(
-        "SELECT name, namespace, cronjob_name, status, created_at, spec \
+        "SELECT name, namespace, cronjob_name, status, created_at, worker_plan \
          FROM jobs WHERE status != 'Archived' ORDER BY created_at DESC",
     )
     .fetch_all(pool)
@@ -85,12 +86,7 @@ async fn running_jobs(pool: &SqlitePool) -> anyhow::Result<Vec<RunningJob>> {
             let cronjob_name: Option<String> = row.get(2);
             let status: String = row.get(3);
             let created_at: i64 = row.get(4);
-            let spec_str: String = row.get(5);
-            let spec: serde_json::Value =
-                serde_json::from_str(&spec_str).unwrap_or(serde_json::Value::Null);
-            let (cpu_millicores, memory_mb) = extract_resource_requests(&spec);
-            let plan_name = workload::plan_for_resource_requests(cpu_millicores, memory_mb)
-                .map(|plan| plan.name);
+            let plan_name: Option<String> = row.get(5);
             RunningJob {
                 name,
                 namespace,
@@ -166,7 +162,7 @@ fn render_html(
                     kind,
                     esc(&j.status),
                     format_elapsed(now - j.created_at),
-                    j.plan_name.unwrap_or("n/a"),
+                    j.plan_name.as_deref().unwrap_or("n/a"),
                 )
             })
             .collect::<String>()

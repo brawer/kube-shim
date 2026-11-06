@@ -69,7 +69,8 @@ pub struct ChargeBreakdown {
     pub total: f64,
 }
 
-/// A job's VM charge, plus a second charge if it also has an
+/// A job's VM charge, plus one each for its boot disk and IPv4 address
+/// if the plan doesn't bundle them, plus one if it also has an
 /// ephemeral volume -- in the provider's own real billing currency,
 /// for `duration_hours`. `None` if pricing for the job's own plan
 /// hasn't been synced yet (the daily sync hasn't run yet, or
@@ -89,18 +90,40 @@ async fn charge_breakdown_for_duration(
     pool: &SqlitePool,
     zone: &str,
     spec: &JsonValue,
+    recorded_plan: Option<&str>,
     duration_hours: f64,
 ) -> Result<Option<(Vec<ChargeBreakdown>, String)>> {
-    let (cpu_millicores, memory_mb) = extract_resource_requests(spec);
-    // Same rounding `handle_vm_pending` applies when actually sizing
-    // the worker VM -- the cost estimate must size against the exact
-    // plan that'll really be provisioned, not a differently-rounded
-    // guess of its own.
-    let Some(plan) = workload::plan_for_resource_requests(cpu_millicores, memory_mb) else {
-        return Ok(None);
+    // A job whose VM already exists is charged for the plan it really
+    // got (`jobs.worker_plan`, issue #85). Otherwise the same cheapest-
+    // fit choice `handle_vm_pending` makes -- the estimate must size
+    // against the plan that'll really be provisioned.
+    let (plan_name, plan_storage_gb) = match recorded_plan {
+        Some(name) => {
+            let storage_gb: Option<u32> =
+                sqlx::query_scalar("SELECT storage_gb FROM provider_plans WHERE name = ?")
+                    .bind(name)
+                    .fetch_optional(pool)
+                    .await?;
+            // A plan retired from the catalog since: assume its storage
+            // covered the boot disk, as it did for every plan this
+            // project used before the catalog was synced.
+            (
+                name.to_string(),
+                storage_gb.unwrap_or(workload::WORKER_BOOT_DISK_GB),
+            )
+        }
+        None => {
+            let (cpu_millicores, memory_mb) = extract_resource_requests(spec);
+            match workload::plan_for_resource_requests(pool, zone, cpu_millicores, memory_mb)
+                .await?
+            {
+                Some(plan) => (plan.name, plan.storage_gb),
+                None => return Ok(None),
+            }
+        }
     };
 
-    let vm_price_key = format!("server_plan_{}", plan.name);
+    let vm_price_key = format!("server_plan_{plan_name}");
     let Some((vm_amount, vm_price, provider_currency)) =
         cached_price(pool, zone, &vm_price_key).await?
     else {
@@ -108,7 +131,7 @@ async fn charge_breakdown_for_duration(
     };
     let vm_unit_price = (vm_price / vm_amount) / 100.0;
     let mut charges = vec![ChargeBreakdown {
-        sku_id: plan.name.to_string(),
+        sku_id: plan_name,
         sku_price_id: vm_price_key,
         pricing_category: "Standard",
         quantity: duration_hours,
@@ -116,6 +139,39 @@ async fn charge_breakdown_for_duration(
         unit_price: vm_unit_price,
         total: vm_unit_price * duration_hours,
     }];
+
+    // Plans that don't bundle the boot disk and public IPv4 (Cloud
+    // Native style, `workload::plan_bundles_disk_and_ip`) bill both
+    // separately: one charge each.
+    if !workload::plan_bundles_disk_and_ip(plan_storage_gb) {
+        let boot_tier = StorageTier::Standard.upcloud_tier();
+        let boot_price_key = format!("storage_{boot_tier}");
+        if let Some((amount, price, _)) = cached_price(pool, zone, &boot_price_key).await? {
+            let unit_price = (price / amount) / 100.0 * f64::from(workload::WORKER_BOOT_DISK_GB);
+            charges.push(ChargeBreakdown {
+                sku_id: format!("{boot_tier}-{}GB-boot", workload::WORKER_BOOT_DISK_GB),
+                sku_price_id: boot_price_key,
+                pricing_category: "Standard",
+                quantity: duration_hours,
+                unit: "Hours",
+                unit_price,
+                total: unit_price * duration_hours,
+            });
+        }
+        let ip_price_key = "ipv4_address".to_string();
+        if let Some((amount, price, _)) = cached_price(pool, zone, &ip_price_key).await? {
+            let unit_price = (price / amount) / 100.0;
+            charges.push(ChargeBreakdown {
+                sku_id: "ipv4-address".to_string(),
+                sku_price_id: ip_price_key,
+                pricing_category: "Standard",
+                quantity: duration_hours,
+                unit: "Hours",
+                unit_price,
+                total: unit_price * duration_hours,
+            });
+        }
+    }
 
     if let Some(volume) = find_ephemeral_volume(spec) {
         if let Some(size_gb) = volume
@@ -173,7 +229,7 @@ pub async fn estimate_job_charges(
     active_deadline_seconds: i64,
 ) -> Result<Option<(Vec<ChargeBreakdown>, String)>> {
     let duration_hours = active_deadline_seconds.max(0) as f64 / SECONDS_PER_HOUR;
-    charge_breakdown_for_duration(pool, zone, spec, duration_hours).await
+    charge_breakdown_for_duration(pool, zone, spec, None, duration_hours).await
 }
 
 /// A job's real charges once it's actually finished, from its real
@@ -185,10 +241,11 @@ pub async fn actual_job_charges(
     pool: &SqlitePool,
     zone: &str,
     spec: &JsonValue,
+    worker_plan: Option<&str>,
     duration_seconds: i64,
 ) -> Result<Option<(Vec<ChargeBreakdown>, String)>> {
     let duration_hours = duration_seconds.max(0) as f64 / SECONDS_PER_HOUR;
-    charge_breakdown_for_duration(pool, zone, spec, duration_hours).await
+    charge_breakdown_for_duration(pool, zone, spec, worker_plan, duration_hours).await
 }
 
 /// A job's worst-case *total* cost before it starts, converted to
@@ -218,11 +275,12 @@ pub async fn calculate_actual_cost(
     pool: &SqlitePool,
     zone: &str,
     spec: &JsonValue,
+    worker_plan: Option<&str>,
     duration_seconds: i64,
     main_currency: &str,
 ) -> Result<Option<f64>> {
     let Some((charges, provider_currency)) =
-        actual_job_charges(pool, zone, spec, duration_seconds).await?
+        actual_job_charges(pool, zone, spec, worker_plan, duration_seconds).await?
     else {
         return Ok(None);
     };
@@ -686,6 +744,7 @@ mod tests {
     #[tokio::test]
     async fn test_estimate_vm_only_job() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
         insert_price(
             &pool,
             "de-fra1",
@@ -707,6 +766,7 @@ mod tests {
     #[tokio::test]
     async fn test_estimate_vm_and_volume_job() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
         insert_price(
             &pool,
             "de-fra1",
@@ -729,6 +789,7 @@ mod tests {
     #[tokio::test]
     async fn test_estimate_without_volume_pricing_still_returns_vm_cost_alone() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
         insert_price(
             &pool,
             "de-fra1",
@@ -782,6 +843,7 @@ mod tests {
     #[tokio::test]
     async fn test_estimate_converts_to_a_different_main_currency() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
         insert_price(
             &pool,
             "de-fra1",
@@ -835,6 +897,7 @@ mod tests {
     #[tokio::test]
     async fn test_actual_cost_uses_real_duration_not_the_deadline() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
         insert_price(
             &pool,
             "de-fra1",
@@ -846,7 +909,7 @@ mod tests {
         .await;
 
         // Real run was only 30 minutes (1800s), half of the 1-hour cost.
-        let cost = calculate_actual_cost(&pool, "de-fra1", &vm_only_spec(), 1800, "EUR")
+        let cost = calculate_actual_cost(&pool, "de-fra1", &vm_only_spec(), None, 1800, "EUR")
             .await
             .unwrap()
             .unwrap();
@@ -858,6 +921,7 @@ mod tests {
         // The exact real-world case that prompted this: UpCloud bills
         // some accounts in USD, not just EUR.
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
         insert_price(
             &pool,
             "us-chi1",
@@ -894,6 +958,7 @@ mod tests {
     #[tokio::test]
     async fn test_charge_breakdown_vm_only_is_a_single_charge() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
         insert_price(
             &pool,
             "de-fra1",
@@ -919,6 +984,97 @@ mod tests {
         assert!((charges[0].total - 0.004464).abs() < 1e-9);
     }
 
+    async fn store_cloudnative_plan(pool: &SqlitePool) {
+        crate::workload::store_plans(
+            pool,
+            &[crate::providers::PlanInfo {
+                name: "CLOUDNATIVE-1xCPU-2GB".to_string(),
+                cpu_cores: 1,
+                memory_mb: 2048,
+                storage_gb: 0,
+                storage_tier: None,
+                gpu_count: 0,
+                current_offering: true,
+            }],
+            &Default::default(),
+            0,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_unbundled_plan_adds_boot_disk_and_ipv4_charges() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        store_cloudnative_plan(&pool).await;
+        insert_price(
+            &pool,
+            "de-fra1",
+            "server_plan_CLOUDNATIVE-1xCPU-2GB",
+            1.0,
+            0.5,
+            "EUR",
+        )
+        .await;
+        insert_price(&pool, "de-fra1", "storage_standard", 1.0, 0.0118, "EUR").await;
+        insert_price(&pool, "de-fra1", "ipv4_address", 1.0, 0.4812, "EUR").await;
+
+        let (charges, _) = estimate_job_charges(&pool, "de-fra1", &vm_only_spec(), 3600)
+            .await
+            .unwrap()
+            .unwrap();
+        let skus: Vec<&str> = charges.iter().map(|c| c.sku_id.as_str()).collect();
+        assert_eq!(
+            skus,
+            vec![
+                "CLOUDNATIVE-1xCPU-2GB",
+                "standard-10GB-boot",
+                "ipv4-address"
+            ]
+        );
+        assert!((charges[1].total - 0.00118).abs() < 1e-9);
+        assert!((charges[2].total - 0.004812).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn test_actual_cost_uses_the_recorded_plan_not_todays_choice() {
+        // The job ran on DEV-1xCPU-2GB; since then a cheaper plan fits.
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
+        insert_price(
+            &pool,
+            "de-fra1",
+            "server_plan_DEV-1xCPU-1GB-10GB",
+            1.0,
+            0.4464,
+            "EUR",
+        )
+        .await;
+        insert_price(
+            &pool,
+            "de-fra1",
+            "server_plan_DEV-1xCPU-2GB",
+            1.0,
+            0.8,
+            "EUR",
+        )
+        .await;
+
+        let (charges, _) = actual_job_charges(
+            &pool,
+            "de-fra1",
+            &vm_only_spec(),
+            Some("DEV-1xCPU-2GB"),
+            3600,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(charges.len(), 1);
+        assert_eq!(charges[0].sku_id, "DEV-1xCPU-2GB");
+        assert!((charges[0].total - 0.008).abs() < 1e-9);
+    }
+
     #[tokio::test]
     async fn test_charge_breakdown_with_volume_is_two_separate_charges() {
         // The real finding that drove this redesign: FOCUS requires
@@ -927,6 +1083,7 @@ mod tests {
         // row -- they're two distinct charges, each with their own
         // SkuId/quantity/unit price.
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
         insert_price(
             &pool,
             "de-fra1",
@@ -1195,6 +1352,7 @@ mod tests {
     #[tokio::test]
     async fn test_check_budget_rejects_when_estimate_exceeds_available() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
         insert_price(
             &pool,
             "de-fra1",
@@ -1220,6 +1378,7 @@ mod tests {
     #[tokio::test]
     async fn test_check_budget_allows_when_balance_covers_it() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
         insert_price(
             &pool,
             "de-fra1",
@@ -1245,6 +1404,7 @@ mod tests {
     #[tokio::test]
     async fn test_check_budget_fails_open_when_budgeting_disabled() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
         insert_price(
             &pool,
             "de-fra1",

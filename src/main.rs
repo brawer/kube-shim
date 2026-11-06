@@ -3,7 +3,7 @@ use clap::Parser;
 use kube_shim::providers::upcloud::UpCloudProvider;
 use kube_shim::providers::CloudProvider;
 use kube_shim::reconcile::JobContext;
-use kube_shim::{acme, api, app, config, db, metadata, pricing, reconcile, ssh, tls};
+use kube_shim::{acme, api, app, config, db, metadata, pricing, reconcile, ssh, tls, workload};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -89,6 +89,10 @@ async fn main() -> Result<()> {
         worker_ssh_private_key: cfg.upcloud.worker_ssh_private_key.clone(),
         worker_ssh_port: ssh::SSH_PORT,
         main_currency: cfg.shim.main_currency.clone(),
+        plan_filter: workload::PlanFilter {
+            allow_prefixes: cfg.upcloud.worker_plan_allow_prefixes.clone(),
+            deny_prefixes: cfg.upcloud.worker_plan_deny_prefixes.clone(),
+        },
     };
     // Phase 14a: if this is genuinely the first boot ever against this
     // database (neither UpCloud pricing nor ECB exchange rates cached

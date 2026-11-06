@@ -5,17 +5,19 @@
 //! guessed -- see docs/IMPLEMENTATION_PLAN.md Phase 7.
 
 mod firewall;
+mod plans;
 mod pricing;
 mod servers;
 mod volumes;
 
 use crate::providers::{
-    CloudProvider, CreateServerRequest, CreateVolumeRequest, FirewallRule, PriceEntry,
+    CloudProvider, CreateServerRequest, CreateVolumeRequest, FirewallRule, PlanInfo, PriceEntry,
     ProviderError, Server, Volume,
 };
 use async_trait::async_trait;
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
+use std::collections::HashMap;
 use std::time::Duration;
 
 const DEFAULT_BASE_URL: &str = "https://api.upcloud.com/1.3";
@@ -187,8 +189,15 @@ impl CloudProvider for UpCloudProvider {
         firewall::list_firewall_rules(self, server_id).await
     }
 
-    async fn get_pricing(&self, zone: &str, price_key: &str) -> Result<PriceEntry, ProviderError> {
-        pricing::get_pricing(self, zone, price_key).await
+    async fn get_zone_prices(
+        &self,
+        zone: &str,
+    ) -> Result<HashMap<String, PriceEntry>, ProviderError> {
+        pricing::get_zone_prices(self, zone).await
+    }
+
+    async fn list_plans(&self) -> Result<Vec<PlanInfo>, ProviderError> {
+        plans::list_plans(self).await
     }
 }
 

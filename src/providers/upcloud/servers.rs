@@ -58,7 +58,7 @@ struct StorageDeviceSpec {
     storage: String,
     title: String,
     size: u32,
-    tier: &'static str,
+    tier: String,
 }
 
 #[derive(Deserialize)]
@@ -140,7 +140,7 @@ pub(super) async fn create_server(
                     storage: req.template_uuid,
                     title: format!("{}-os", req.title),
                     size: req.boot_disk_size_gb,
-                    tier: "standard",
+                    tier: req.boot_disk_tier,
                 }],
             },
             user_data: req.user_data,
@@ -282,6 +282,7 @@ mod tests {
             plan: "DEV-1xCPU-1GB-10GB".to_string(),
             template_uuid: "01000000-0000-4000-8000-000030240200".to_string(),
             boot_disk_size_gb: 10,
+            boot_disk_tier: "standard".to_string(),
             ssh_public_keys: vec!["ssh-ed25519 AAAA... test".to_string()],
             user_data: "#!/bin/bash\necho hi\n".to_string(),
         }

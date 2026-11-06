@@ -103,9 +103,9 @@ CREATE TABLE IF NOT EXISTS hetzner_pricing (
 );
 
 -- Real UpCloud pricing (Phase 14a), synced daily from `GET /1.3/price`
--- -- one row per (zone, price_key) this project actually needs
--- (`workload::all_server_plans()` + both `volumes::StorageTier`s), not
--- the whole catalog. `currency` is the account's own real billing
+-- -- one row per (zone, price_key) in the configured zone's catalog.
+-- Upserted, never deleted, so a retired plan a job already ran on keeps
+-- its price for that job's actual cost. `currency` is the account's own real billing
 -- currency, read from the response itself (`providers::PriceEntry`'s
 -- own docs) -- never hardcoded, since UpCloud bills some accounts in
 -- USD, not just EUR.
@@ -117,6 +117,22 @@ CREATE TABLE IF NOT EXISTS provider_pricing (
     currency TEXT NOT NULL,
     fetched_at INTEGER NOT NULL,
     PRIMARY KEY (zone, price_key)
+);
+
+-- UpCloud's server-plan catalog (issue #85), synced daily from
+-- `GET /1.3/plan` and replaced wholesale on every successful sync
+-- (`workload::store_plans`). Holds only plans worker VMs may use: GPU
+-- plans, plans UpCloud no longer sells, and anything
+-- `upcloud.worker_plan_*_prefixes` excludes are filtered out before they get here. Every plan exists in every zone
+-- (UpCloud's docs), so there's no zone column. Prices per zone live in
+-- `provider_pricing` under `server_plan_<name>`.
+CREATE TABLE IF NOT EXISTS provider_plans (
+    name TEXT PRIMARY KEY,
+    cpu_cores INTEGER NOT NULL,
+    memory_mb INTEGER NOT NULL,
+    storage_gb INTEGER NOT NULL,
+    storage_tier TEXT,
+    fetched_at INTEGER NOT NULL
 );
 
 -- The ECB's daily reference rates (Phase 14a), EUR-anchored (every row

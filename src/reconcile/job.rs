@@ -160,11 +160,7 @@ pub const TERMINAL_STATE: &str = "Archived";
 /// 11's job; see this module's own top-level docs on staying in scope.
 const RETRY_ESCALATION_THRESHOLD: i64 = 5 * 60;
 
-/// Boot disk size for every worker VM -- an OS-only disk, not the job's
-/// own scratch space (that's the separately attached ephemeral volume).
-/// Matches this project's own shim instance's boot disk convention
-/// (`bootstrap/provision.sh`'s real UpCloud server).
-const WORKER_BOOT_DISK_GB: u32 = 10;
+use workload::WORKER_BOOT_DISK_GB;
 
 /// Everything a job-advancing tick needs beyond the database: the real
 /// `CloudProvider` to call, whether to actually call it, and the naming/
@@ -220,6 +216,9 @@ pub struct JobContext {
     /// never the provider's own real billing currency directly (see
     /// `pricing::estimate_job_cost`'s own docs).
     pub main_currency: String,
+    /// From `config.toml`'s `[upcloud] worker_plan_*_prefixes` (issue
+    /// #85): which catalog plans the daily sync keeps as eligible.
+    pub plan_filter: workload::PlanFilter,
 }
 
 /// The state one tick after `current`, or `None` if `current` is
@@ -715,18 +714,24 @@ async fn handle_vm_pending(
 ) -> Result<bool> {
     let spec: JsonValue = serde_json::from_str(spec_str).unwrap_or(JsonValue::Null);
     let (cpu_millicores, memory_mb) = extract_resource_requests(&spec);
-    // Rounded *up* here, deliberately: UpCloud has no fractional-core or
-    // sub-GB-memory plans, so sizing the actual worker VM needs whole
-    // units, even though the request itself (and everything reporting
-    // on it, e.g. api::metrics) keeps full precision.
-    let cpu_cores = cpu_millicores.unwrap_or(1000).div_ceil(1000);
-    let memory_gb = memory_mb.unwrap_or(1024).div_ceil(1024);
-    let plan = workload::smallest_fitting_server_plan(cpu_cores, memory_gb);
+    // Rounded *up* (inside `whole_units_for_requests`), deliberately:
+    // UpCloud has no fractional-core or sub-GB-memory plans, so sizing
+    // the actual worker VM needs whole units, even though the request
+    // itself (and everything reporting on it, e.g. api::metrics) keeps
+    // full precision.
+    let (cpu_cores, memory_gb) = workload::whole_units_for_requests(cpu_millicores, memory_mb);
+    let plan =
+        workload::plan_for_resource_requests(pool, &ctx.zone, cpu_millicores, memory_mb).await?;
 
     let Some(plan) = plan else {
-        let msg = format!(
-            "no known server plan is big enough for {cpu_cores}/{memory_gb} CPU/GB requested"
-        );
+        let msg = if workload::has_cached_plans(pool).await? {
+            format!(
+                "no available server plan is big enough for {cpu_cores}/{memory_gb} CPU/GB \
+                 requested"
+            )
+        } else {
+            "no server plans cached yet -- waiting for the plan catalog sync".to_string()
+        };
         record_failed_attempt(pool, job_id, namespace, name, &msg, last_transition_time).await?;
         return Ok(false);
     };
@@ -795,7 +800,7 @@ async fn handle_vm_pending(
                  creating a duplicate",
                 found.id
             );
-            set_worker_vm(pool, job_id, &found.id, &title).await?;
+            set_worker_vm(pool, job_id, &found.id, &title, &plan.name).await?;
             return Ok(true);
         }
     }
@@ -804,9 +809,10 @@ async fn handle_vm_pending(
         title: title.clone(),
         hostname: title.clone(),
         zone: ctx.zone.clone(),
-        plan: plan.name.to_string(),
+        plan: plan.name.clone(),
         template_uuid: ctx.worker_template_uuid.clone(),
         boot_disk_size_gb: WORKER_BOOT_DISK_GB,
+        boot_disk_tier: workload::boot_disk_tier(&plan).to_string(),
         ssh_public_keys: ctx.worker_ssh_public_keys.clone(),
         user_data,
     };
@@ -818,7 +824,7 @@ async fn handle_vm_pending(
                 server.id,
                 plan.name
             );
-            set_worker_vm(pool, job_id, &server.id, &title).await?;
+            set_worker_vm(pool, job_id, &server.id, &title, &plan.name).await?;
             Ok(true)
         }
         Err(err) => {
@@ -1312,10 +1318,16 @@ async fn handle_container_running(
     let duration_seconds = Utc::now().timestamp() - created_at;
     let spec: JsonValue = serde_json::from_str(spec_str).unwrap_or(JsonValue::Null);
     let main_currency = pricing::effective_main_currency(pool, &ctx.main_currency).await?;
+    let worker_plan: Option<String> =
+        sqlx::query_scalar("SELECT worker_plan FROM jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await?;
     let actual_cost = match pricing::calculate_actual_cost(
         pool,
         &ctx.zone,
         &spec,
+        worker_plan.as_deref(),
         duration_seconds,
         &main_currency,
     )
@@ -1542,13 +1554,24 @@ async fn delete_job_volume(pool: &SqlitePool, job_id: &str) -> Result<()> {
     Ok(())
 }
 
-async fn set_worker_vm(pool: &SqlitePool, job_id: &str, vm_id: &str, vm_name: &str) -> Result<()> {
-    sqlx::query("UPDATE jobs SET worker_vm_id = ?, worker_vm_name = ? WHERE id = ?")
-        .bind(vm_id)
-        .bind(vm_name)
-        .bind(job_id)
-        .execute(pool)
-        .await?;
+/// Also records the plan the VM was created with (issue #85), so actual
+/// cost and the status page use what was really provisioned.
+async fn set_worker_vm(
+    pool: &SqlitePool,
+    job_id: &str,
+    vm_id: &str,
+    vm_name: &str,
+    plan: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE jobs SET worker_vm_id = ?, worker_vm_name = ?, worker_plan = ? WHERE id = ?",
+    )
+    .bind(vm_id)
+    .bind(vm_name)
+    .bind(plan)
+    .bind(job_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -1668,6 +1691,7 @@ mod tests {
             worker_ssh_private_key: crate::ssh::tests::throwaway_private_key_pem(),
             worker_ssh_port: ssh::SSH_PORT,
             main_currency: "EUR".to_string(),
+            plan_filter: Default::default(),
         }
     }
 
@@ -1940,6 +1964,7 @@ mod tests {
     #[tokio::test]
     async fn test_vm_pending_dry_run_advances_without_provider_call() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
         let now = Utc::now().timestamp();
         sqlx::query(
             "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
@@ -1975,6 +2000,7 @@ mod tests {
         // though extract_resource_requests itself now preserves that
         // fractional precision for api::metrics's own purposes.
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
         let now = Utc::now().timestamp();
         let spec = serde_json::json!({
             "template": {"spec": {
@@ -2009,6 +2035,7 @@ mod tests {
     #[tokio::test]
     async fn test_vm_pending_refuses_with_no_ssh_keys_configured() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
         let now = Utc::now().timestamp();
         sqlx::query(
             "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
@@ -2051,6 +2078,8 @@ mod tests {
         ctx.provider = Arc::new(provider);
 
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+
+        crate::workload::seed_test_plans(&pool).await;
         let now = Utc::now().timestamp();
         sqlx::query(
             "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
@@ -2080,8 +2109,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_vm_pending_picks_the_cheapest_catalog_plan_and_records_it() {
+        // Issue #85's acceptance case: osmdiffs asks for 6 CPU / 8 GiB.
+        // The body UpCloud receives is captured so the test can check
+        // the plan and boot-disk tier really sent.
+        let captured = Arc::new(std::sync::Mutex::new(None::<serde_json::Value>));
+        let sink = captured.clone();
+        let app = axum::Router::new().route(
+            "/1.3/server",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let sink = sink.clone();
+                async move {
+                    *sink.lock().unwrap() = Some(body);
+                    axum::Json(serde_json::json!({
+                        "server": {"uuid": "srv-osm", "title": "t", "state": "maintenance"}
+                    }))
+                }
+            }),
+        );
+        let mut ctx = mock_ctx(false);
+        ctx.provider = Arc::new(crate::providers::upcloud::tests::mock_server(app).await);
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let plan = |name: &str, storage_gb: u32, tier: Option<&str>| crate::providers::PlanInfo {
+            name: name.to_string(),
+            cpu_cores: 6,
+            memory_mb: 16384,
+            storage_gb,
+            storage_tier: tier.map(str::to_string),
+            gpu_count: 0,
+            current_offering: true,
+        };
+        crate::workload::store_plans(
+            &pool,
+            &[
+                plan("6xCPU-16GB", 320, Some("maxiops")),
+                plan("CLOUDNATIVE-6xCPU-16GB", 0, None),
+            ],
+            &Default::default(),
+            0,
+        )
+        .await
+        .unwrap();
+        insert_provider_price(&pool, "server_plan_6xCPU-16GB", 1.0, 15.4761).await;
+        insert_provider_price(&pool, "server_plan_CLOUDNATIVE-6xCPU-16GB", 1.0, 11.0119).await;
+        insert_provider_price(&pool, "storage_standard", 1.0, 0.0118).await;
+        insert_provider_price(&pool, "ipv4_address", 1.0, 0.4812).await;
+
+        let spec = serde_json::json!({
+            "template": {"spec": {
+                "containers": [{"image": "x", "resources": {"requests": {"cpu": "6", "memory": "8Gi"}}}]
+            }}
+        })
+        .to_string();
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
+             VALUES ('j1', 'osmdiffs', 'default', ?, 'VMPending', ?, ?, 1)",
+        )
+        .bind(spec)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(advance_all(&pool, &ctx).await.unwrap(), 1);
+
+        let worker_plan: Option<String> =
+            sqlx::query_scalar("SELECT worker_plan FROM jobs WHERE id = 'j1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(worker_plan.as_deref(), Some("CLOUDNATIVE-6xCPU-16GB"));
+        let body = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(body["server"]["plan"], "CLOUDNATIVE-6xCPU-16GB");
+        assert_eq!(
+            body["server"]["storage_devices"]["storage_device"][0]["tier"],
+            "standard"
+        );
+    }
+
+    #[tokio::test]
     async fn test_vm_pending_no_fitting_plan_records_error() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
         let spec = serde_json::json!({
             "template": {"spec": {
                 "containers": [{"image": "x", "resources": {"requests": {"cpu": "64", "memory": "256Gi"}}}]
@@ -2108,7 +2220,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert!(last_error.unwrap().contains("no known server plan"));
+        assert!(last_error.unwrap().contains("no available server plan"));
     }
 
     async fn insert_job_with_vm(pool: &SqlitePool, status: &str, vm_id: &str) {
@@ -2477,6 +2589,7 @@ mod tests {
     #[tokio::test]
     async fn test_missing_secret_blocks_vm_creation_with_one_warning_event() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
         insert_job_with_spec(&pool, "VMPending", &osmdiffs_spec(), None).await;
 
         for _ in 0..2 {
@@ -2597,6 +2710,8 @@ mod tests {
         ctx.worker_ssh_port = port;
 
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+
+        crate::workload::seed_test_plans(&pool).await;
         insert_provider_price(&pool, "server_plan_DEV-1xCPU-1GB-10GB", 1.0, 0.4464).await;
         let now = Utc::now().timestamp();
         let one_hour_ago = now - 3600;
@@ -3297,6 +3412,8 @@ mod tests {
         ctx.provider = Arc::new(provider);
 
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+
+        crate::workload::seed_test_plans(&pool).await;
         let now = Utc::now().timestamp();
         sqlx::query(
             "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \

@@ -26,8 +26,10 @@ use crate::k8s_status;
 use crate::run_options;
 use crate::volumes::{self, StorageTier};
 use crate::workload;
-use axum::response::Response;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use serde_json::Value as JsonValue;
+use sqlx::SqlitePool;
 
 /// `{field_prefix}.activeDeadlineSeconds` must be set. Optional in the
 /// real Kubernetes API, but the shim needs a hard worst-case runtime
@@ -177,6 +179,44 @@ pub fn validate_run_options(
         &format!("{field_prefix}.template.spec.{}", err.field),
         &err.value,
     ))
+}
+
+/// Issue #85: rejects a workload whose resource requests no cached
+/// server plan can satisfy, rather than letting each run fail later at
+/// `VMPending`. Accepts it while the plan catalog hasn't been synced
+/// yet (nothing to judge against); `main.rs` blocks on the first sync
+/// before serving requests, so that's only a transient state.
+pub async fn validate_plan_fits(
+    pool: &SqlitePool,
+    zone: &str,
+    pod_template_spec: &JsonValue,
+) -> Option<Response> {
+    let (cpu_millicores, memory_mb) =
+        crate::reconcile::job::extract_resource_requests(pod_template_spec);
+    let result = async {
+        if !workload::has_cached_plans(pool).await? {
+            return anyhow::Ok(None);
+        }
+        let plan =
+            workload::plan_for_resource_requests(pool, zone, cpu_millicores, memory_mb).await?;
+        Ok(Some(plan.is_some()))
+    }
+    .await;
+    match result {
+        Ok(None) | Ok(Some(true)) => None,
+        Ok(Some(false)) => {
+            let (cpu_cores, memory_gb) =
+                workload::whole_units_for_requests(cpu_millicores, memory_mb);
+            Some(k8s_status::policy_denied(
+                "kube-shim.brawer.ch/require-fitting-server-plan",
+                format!(
+                    "no available server plan is big enough for {cpu_cores} CPU / \
+                     {memory_gb} GB requested"
+                ),
+            ))
+        }
+        Err(e) => Some((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()),
+    }
 }
 
 #[cfg(test)]

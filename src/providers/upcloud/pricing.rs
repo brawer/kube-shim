@@ -1,8 +1,8 @@
 //! Pricing lookup. `GET /1.3/price` returns a large catalog (every zone,
 //! every plan/service) -- verified for real against the live API while
 //! researching UpCloud (docs/IMPLEMENTATION_PLAN.md Phase 7); this module
-//! only ever extracts the one `(zone, price_key)` entry a caller actually
-//! asked for, not the whole catalog. See `PriceEntry`'s own docs for why
+//! only ever returns the one zone a caller actually asked for, not every
+//! zone in the catalog. See `PriceEntry`'s own docs for why
 //! the return type stays a raw passthrough rather than a typed cost
 //! model -- that's Phase 14a's job, once currency conversion exists to
 //! design it for.
@@ -43,11 +43,10 @@ struct RawPriceEntry {
     price: f64,
 }
 
-pub(super) async fn get_pricing(
+pub(super) async fn get_zone_prices(
     provider: &UpCloudProvider,
     zone: &str,
-    price_key: &str,
-) -> Result<PriceEntry, ProviderError> {
+) -> Result<HashMap<String, PriceEntry>, ProviderError> {
     let response: PriceListEnvelope = provider
         .send_json(provider.request(Method::GET, "/price"))
         .await?;
@@ -60,17 +59,20 @@ pub(super) async fn get_pricing(
         .find(|z| z.name == zone)
         .ok_or_else(|| ProviderError::NotFound(format!("zone {zone} not present in price list")))?;
 
-    let entry = zone_prices.entries.get(price_key).ok_or_else(|| {
-        ProviderError::NotFound(format!(
-            "price key {price_key:?} not present for zone {zone}"
-        ))
-    })?;
-
-    Ok(PriceEntry {
-        amount: entry.amount,
-        price: entry.price,
-        currency,
-    })
+    Ok(zone_prices
+        .entries
+        .into_iter()
+        .map(|(key, entry)| {
+            (
+                key,
+                PriceEntry {
+                    amount: entry.amount,
+                    price: entry.price,
+                    currency: currency.clone(),
+                },
+            )
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -100,17 +102,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_pricing_finds_the_right_zone_and_key() {
+    async fn test_get_zone_prices_finds_the_right_zone() {
         let app = axum::Router::new().route(
             "/1.3/price",
             get(move || async move { Json(sample_price_response()) }),
         );
         let provider = mock_server(app).await;
 
-        let entry = provider
-            .get_pricing("de-fra1", "server_plan_DEV-1xCPU-1GB-10GB")
-            .await
-            .unwrap();
+        let prices = provider.get_zone_prices("de-fra1").await.unwrap();
+        assert_eq!(prices.len(), 2);
+        let entry = &prices["server_plan_DEV-1xCPU-1GB-10GB"];
 
         assert_eq!(entry.amount, 1.0);
         assert_eq!(entry.price, 0.4464);
@@ -118,7 +119,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_pricing_captures_a_non_eur_currency() {
+    async fn test_get_zone_prices_captures_a_non_eur_currency() {
         // UpCloud bills some accounts in USD, not just EUR -- this must
         // come from the real response, not a hardcoded assumption.
         let app = axum::Router::new().route(
@@ -137,15 +138,12 @@ mod tests {
         );
         let provider = mock_server(app).await;
 
-        let entry = provider
-            .get_pricing("us-chi1", "server_plan_DEV-1xCPU-1GB-10GB")
-            .await
-            .unwrap();
-        assert_eq!(entry.currency, "USD");
+        let prices = provider.get_zone_prices("us-chi1").await.unwrap();
+        assert_eq!(prices["server_plan_DEV-1xCPU-1GB-10GB"].currency, "USD");
     }
 
     #[tokio::test]
-    async fn test_get_pricing_unknown_zone_is_not_found() {
+    async fn test_get_zone_prices_unknown_zone_is_not_found() {
         let app = axum::Router::new().route(
             "/1.3/price",
             get(move || async move { Json(sample_price_response()) }),
@@ -153,22 +151,7 @@ mod tests {
         let provider = mock_server(app).await;
 
         let err = provider
-            .get_pricing("us-nonexistent1", "server_plan_DEV-1xCPU-1GB-10GB")
-            .await
-            .unwrap_err();
-        assert!(matches!(err, crate::providers::ProviderError::NotFound(_)));
-    }
-
-    #[tokio::test]
-    async fn test_get_pricing_unknown_key_is_not_found() {
-        let app = axum::Router::new().route(
-            "/1.3/price",
-            get(move || async move { Json(sample_price_response()) }),
-        );
-        let provider = mock_server(app).await;
-
-        let err = provider
-            .get_pricing("de-fra1", "server_plan_DOES-NOT-EXIST")
+            .get_zone_prices("us-nonexistent1")
             .await
             .unwrap_err();
         assert!(matches!(err, crate::providers::ProviderError::NotFound(_)));

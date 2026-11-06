@@ -186,6 +186,11 @@ pub async fn create_job(
     {
         return response;
     }
+    if let Some(response) =
+        admission::validate_plan_fits(&pool, &cost_report_config.zone, &req.spec).await
+    {
+        return response;
+    }
 
     // Budget admission (Phase 14b, moved here from a `BudgetWait`
     // state that created the row first and found out later): rejected
@@ -527,6 +532,7 @@ mod tests {
         // the same way a real cluster's ResourceQuota admission
         // controller would.
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
         insert_price(&pool).await;
         seed_budget(&pool, 0.0, 2.0).await;
 
@@ -550,9 +556,45 @@ mod tests {
         assert_eq!(count, 0);
     }
 
+    fn spec_requesting(cpu: &str, memory: &str) -> JsonValue {
+        let mut spec = valid_spec();
+        spec["template"]["spec"]["containers"][0]["resources"] =
+            json!({"requests": {"cpu": cpu, "memory": memory}});
+        spec
+    }
+
+    #[tokio::test]
+    async fn test_create_job_rejected_at_admission_when_no_plan_fits() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
+
+        let response = router(pool.clone())
+            .oneshot(create_request("too-big", spec_requesting("6", "8Gi")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let message = body_json(response).await["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(message.contains("require-fitting-server-plan"));
+        assert!(message.contains("6 CPU / 8 GB"));
+    }
+
+    #[tokio::test]
+    async fn test_create_job_accepted_while_plan_catalog_not_synced_yet() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let response = router(pool.clone())
+            .oneshot(create_request("early", spec_requesting("6", "8Gi")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
     #[tokio::test]
     async fn test_create_job_accepted_and_stores_estimated_cost_when_budget_covers_it() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
         insert_price(&pool).await;
         seed_budget(&pool, 10.0, 2.0).await;
 

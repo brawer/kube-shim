@@ -1,3 +1,4 @@
+use super::cost_report::CostReportConfig;
 use super::secret::ObjectMeta;
 use crate::admission;
 use axum::{
@@ -37,6 +38,7 @@ pub struct CreateCronJobRequest {
 pub async fn create_cronjob(
     State(pool): State<SqlitePool>,
     Extension(notify): Extension<Arc<Notify>>,
+    Extension(cost_report_config): Extension<Arc<CostReportConfig>>,
     Json(req): Json<CreateCronJobRequest>,
 ) -> Response {
     // Admission checks first, before anything is written -- same ordering
@@ -81,6 +83,11 @@ pub async fn create_cronjob(
     }
     if let Some(response) =
         admission::validate_run_options(&object_description, &pod_template_spec, FIELD_PREFIX)
+    {
+        return response;
+    }
+    if let Some(response) =
+        admission::validate_plan_fits(&pool, &cost_report_config.zone, &pod_template_spec).await
     {
         return response;
     }
