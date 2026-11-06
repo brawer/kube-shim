@@ -11,12 +11,16 @@
 # syntax would make cloud_init.rs's substitution collide with podman's own
 # --format templating.
 #
-# Every job-supplied value (image, command, args, env) arrives here
-# already base64-encoded and is decoded with `base64 -d`, never
+# Every job-supplied value embedded here (image, resource limits)
+# arrives already base64-encoded and is decoded with `base64 -d`, never
 # interpolated into this script as raw shell text -- see cloud_init.rs's
-# own module docs for why (a malicious/malformed image name or env value
-# must not be able to inject shell commands into a script that runs as
-# root).
+# own module docs for why (a malicious/malformed image name must not be
+# able to inject shell commands into a script that runs as root).
+#
+# The container's env, command and args are deliberately NOT in this
+# script (it is the server's user_data, readable through UpCloud's API):
+# the shim delivers them over SSH into root-only files under $CONFIG_DIR
+# (issue #84), and this script waits for them below.
 set -u
 
 STATUS_FILE=/tmp/job-status.txt
@@ -26,9 +30,6 @@ EXIT_CODE_FILE=/tmp/exit-code
 echo "Waiting for volume..." > "$STATUS_FILE"
 
 IMAGE=$(echo '__KUBESHIM_IMAGE_B64__' | base64 -d)
-mapfile -t COMMAND < <(echo '__KUBESHIM_COMMAND_B64__' | base64 -d)
-mapfile -t ARGS < <(echo '__KUBESHIM_ARGS_B64__' | base64 -d)
-mapfile -t ENV_LINES < <(echo '__KUBESHIM_ENV_B64__' | base64 -d)
 CPU_LIMIT=$(echo '__KUBESHIM_CPU_LIMIT_B64__' | base64 -d)
 MEMORY_LIMIT=$(echo '__KUBESHIM_MEMORY_LIMIT_B64__' | base64 -d)
 
@@ -67,14 +68,19 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq podman >> "$STATUS_FILE" 2>&1
 
-# ENV_LINES entries are "NAME=VALUE" strings, fed to `podman run` as
-# separate -e arguments -- never concatenated into a shell command string,
-# so a value containing shell metacharacters can't do anything but be a
-# literal environment variable value.
-ENV_ARGS=()
-for line in "${ENV_LINES[@]}"; do
-    [ -n "$line" ] && ENV_ARGS+=(-e "$line")
+# Wait for the container config the shim delivers over SSH (its
+# `ContainerConfiguring` state, src/cloud_init.rs's UPLOAD_*_COMMAND):
+# `env` in `podman run --env-file` format, `command`/`args` as
+# NUL-terminated entries, each written root-only and renamed into place,
+# then `ready` last. No timeout of our own: the shim fails and deletes a
+# job (and this VM) that gets stuck before its container starts.
+CONFIG_DIR=/run/kube-shim
+echo "Waiting for container config..." >> "$STATUS_FILE"
+until [ -e "$CONFIG_DIR/ready" ]; do
+    sleep 2
 done
+mapfile -d '' -t COMMAND < "$CONFIG_DIR/command"
+mapfile -d '' -t ARGS < "$CONFIG_DIR/args"
 
 # Empty CPU_LIMIT/MEMORY_LIMIT means the job's spec had no
 # resources.limits.cpu/.memory set -- omit the flag entirely rather than
@@ -85,8 +91,12 @@ RESOURCE_ARGS=()
 [ -n "$MEMORY_LIMIT" ] && RESOURCE_ARGS+=(--memory "$MEMORY_LIMIT")
 
 echo "Starting container..." >> "$STATUS_FILE"
-CONTAINER_ID=$(podman run -d -v /scratch:/scratch "${RESOURCE_ARGS[@]}" "${ENV_ARGS[@]}" "$IMAGE" "${COMMAND[@]}" "${ARGS[@]}")
+# --env-file, not one `-e NAME=VALUE` per variable, so Secret values
+# never show up in this VM's process list.
+CONTAINER_ID=$(podman run -d -v /scratch:/scratch "${RESOURCE_ARGS[@]}" --env-file "$CONFIG_DIR/env" "$IMAGE" "${COMMAND[@]}" "${ARGS[@]}")
 echo "$CONTAINER_ID" > "$CONTAINER_ID_FILE"
+# podman has copied the env into the container's own config by now.
+rm -f "$CONFIG_DIR/env"
 
 podman wait "$CONTAINER_ID" > /dev/null
 EXIT_CODE=$(podman inspect "$CONTAINER_ID" --format '{{.State.ExitCode}}')

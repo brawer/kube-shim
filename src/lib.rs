@@ -6,6 +6,7 @@ pub mod app;
 pub mod auth;
 pub mod cloud_init;
 pub mod config;
+pub mod container_env;
 pub mod currency;
 pub mod db;
 pub mod k8s_status;

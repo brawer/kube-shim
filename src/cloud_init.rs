@@ -16,12 +16,39 @@
 //! inside the template's single-quoted `'...'` literals is safe by
 //! construction, not just by convention.
 
-use crate::{volumes, workload};
+//!
+//! **Only the image and resource limits travel in `user_data`.** The
+//! container's environment (which may hold `Secret` values) and its
+//! `command`/`args` (which may embed them via `$(VAR)` expansion) are
+//! delivered later over SSH instead (`ContainerConfig`, uploaded by
+//! `reconcile::job`'s `ContainerConfiguring` state into root-only files
+//! under `CONFIG_DIR`), so they are never readable through UpCloud's API
+//! by anyone who can read the server's `user_data` (issue #84). The
+//! template waits for `READY_PATH` before it starts the container.
+
+use crate::{container_env, volumes, workload};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde_json::Value as JsonValue;
 
 const TEMPLATE: &str = include_str!("../bootstrap/cloud-init-template.sh");
+
+/// Where the worker keeps the SSH-delivered container config. `/run` is
+/// a tmpfs, so nothing here ever reaches the boot disk.
+/// `bootstrap/cloud-init-template.sh` hardcodes the same paths.
+pub const CONFIG_DIR: &str = "/run/kube-shim";
+
+/// The fixed remote commands `reconcile::job` runs (with the file's
+/// contents on stdin) to deliver each file: written root-only (`umask
+/// 077`) and renamed into place, so the template never reads a
+/// half-written file. `READY_COMMAND` goes last, once all three exist.
+pub const UPLOAD_ENV_COMMAND: &str = "umask 077 && mkdir -p /run/kube-shim && \
+     cat > /run/kube-shim/env.part && mv -f /run/kube-shim/env.part /run/kube-shim/env";
+pub const UPLOAD_COMMAND_COMMAND: &str = "umask 077 && mkdir -p /run/kube-shim && \
+     cat > /run/kube-shim/command.part && mv -f /run/kube-shim/command.part /run/kube-shim/command";
+pub const UPLOAD_ARGS_COMMAND: &str = "umask 077 && mkdir -p /run/kube-shim && \
+     cat > /run/kube-shim/args.part && mv -f /run/kube-shim/args.part /run/kube-shim/args";
+pub const READY_COMMAND: &str = "umask 077 && cat > /run/kube-shim/ready";
 
 /// Builds the real `user_data` script for a job's worker VM, from
 /// `spec.template.spec.containers[0]` -- this project only ever reads the
@@ -37,9 +64,7 @@ const TEMPLATE: &str = include_str!("../bootstrap/cloud-init-template.sh");
 /// image (see `src/admission.rs`'s existing checks, neither of which
 /// covers this).
 pub fn generate(spec: &JsonValue) -> Result<String, String> {
-    let container = spec
-        .pointer("/template/spec/containers/0")
-        .ok_or_else(|| "job spec has no template.spec.containers[0]".to_string())?;
+    let container = first_container(spec)?;
 
     let image = container
         .get("image")
@@ -47,19 +72,87 @@ pub fn generate(spec: &JsonValue) -> Result<String, String> {
         .filter(|image| !image.is_empty())
         .ok_or_else(|| "containers[0].image is missing, empty, or not a string".to_string())?;
 
-    let command = string_array(container, "command").join("\n");
-    let args = string_array(container, "args").join("\n");
-    let env = env_lines(container).join("\n");
     let cpu_limit = cpu_limit_flag_value(container);
     let memory_limit = memory_limit_flag_value(container);
 
     Ok(TEMPLATE
         .replace("__KUBESHIM_IMAGE_B64__", &b64(image))
-        .replace("__KUBESHIM_COMMAND_B64__", &b64(&command))
-        .replace("__KUBESHIM_ARGS_B64__", &b64(&args))
-        .replace("__KUBESHIM_ENV_B64__", &b64(&env))
         .replace("__KUBESHIM_CPU_LIMIT_B64__", &b64(&cpu_limit))
         .replace("__KUBESHIM_MEMORY_LIMIT_B64__", &b64(&memory_limit)))
+}
+
+/// `spec.template.spec.containers[0]`.
+pub fn first_container(spec: &JsonValue) -> Result<&JsonValue, String> {
+    spec.pointer("/template/spec/containers/0")
+        .ok_or_else(|| "job spec has no template.spec.containers[0]".to_string())
+}
+
+/// The three files the worker's container is started from, delivered
+/// over SSH (see the module docs).
+#[derive(Debug, PartialEq, Eq)]
+pub struct ContainerConfig {
+    /// `podman run --env-file` format: one `NAME=VALUE` per line.
+    pub env_file: Vec<u8>,
+    /// `command`/`args` after Kubernetes' `$(VAR)` expansion, each entry
+    /// NUL-terminated (read back with `mapfile -d ''`), so an entry can
+    /// hold any text, newlines included.
+    pub command: Vec<u8>,
+    pub args: Vec<u8>,
+}
+
+/// podman's `--env-file` parser reads one variable per line, takes
+/// everything after the first `=` literally (no quoting), skips lines
+/// starting with `#`, strips leading whitespace from the name, and a
+/// line longer than 64KiB fails to parse. Anything it can't represent
+/// is refused here, loudly, rather than delivered mangled.
+const MAX_ENV_FILE_LINE: usize = 60 * 1024;
+
+pub fn container_config(
+    container: &JsonValue,
+    env: &[(String, String)],
+) -> Result<ContainerConfig, String> {
+    let mut env_file = Vec::new();
+    for (name, value) in env {
+        if name.starts_with([' ', '#']) {
+            return Err(format!(
+                "environment variable name {name:?} can't start with a space or '#' \
+                 (not representable in podman's --env-file)"
+            ));
+        }
+        if value.contains(['\n', '\r']) {
+            return Err(format!(
+                "environment variable {name} contains a line break, which podman's \
+                 --env-file can't represent"
+            ));
+        }
+        let line = format!("{name}={value}\n");
+        if line.len() > MAX_ENV_FILE_LINE {
+            return Err(format!(
+                "environment variable {name} is longer than {MAX_ENV_FILE_LINE} bytes, \
+                 podman's --env-file limit"
+            ));
+        }
+        env_file.extend_from_slice(line.as_bytes());
+    }
+
+    let nul_terminated = |field: &str| -> Result<Vec<u8>, String> {
+        let mut out = Vec::new();
+        for entry in string_array(container, field) {
+            let expanded = container_env::expand(&entry, env);
+            if expanded.contains('\0') {
+                return Err(format!("containers[0].{field} contains a NUL byte"));
+            }
+            out.extend_from_slice(expanded.as_bytes());
+            out.push(0);
+        }
+        Ok(out)
+    };
+
+    Ok(ContainerConfig {
+        env_file,
+        command: nul_terminated("command")?,
+        args: nul_terminated("args")?,
+    })
 }
 
 fn resource_limit_quantity<'a>(container: &'a JsonValue, key: &str) -> Option<&'a str> {
@@ -127,29 +220,6 @@ fn string_array(container: &JsonValue, field: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// `containers[0].env[]`, Kubernetes' `{name, value}` shape -- plain
-/// values only. An entry using `valueFrom` (e.g. `secretKeyRef`, pulling
-/// from this project's own real `Secret` support) is silently skipped
-/// rather than failing the whole job over it; wiring that up is future
-/// work, not scoped to Phase 9 (see docs/IMPLEMENTATION_PLAN.md, which
-/// never mentions it).
-fn env_lines(container: &JsonValue) -> Vec<String> {
-    container
-        .get("env")
-        .and_then(JsonValue::as_array)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|entry| {
-                    let name = entry.get("name")?.as_str()?;
-                    let value = entry.get("value")?.as_str()?;
-                    Some(format!("{name}={value}"))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn b64(s: &str) -> String {
     BASE64.encode(s)
 }
@@ -186,9 +256,6 @@ mod tests {
         // exact tokens are gone, not a bare "__KUBESHIM_" substring.
         for placeholder in [
             "__KUBESHIM_IMAGE_B64__",
-            "__KUBESHIM_COMMAND_B64__",
-            "__KUBESHIM_ARGS_B64__",
-            "__KUBESHIM_ENV_B64__",
             "__KUBESHIM_CPU_LIMIT_B64__",
             "__KUBESHIM_MEMORY_LIMIT_B64__",
         ] {
@@ -198,48 +265,88 @@ mod tests {
             );
         }
         assert_eq!(decode_between(&script, "IMAGE=$(echo "), "busybox:latest");
-        assert_eq!(decode_between(&script, "COMMAND < <(echo "), "");
-        assert_eq!(decode_between(&script, "ARGS < <(echo "), "");
-        assert_eq!(decode_between(&script, "ENV_LINES < <(echo "), "");
     }
 
     #[test]
-    fn test_encodes_command_args_env() {
+    fn test_user_data_never_contains_env_command_or_args() {
+        // Issue #84: these may hold Secret values, so they travel over
+        // SSH (ContainerConfig), never in user_data.
         let spec = container_spec(json!({
             "image": "busybox:latest",
             "command": ["sh", "-c"],
-            "args": ["echo hello > /scratch/out.txt"],
-            "env": [
-                {"name": "FOO", "value": "bar"},
-                {"name": "BAZ", "value": "qux"}
-            ]
+            "args": ["echo very-secret-arg"],
+            "env": [{"name": "FOO", "value": "very-secret-value"}]
         }));
         let script = generate(&spec).unwrap();
+        for needle in ["very-secret-arg", "very-secret-value", "FOO"] {
+            assert!(!script.contains(needle), "{needle} leaked into user_data");
+        }
+        assert!(!script.contains(&BASE64.encode("FOO=very-secret-value")));
+        assert!(!script.contains(&BASE64.encode("echo very-secret-arg")));
+        // The template reads them from the SSH-delivered files instead.
+        assert!(script.contains("CONFIG_DIR=/run/kube-shim"));
+        assert!(script.contains("--env-file \"$CONFIG_DIR/env\""));
+    }
 
-        assert_eq!(decode_between(&script, "IMAGE=$(echo "), "busybox:latest");
-        assert_eq!(decode_between(&script, "COMMAND < <(echo "), "sh\n-c");
+    fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_container_config_env_file_and_nul_terminated_argv() {
+        let container = json!({
+            "image": "busybox:latest",
+            "command": ["sh", "-c"],
+            "args": ["echo hello\nworld > /scratch/out.txt", ""]
+        });
+        let env = pairs(&[("FOO", "bar=baz"), ("EMPTY", ""), ("Q", "\"quoted\" #x")]);
+        let config = container_config(&container, &env).unwrap();
+
         assert_eq!(
-            decode_between(&script, "ARGS < <(echo "),
-            "echo hello > /scratch/out.txt"
+            config.env_file,
+            b"FOO=bar=baz\nEMPTY=\nQ=\"quoted\" #x\n".to_vec()
         );
+        assert_eq!(config.command, b"sh\0-c\0".to_vec());
         assert_eq!(
-            decode_between(&script, "ENV_LINES < <(echo "),
-            "FOO=bar\nBAZ=qux"
+            config.args,
+            b"echo hello\nworld > /scratch/out.txt\0\0".to_vec()
         );
     }
 
     #[test]
-    fn test_env_entry_with_value_from_is_skipped_not_fatal() {
-        let spec = container_spec(json!({
-            "image": "busybox:latest",
-            "env": [
-                {"name": "FROM_SECRET", "valueFrom": {"secretKeyRef": {"name": "s", "key": "k"}}},
-                {"name": "PLAIN", "value": "ok"}
-            ]
-        }));
-        let script = generate(&spec).unwrap();
+    fn test_container_config_expands_vars_in_command_and_args() {
+        // The osmdiffs args from issue #84.
+        let container = json!({
+            "image": "x",
+            "args": ["run", "--workdir", "/workdir", "--run_id", "$(RUN_ID)", "$$(RUN_ID)"]
+        });
+        let env = pairs(&[("RUN_ID", "osmdiffs-1762410000")]);
+        let config = container_config(&container, &env).unwrap();
+        assert_eq!(
+            config.args,
+            b"run\0--workdir\0/workdir\0--run_id\0osmdiffs-1762410000\0$(RUN_ID)\0".to_vec()
+        );
+        assert!(config.command.is_empty());
+    }
 
-        assert_eq!(decode_between(&script, "ENV_LINES < <(echo "), "PLAIN=ok");
+    #[test]
+    fn test_container_config_refuses_what_env_file_cannot_hold() {
+        let container = json!({"image": "x"});
+        for env in [
+            pairs(&[("PEM", "line1\nline2")]),
+            pairs(&[("CR", "a\rb")]),
+            pairs(&[("#COMMENT", "x")]),
+            pairs(&[(" LEADING", "x")]),
+        ] {
+            assert!(
+                container_config(&container, &env).is_err(),
+                "{env:?} must be refused"
+            );
+        }
+        let huge = "x".repeat(MAX_ENV_FILE_LINE);
+        assert!(container_config(&container, &pairs(&[("BIG", &huge)])).is_err());
     }
 
     #[test]

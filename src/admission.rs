@@ -21,6 +21,7 @@
 //! (`api::cronjob::create_cronjob`/`api::job::create_job`), not two
 //! copies of the same three checks.
 
+use crate::container_env;
 use crate::k8s_status;
 use crate::volumes::{self, StorageTier};
 use crate::workload;
@@ -136,6 +137,28 @@ pub fn validate_resource_limits(
         }
     }
     None
+}
+
+/// Validates the first container's `env[]`/`envFrom[]` sources (issue
+/// #84): anything kube-shim can't actually provide (`configMapKeyRef`,
+/// `resourceFieldRef`, `envFrom[].configMapRef`, a `fieldRef` other than
+/// `metadata.name`/`metadata.namespace`) is rejected here, at create
+/// time, instead of the job later running without that variable. A
+/// referenced Secret that doesn't exist (yet) is *not* rejected here --
+/// as in Kubernetes, it may be created after the CronJob; the job run
+/// then waits for it (see `src/container_env.rs`).
+pub fn validate_env_sources(
+    object_description: &str,
+    pod_template_spec: &JsonValue,
+    field_prefix: &str,
+) -> Option<Response> {
+    let container = pod_template_spec.pointer("/template/spec/containers/0")?;
+    let err = container_env::validate(container).err()?;
+    Some(k8s_status::invalid_field_value(
+        object_description,
+        &format!("{field_prefix}.template.spec.containers[0].{}", err.field),
+        &err.value,
+    ))
 }
 
 #[cfg(test)]
@@ -331,6 +354,53 @@ mod tests {
             validate_resource_limits("Job \"x\"", &spec, "spec").expect("must be rejected");
         let message = response_message(response).await;
         assert!(message.contains("spec.template.spec.containers[0].resources.limits.cpu"));
+        assert!(!message.contains("jobTemplate"));
+    }
+
+    #[test]
+    fn test_env_sources_supported_accepted() {
+        let spec = json!({"template": {"spec": {"containers": [{
+            "image": "x",
+            "env": [{"name": "RUN_ID", "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}}}],
+            "envFrom": [{"secretRef": {"name": "osmdiffs-s3-credentials"}}]
+        }]}}});
+        assert!(validate_env_sources("CronJob \"x\"", &spec, CRONJOB_PREFIX).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_env_sources_config_map_rejected() {
+        let spec = json!({"template": {"spec": {"containers": [{
+            "image": "x",
+            "env": [
+                {"name": "A", "value": "1"},
+                {"name": "B", "valueFrom": {"configMapKeyRef": {"name": "c", "key": "k"}}}
+            ]
+        }]}}});
+        let response =
+            validate_env_sources("CronJob \"x\"", &spec, CRONJOB_PREFIX).expect("must be rejected");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let message = response_message(response).await;
+        assert!(
+            message.contains("spec.jobTemplate.spec.template.spec.containers[0].env[1].valueFrom"),
+            "{message}"
+        );
+        assert!(message.contains("configMapKeyRef"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn test_env_sources_unsupported_field_ref_uses_job_prefix() {
+        let spec = json!({"template": {"spec": {"containers": [{
+            "image": "x",
+            "env": [{"name": "IP", "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}}}]
+        }]}}});
+        let response = validate_env_sources("Job \"x\"", &spec, "spec").expect("must be rejected");
+        let message = response_message(response).await;
+        assert!(message
+            .contains("spec.template.spec.containers[0].env[0].valueFrom.fieldRef.fieldPath"));
+        assert!(message.contains("status.podIP"));
         assert!(!message.contains("jobTemplate"));
     }
 }
