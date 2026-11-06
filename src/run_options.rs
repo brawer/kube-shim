@@ -23,6 +23,9 @@
 //!   rejected at admission, and without any `runAsUser` the worker
 //!   refuses to start the container unless the image's `USER` is a
 //!   numeric, non-zero uid (an empty or named user can't be verified).
+//! - `containers[0].securityContext.allowPrivilegeEscalation: false`:
+//!   `podman run --security-opt no-new-privileges`. `true` (or unset)
+//!   is Kubernetes' default and podman's too.
 //! - `containers[0].volumeMounts[]` for the job's ephemeral volume:
 //!   `mountPath` and `readOnly`. Without such a mount the volume stays
 //!   at `/scratch`, as before.
@@ -35,10 +38,15 @@
 //! The one exception is a few fields set to the value that matches what
 //! kube-shim does anyway (issue #92): the OpenTofu/Terraform kubernetes
 //! provider always sends them, even when the config never mentions them.
-//! `privileged: false`, `allowPrivilegeEscalation: true` (Kubernetes'
-//! default) and the scratch
+//! `privileged: false` and the scratch
 //! mount's `mountPropagation: "None"` are accepted; any other value for
 //! them is rejected. See the `*_NO_OP_VALUES` tables.
+//!
+//! Whatever the spec says, the container always runs in its own user
+//! namespace (`podman run --userns=auto`), so its uid 0 is an
+//! unprivileged uid on the worker VM, and the scratch volume is mounted
+//! with `idmap` so ownership (fsGroup's `chgrp`) looks the
+//! same inside the container as on the VM.
 //!
 //! The numbers and the mount path reach the worker's script base64-encoded
 //! like every other job-supplied value (see `src/cloud_init.rs`), and are
@@ -62,6 +70,7 @@ const CONTAINER_SECURITY_CONTEXT_FIELDS: &[&str] = &[
     "runAsGroup",
     "runAsNonRoot",
     "readOnlyRootFilesystem",
+    "allowPrivilegeEscalation",
 ];
 const SCRATCH_MOUNT_FIELDS: &[&str] = &["name", "mountPath", "readOnly"];
 
@@ -84,11 +93,8 @@ impl NoOp {
 }
 
 const POD_SECURITY_CONTEXT_NO_OP_VALUES: &[(&str, NoOp)] = &[];
-const CONTAINER_SECURITY_CONTEXT_NO_OP_VALUES: &[(&str, NoOp)] = &[
-    ("privileged", NoOp::Bool(false)),
-    // Kubernetes' default: podman doesn't set no-new-privileges either.
-    ("allowPrivilegeEscalation", NoOp::Bool(true)),
-];
+const CONTAINER_SECURITY_CONTEXT_NO_OP_VALUES: &[(&str, NoOp)] =
+    &[("privileged", NoOp::Bool(false))];
 const SCRATCH_MOUNT_NO_OP_VALUES: &[(&str, NoOp)] = &[("mountPropagation", NoOp::Str("None"))];
 
 /// A spec problem found at admission time: `field` is the offending
@@ -118,8 +124,10 @@ pub struct RunOptions {
     pub run_as_non_root: bool,
     /// `--read-only`.
     pub read_only_root_filesystem: bool,
-    /// `-v`'s argument for the scratch volume, e.g. `/scratch:/workdir`
-    /// or `/scratch:/scratch:ro`.
+    /// `--security-opt no-new-privileges` (`allowPrivilegeEscalation: false`).
+    pub no_new_privileges: bool,
+    /// `-v`'s argument for the scratch volume, e.g.
+    /// `/scratch:/workdir:idmap` or `/scratch:/scratch:ro,idmap`.
     pub scratch_volume: String,
 }
 
@@ -206,9 +214,15 @@ pub fn parse(job_spec: &JsonValue) -> Result<RunOptions, SpecError> {
         "containers[0].securityContext",
     )?
     .unwrap_or(false);
+    let no_new_privileges = !bool_field(
+        container_sc,
+        "allowPrivilegeEscalation",
+        "containers[0].securityContext",
+    )?
+    .unwrap_or(true);
 
     let scratch_volume = match scratch_mount(job_spec) {
-        None => format!("{DEFAULT_SCRATCH_MOUNT_PATH}:{DEFAULT_SCRATCH_MOUNT_PATH}"),
+        None => format!("{DEFAULT_SCRATCH_MOUNT_PATH}:{DEFAULT_SCRATCH_MOUNT_PATH}:idmap"),
         Some((i, mount)) => {
             let field = format!("containers[0].volumeMounts[{i}]");
             let path = match mount.get("mountPath") {
@@ -230,8 +244,8 @@ pub fn parse(job_spec: &JsonValue) -> Result<RunOptions, SpecError> {
                     return Err(spec_error(format!("{field}.readOnly"), other.to_string()))
                 }
             };
-            let suffix = if read_only { ":ro" } else { "" };
-            format!("{DEFAULT_SCRATCH_MOUNT_PATH}:{path}{suffix}")
+            let options = if read_only { "ro,idmap" } else { "idmap" };
+            format!("{DEFAULT_SCRATCH_MOUNT_PATH}:{path}:{options}")
         }
     };
 
@@ -240,6 +254,7 @@ pub fn parse(job_spec: &JsonValue) -> Result<RunOptions, SpecError> {
         user,
         run_as_non_root,
         read_only_root_filesystem,
+        no_new_privileges,
         scratch_volume,
     })
 }
@@ -363,7 +378,8 @@ mod tests {
                 user: None,
                 run_as_non_root: false,
                 read_only_root_filesystem: false,
-                scratch_volume: "/scratch:/scratch".to_string(),
+                no_new_privileges: false,
+                scratch_volume: "/scratch:/scratch:idmap".to_string(),
             }
         );
     }
@@ -376,7 +392,7 @@ mod tests {
         assert_eq!(options.fs_group, Some(1000));
         assert!(options.read_only_root_filesystem);
         assert_eq!(options.user, None);
-        assert_eq!(options.scratch_volume, "/scratch:/scratch");
+        assert_eq!(options.scratch_volume, "/scratch:/scratch:idmap");
     }
 
     /// What the OpenTofu kubernetes provider (v3.5.0) sends for the
@@ -404,7 +420,7 @@ mod tests {
         assert_eq!(options.fs_group, Some(1000));
         assert!(options.read_only_root_filesystem);
         assert_eq!(options.user, None);
-        assert_eq!(options.scratch_volume, "/scratch:/scratch");
+        assert_eq!(options.scratch_volume, "/scratch:/scratch:idmap");
     }
 
     #[test]
@@ -427,13 +443,6 @@ mod tests {
             (
                 json!({"containers": [{"image": "x", "securityContext": {"privileged": true}}]}),
                 spec_error("containers[0].securityContext.privileged", "true"),
-            ),
-            (
-                json!({"containers": [{"image": "x", "securityContext": {"allowPrivilegeEscalation": false}}]}),
-                spec_error(
-                    "containers[0].securityContext.allowPrivilegeEscalation",
-                    "false",
-                ),
             ),
             (
                 json!({"containers": [{"image": "x", "securityContext": {"privileged": "false"}}]}),
@@ -539,6 +548,31 @@ mod tests {
     }
 
     #[test]
+    fn test_allow_privilege_escalation() {
+        for (value, expected) in [
+            (json!(null), false),
+            (json!(true), false),
+            (json!(false), true),
+        ] {
+            let spec = job_spec(json!({
+                "containers": [{"image": "x", "securityContext": {"allowPrivilegeEscalation": value}}]
+            }));
+            assert_eq!(validate(&spec), Ok(()));
+            assert_eq!(parse(&spec).unwrap().no_new_privileges, expected, "{value}");
+        }
+        let spec = job_spec(json!({
+            "containers": [{"image": "x", "securityContext": {"allowPrivilegeEscalation": "no"}}]
+        }));
+        assert_eq!(
+            validate(&spec),
+            Err(spec_error(
+                "containers[0].securityContext.allowPrivilegeEscalation",
+                "\"no\""
+            ))
+        );
+    }
+
+    #[test]
     fn test_run_as_group_without_user_rejected() {
         let spec = job_spec(json!({
             "containers": [{"image": "x", "securityContext": {"runAsGroup": 1000}}]
@@ -619,7 +653,10 @@ mod tests {
             ]
         }));
         assert!(validate(&spec).is_ok());
-        assert_eq!(parse(&spec).unwrap().scratch_volume, "/scratch:/workdir:ro");
+        assert_eq!(
+            parse(&spec).unwrap().scratch_volume,
+            "/scratch:/workdir:ro,idmap"
+        );
     }
 
     #[test]

@@ -92,6 +92,11 @@ pub fn generate(spec: &JsonValue) -> Result<String, String> {
         ""
     };
     let run_as_non_root = if options.run_as_non_root { "true" } else { "" };
+    let no_new_privileges = if options.no_new_privileges {
+        "true"
+    } else {
+        ""
+    };
 
     Ok(TEMPLATE
         .replace("__KUBESHIM_IMAGE_B64__", &b64(image))
@@ -100,6 +105,10 @@ pub fn generate(spec: &JsonValue) -> Result<String, String> {
         .replace("__KUBESHIM_FS_GROUP_B64__", &b64(&fs_group))
         .replace("__KUBESHIM_RUN_AS_USER_B64__", &b64(&user))
         .replace("__KUBESHIM_READ_ONLY_ROOT_B64__", &b64(read_only_root))
+        .replace(
+            "__KUBESHIM_NO_NEW_PRIVILEGES_B64__",
+            &b64(no_new_privileges),
+        )
         .replace("__KUBESHIM_RUN_AS_NON_ROOT_B64__", &b64(run_as_non_root))
         .replace(
             "__KUBESHIM_SCRATCH_VOLUME_B64__",
@@ -308,6 +317,7 @@ mod tests {
             "__KUBESHIM_RUN_AS_USER_B64__",
             "__KUBESHIM_READ_ONLY_ROOT_B64__",
             "__KUBESHIM_RUN_AS_NON_ROOT_B64__",
+            "__KUBESHIM_NO_NEW_PRIVILEGES_B64__",
             "__KUBESHIM_SCRATCH_VOLUME_B64__",
         ] {
             assert!(
@@ -319,10 +329,11 @@ mod tests {
         assert_eq!(decode_between(&script, "FS_GROUP=$(echo "), "");
         assert_eq!(decode_between(&script, "RUN_AS_USER=$(echo "), "");
         assert_eq!(decode_between(&script, "READ_ONLY_ROOT=$(echo "), "");
+        assert_eq!(decode_between(&script, "NO_NEW_PRIVILEGES=$(echo "), "");
         assert_eq!(decode_between(&script, "RUN_AS_NON_ROOT=$(echo "), "");
         assert_eq!(
             decode_between(&script, "SCRATCH_VOLUME=$(echo "),
-            "/scratch:/scratch"
+            "/scratch:/scratch:idmap"
         );
     }
 
@@ -333,7 +344,7 @@ mod tests {
             "securityContext": {"fsGroup": 1000, "runAsUser": 1000, "runAsNonRoot": true},
             "containers": [{
                 "image": "x",
-                "securityContext": {"readOnlyRootFilesystem": true},
+                "securityContext": {"readOnlyRootFilesystem": true, "allowPrivilegeEscalation": false},
                 "volumeMounts": [{"name": "scratch", "mountPath": "/workdir"}]
             }],
             "volumes": [{"name": "scratch", "ephemeral": {"volumeClaimTemplate": {"spec": {}}}}]
@@ -342,13 +353,17 @@ mod tests {
         assert_eq!(decode_between(&script, "FS_GROUP=$(echo "), "1000");
         assert_eq!(decode_between(&script, "RUN_AS_USER=$(echo "), "1000");
         assert_eq!(decode_between(&script, "READ_ONLY_ROOT=$(echo "), "true");
+        assert_eq!(decode_between(&script, "NO_NEW_PRIVILEGES=$(echo "), "true");
         assert_eq!(decode_between(&script, "RUN_AS_NON_ROOT=$(echo "), "true");
         assert_eq!(
             decode_between(&script, "SCRATCH_VOLUME=$(echo "),
-            "/scratch:/workdir"
+            "/scratch:/workdir:idmap"
         );
         assert!(script.contains("chgrp \"$FS_GROUP\" /scratch"));
         assert!(script.contains("chmod 2775 /scratch"));
+        // Always: a user namespace, with subordinate ids to draw from.
+        assert!(script.contains("SECURITY_ARGS=(--userns auto:size=2147483648)"));
+        assert!(script.contains("containers:2147483647:2147483648\" >> /etc/subuid"));
     }
 
     #[test]
