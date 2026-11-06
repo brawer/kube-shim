@@ -48,6 +48,12 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     // re-deriving the naming convention by hand" reason, now extended
     // to volumes too.
     ("job_volumes", "provider_volume_name", "TEXT"),
+    // Issue #85: the server plan a job's worker VM was really created
+    // with. Plan choice now depends on the synced catalog and prices,
+    // so actual cost, the cost report and the status page read this
+    // instead of re-deriving a plan that might differ by then. NULL
+    // until the VM is created (or for jobs from before this column).
+    ("jobs", "worker_plan", "TEXT"),
 ];
 
 pub async fn run(pool: &SqlitePool) -> Result<()> {

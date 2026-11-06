@@ -10,6 +10,7 @@
 pub mod upcloud;
 
 use async_trait::async_trait;
+use std::collections::HashMap;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -63,6 +64,10 @@ pub struct CreateServerRequest {
     /// Boot disk size in GB -- separate from any ephemeral scratch volume
     /// attached later via `attach_volume`.
     pub boot_disk_size_gb: u32,
+    /// Provider-specific storage tier for the boot disk (issue #85): the
+    /// plan's own tier when the plan includes storage, so the disk is
+    /// billed as part of the plan.
+    pub boot_disk_tier: String,
     pub ssh_public_keys: Vec<String>,
     /// UpCloud's own "server setup script" mechanism (their `user_data`
     /// field): a plain-text shell script (not base64, not a URL -- just
@@ -162,6 +167,27 @@ pub struct PriceEntry {
     pub currency: String,
 }
 
+/// One server plan from the provider's own catalog (`GET /1.3/plan` for
+/// UpCloud) -- synced daily into `provider_plans` by
+/// `reconcile::pricing` (issue #85), never hardcoded: UpCloud adds and
+/// retires plans often enough that a hand-maintained list goes stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanInfo {
+    pub name: String,
+    pub cpu_cores: u32,
+    pub memory_mb: u32,
+    /// Storage the plan includes, in GB (`0` for e.g. UpCloud's
+    /// `CLOUDNATIVE-*` family, whose boot disk is billed separately).
+    pub storage_gb: u32,
+    /// Tier of the included storage (`"maxiops"`, `"standard"`), `None`
+    /// when the plan includes none.
+    pub storage_tier: Option<String>,
+    pub gpu_count: u32,
+    /// `false` for plans UpCloud lists but no longer sells
+    /// (`current_offering: "no"`, e.g. `DEV-1xCPU-1GB-10GB`).
+    pub current_offering: bool,
+}
+
 #[async_trait]
 pub trait CloudProvider: Send + Sync {
     /// The provider's own display/brand name (e.g. `"UpCloud"`) --
@@ -231,10 +257,19 @@ pub trait CloudProvider: Send + Sync {
         server_id: &str,
     ) -> Result<Vec<FirewallRule>, ProviderError>;
 
-    /// `price_key` is one of UpCloud's own pricing catalog keys verbatim
-    /// (e.g. `"server_plan_DEV-1xCPU-1GB-10GB"`, `"storage_maxiops"`) --
-    /// see `PriceEntry`'s own docs for why this stays a raw passthrough.
-    async fn get_pricing(&self, zone: &str, price_key: &str) -> Result<PriceEntry, ProviderError>;
+    /// Every price-catalog entry for `zone`, keyed by the provider's own
+    /// catalog keys verbatim (e.g. `"server_plan_DEV-1xCPU-1GB-10GB"`,
+    /// `"storage_maxiops"`) -- see `PriceEntry`'s own docs for why this
+    /// stays a raw passthrough. One call returns the whole zone, so the
+    /// daily sync fetches the catalog once rather than once per key.
+    async fn get_zone_prices(
+        &self,
+        zone: &str,
+    ) -> Result<HashMap<String, PriceEntry>, ProviderError>;
+    /// The provider's whole server-plan catalog (issue #85). UpCloud
+    /// documents every plan as available in every zone, with only the
+    /// price differing -- so this takes no zone.
+    async fn list_plans(&self) -> Result<Vec<PlanInfo>, ProviderError>;
 }
 
 #[cfg(test)]

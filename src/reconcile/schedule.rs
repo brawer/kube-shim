@@ -230,6 +230,7 @@ mod tests {
             worker_ssh_private_key: String::new(),
             worker_ssh_port: crate::ssh::SSH_PORT,
             main_currency: "EUR".to_string(),
+            plan_filter: Default::default(),
         }
     }
 
@@ -303,6 +304,7 @@ mod tests {
         // afforded is skipped (no row created at all), not created and
         // left in a BudgetWait-style state.
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
         insert_price(&pool).await;
         seed_budget(&pool, 0.0, 2.0).await;
         let created_at = Utc::now().timestamp() - 120;
@@ -338,6 +340,7 @@ mod tests {
         // exact same due instant is retried on the very next call,
         // with no extra retry bookkeeping needed.
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
         insert_price(&pool).await;
         seed_budget(&pool, 0.0, 2.0).await;
         let created_at = Utc::now().timestamp() - 120;
@@ -359,6 +362,7 @@ mod tests {
     #[tokio::test]
     async fn test_due_run_stores_estimated_cost_when_budget_covers_it() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
         insert_price(&pool).await;
         seed_budget(&pool, 10.0, 2.0).await;
         let created_at = Utc::now().timestamp() - 120;

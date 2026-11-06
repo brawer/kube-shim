@@ -150,6 +150,7 @@ mod tests {
             worker_ssh_private_key: String::new(),
             worker_ssh_port: crate::ssh::SSH_PORT,
             main_currency: "EUR".to_string(),
+            plan_filter: Default::default(),
         }
     }
 

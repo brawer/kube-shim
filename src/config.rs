@@ -151,6 +151,17 @@ pub struct UpCloudConfig {
     /// `src/reconcile/job.rs`).
     #[serde(default)]
     pub worker_ssh_private_key: String,
+    /// Issue #85: which plans from UpCloud's catalog worker VMs may use,
+    /// as plan-name prefixes (e.g. `["DEV-", "CLOUDNATIVE-"]`). Empty
+    /// (the default) allows every non-GPU plan; kube-shim then picks the
+    /// cheapest plan that fits each job. GPU plans are never used.
+    #[serde(default)]
+    pub worker_plan_allow_prefixes: Vec<String>,
+    /// Plan-name prefixes worker VMs must never use, checked after
+    /// `worker_plan_allow_prefixes` (e.g. `["CLOUDNATIVE-"]` to keep a
+    /// family that misbehaves with the worker template out).
+    #[serde(default)]
+    pub worker_plan_deny_prefixes: Vec<String>,
 }
 
 fn default_upcloud_zone() -> String {

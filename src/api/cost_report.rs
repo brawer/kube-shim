@@ -165,6 +165,7 @@ struct CompletedJob {
     spec: JsonValue,
     created_at: i64,
     completed_at: i64,
+    worker_plan: Option<String>,
 }
 
 fn parse_date_param(
@@ -395,7 +396,7 @@ pub async fn get_cost_report(
         .timestamp();
 
     let rows = sqlx::query(
-        "SELECT name, namespace, spec, created_at, completed_at FROM jobs \
+        "SELECT name, namespace, spec, created_at, completed_at, worker_plan FROM jobs \
          WHERE actual_cost IS NOT NULL AND created_at >= ? AND created_at < ? \
          ORDER BY created_at",
     )
@@ -415,6 +416,7 @@ pub async fn get_cost_report(
                 spec: serde_json::from_str(&spec_str).unwrap_or(JsonValue::Null),
                 created_at: r.get(3),
                 completed_at: r.get::<Option<i64>, _>(4).unwrap_or_else(|| r.get(3)),
+                worker_plan: r.get(5),
             }
         })
         .collect();
@@ -424,10 +426,15 @@ pub async fn get_cost_report(
 
     for completed_job in &jobs {
         let duration_seconds = completed_job.completed_at - completed_job.created_at;
-        let Some((charges, provider_currency)) =
-            pricing::actual_job_charges(&pool, &config.zone, &completed_job.spec, duration_seconds)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        let Some((charges, provider_currency)) = pricing::actual_job_charges(
+            &pool,
+            &config.zone,
+            &completed_job.spec,
+            completed_job.worker_plan.as_deref(),
+            duration_seconds,
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         else {
             continue;
         };
@@ -563,6 +570,7 @@ mod tests {
     #[tokio::test]
     async fn test_vm_only_job_produces_one_real_focus_row() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
         insert_price(&pool, "server_plan_DEV-1xCPU-1GB-10GB", 1.0, 0.4464).await;
         let created = chrono::NaiveDate::from_ymd_opt(2026, 9, 15)
             .unwrap()
@@ -610,6 +618,7 @@ mod tests {
     #[tokio::test]
     async fn test_job_with_volume_produces_two_charge_rows() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
         insert_price(&pool, "server_plan_DEV-1xCPU-1GB-10GB", 1.0, 0.4464).await;
         insert_price(&pool, "storage_standard", 1.0, 0.0118).await;
         let created = chrono::NaiveDate::from_ymd_opt(2026, 9, 15)
