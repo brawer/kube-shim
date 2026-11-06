@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.3.0](https://github.com/brawer/kube-shim/compare/v0.2.9...v0.3.0) (2026-11-06)
+
+
+### ⚠ BREAKING CHANGES
+
+* any other securityContext field (runAsNonRoot, capabilities, ...), any other option on the scratch volume's mount, and runAsGroup without runAsUser are now rejected at admission instead of being silently ignored.
+* `api_version` is no longer accepted or returned; send `apiVersion`. Secret `data` values must be base64-encoded; use `stringData` for plain values.
+
+### 🆕 Enhancements
+
+* honor securityContext (fsGroup, runAsUser, readOnlyRootFilesystem) and mountPath ([296e07f](https://github.com/brawer/kube-shim/commit/296e07f110388201cf968e04e159108293449dc2)), closes [#86](https://github.com/brawer/kube-shim/issues/86)
+* pass multi-line env values to the container as podman secrets ([c71305b](https://github.com/brawer/kube-shim/commit/c71305b97d84d291c9eca18c35db2586ffdc16cb))
+* pick worker plans from UpCloud's synced plan catalog ([9ff332e](https://github.com/brawer/kube-shim/commit/9ff332e08c914352f91c5e9b2b31d7f6e76171a8))
+* resolve Secret and fieldRef env vars, deliver them over SSH ([dfeec08](https://github.com/brawer/kube-shim/commit/dfeec08c8345f029542f1ef616e5c1a4e989c5e6))
+* use Kubernetes' camelCase field names and accept Secret stringData ([2af4c01](https://github.com/brawer/kube-shim/commit/2af4c014ec0cc6264feb80d23bc13dcc4413da69))
+
+
+### 🐞 Bug Fixes
+
+* **tofu:** start the quadlet unit instead of enabling it ([412e495](https://github.com/brawer/kube-shim/commit/412e495423380a1c049eede9bdeb1e4677cb267b))
+
+
+### 🚧 Maintenance
+
+* give smoke test 30 s to become ready instead of 5 s ([5f6d4d9](https://github.com/brawer/kube-shim/commit/5f6d4d937c9ac2be7e4d61ef77a5d5d75fdf17c9))
+
 ## [0.2.9](https://github.com/brawer/kube-shim/compare/v0.2.8...v0.2.9) (2026-11-06)
 
 
