@@ -23,6 +23,7 @@
 
 use crate::container_env;
 use crate::k8s_status;
+use crate::run_options;
 use crate::volumes::{self, StorageTier};
 use crate::workload;
 use axum::response::Response;
@@ -157,6 +158,23 @@ pub fn validate_env_sources(
     Some(k8s_status::invalid_field_value(
         object_description,
         &format!("{field_prefix}.template.spec.containers[0].{}", err.field),
+        &err.value,
+    ))
+}
+
+/// Validates the pod's and first container's `securityContext` and the
+/// scratch volume's `volumeMounts[]` entry (issue #86): see
+/// `src/run_options.rs` for what's supported. Anything else set there is
+/// rejected rather than silently ignored.
+pub fn validate_run_options(
+    object_description: &str,
+    pod_template_spec: &JsonValue,
+    field_prefix: &str,
+) -> Option<Response> {
+    let err = run_options::validate(pod_template_spec).err()?;
+    Some(k8s_status::invalid_field_value(
+        object_description,
+        &format!("{field_prefix}.template.spec.{}", err.field),
         &err.value,
     ))
 }
@@ -402,5 +420,32 @@ mod tests {
             .contains("spec.template.spec.containers[0].env[0].valueFrom.fieldRef.fieldPath"));
         assert!(message.contains("status.podIP"));
         assert!(!message.contains("jobTemplate"));
+    }
+
+    #[test]
+    fn test_run_options_osmdiffs_accepted() {
+        let spec = json!({"template": {"spec": {
+            "securityContext": {"fsGroup": 1000},
+            "containers": [{"image": "x", "securityContext": {"readOnlyRootFilesystem": true}}]
+        }}});
+        assert!(validate_run_options("CronJob \"x\"", &spec, CRONJOB_PREFIX).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_run_options_unsupported_field_rejected() {
+        let spec = json!({"template": {"spec": {
+            "containers": [{"image": "x", "securityContext": {"privileged": true}}]
+        }}});
+        let response = validate_run_options("Job \"x\"", &spec, "spec").expect("must be rejected");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let message = response_message(response).await;
+        assert!(
+            message.contains("spec.template.spec.containers[0].securityContext"),
+            "{message}"
+        );
+        assert!(message.contains("privileged"), "{message}");
     }
 }

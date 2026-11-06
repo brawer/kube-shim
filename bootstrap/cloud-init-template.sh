@@ -11,7 +11,8 @@
 # syntax would make cloud_init.rs's substitution collide with podman's own
 # --format templating.
 #
-# Every job-supplied value embedded here (image, resource limits)
+# Every job-supplied value embedded here (image, resource limits, and
+# the run options from src/run_options.rs)
 # arrives already base64-encoded and is decoded with `base64 -d`, never
 # interpolated into this script as raw shell text -- see cloud_init.rs's
 # own module docs for why (a malicious/malformed image name must not be
@@ -32,6 +33,13 @@ echo "Waiting for volume..." > "$STATUS_FILE"
 IMAGE=$(echo '__KUBESHIM_IMAGE_B64__' | base64 -d)
 CPU_LIMIT=$(echo '__KUBESHIM_CPU_LIMIT_B64__' | base64 -d)
 MEMORY_LIMIT=$(echo '__KUBESHIM_MEMORY_LIMIT_B64__' | base64 -d)
+# Run options (issue #86, src/run_options.rs), each empty when unset:
+# fsGroup, `--user` value ("uid" or "uid:gid"), "true" for
+# readOnlyRootFilesystem, and the scratch volume's `-v` argument.
+FS_GROUP=$(echo '__KUBESHIM_FS_GROUP_B64__' | base64 -d)
+RUN_AS_USER=$(echo '__KUBESHIM_RUN_AS_USER_B64__' | base64 -d)
+READ_ONLY_ROOT=$(echo '__KUBESHIM_READ_ONLY_ROOT_B64__' | base64 -d)
+SCRATCH_VOLUME=$(echo '__KUBESHIM_SCRATCH_VOLUME_B64__' | base64 -d)
 
 # The job's ephemeral volume, if it requested one, is attached by the shim
 # via a separate UpCloud API call made AFTER this VM is already running
@@ -61,6 +69,16 @@ if [ -n "$DEVICE" ]; then
     mount "$DEVICE" /scratch
 else
     echo "No volume attached (job requested none, or attach timed out); /scratch is on the boot disk" >> "$STATUS_FILE"
+fi
+
+# Kubernetes' fsGroup semantics: the volume's root belongs to that group,
+# with the setgid bit so new files inherit it. Without this, a container
+# running as non-root can't write to /scratch (root:root 0755). Both the
+# fresh ext4 filesystem and the boot-disk directory are empty, so there
+# is nothing to chown recursively.
+if [ -n "$FS_GROUP" ]; then
+    chgrp "$FS_GROUP" /scratch
+    chmod 2775 /scratch
 fi
 
 echo "Installing podman..." >> "$STATUS_FILE"
@@ -104,10 +122,15 @@ RESOURCE_ARGS=()
 [ -n "$CPU_LIMIT" ] && RESOURCE_ARGS+=(--cpus "$CPU_LIMIT")
 [ -n "$MEMORY_LIMIT" ] && RESOURCE_ARGS+=(--memory "$MEMORY_LIMIT")
 
+SECURITY_ARGS=()
+[ -n "$FS_GROUP" ] && SECURITY_ARGS+=(--group-add "$FS_GROUP")
+[ -n "$RUN_AS_USER" ] && SECURITY_ARGS+=(--user "$RUN_AS_USER")
+[ "$READ_ONLY_ROOT" = true ] && SECURITY_ARGS+=(--read-only)
+
 echo "Starting container..." >> "$STATUS_FILE"
 # --env-file, not one `-e NAME=VALUE` per variable, so Secret values
 # never show up in this VM's process list.
-CONTAINER_ID=$(podman run -d -v /scratch:/scratch "${RESOURCE_ARGS[@]}" --env-file "$CONFIG_DIR/env" "${SECRET_ARGS[@]}" "$IMAGE" "${COMMAND[@]}" "${ARGS[@]}")
+CONTAINER_ID=$(podman run -d -v "$SCRATCH_VOLUME" "${RESOURCE_ARGS[@]}" "${SECURITY_ARGS[@]}" --env-file "$CONFIG_DIR/env" "${SECRET_ARGS[@]}" "$IMAGE" "${COMMAND[@]}" "${ARGS[@]}")
 echo "$CONTAINER_ID" > "$CONTAINER_ID_FILE"
 # podman has copied the env into the container's own config by now.
 rm -f "$CONFIG_DIR/env" "$CONFIG_DIR/secret-env"
