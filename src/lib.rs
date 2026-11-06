@@ -11,6 +11,7 @@ pub mod currency;
 pub mod db;
 pub mod k8s_status;
 pub mod metadata;
+pub mod metrics_export;
 pub mod naming;
 pub mod pricing;
 pub mod providers;

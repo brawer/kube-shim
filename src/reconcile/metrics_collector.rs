@@ -60,6 +60,17 @@
 //! not the sum of every job's, and additionally isolates a panic in
 //! one job's task from aborting the whole pass (`JoinError::is_panic`,
 //! logged and skipped like any other per-job failure).
+//!
+//! **Virtual-memory stats (Phase 18) ride on the same round-trip.** The
+//! combined command also reads the handful of `/proc/vmstat` and
+//! `/proc/meminfo` fields `/metrics` serves under node-exporter's own
+//! names (`metrics_export`): page faults (minor and major), swap-in/out,
+//! and the file-backed/cached/anonymous memory split -- the signals a
+//! workload `mmap()`ing scratch files larger than RAM needs. Both are
+//! plain world-readable files, so this needs no extra privilege. They
+//! are optional in the same way container stats are: a worker whose
+//! `/proc` output doesn't parse still gets its node-health sample
+//! recorded, just with these columns left `NULL`.
 
 use crate::reconcile::job::is_pre_completion_state;
 use crate::ssh::{self, WorkerSshConfig};
@@ -100,7 +111,11 @@ fn collection_command() -> String {
          echo '{SEP}'; \
          nproc; \
          echo '{SEP}'; \
-         cat /proc/loadavg"
+         cat /proc/loadavg; \
+         echo '{SEP}'; \
+         grep -E '^(pgfault|pgmajfault|pswpin|pswpout) ' /proc/vmstat; \
+         echo '{SEP}'; \
+         grep -E '^(Mapped|Cached|AnonPages):' /proc/meminfo"
     )
 }
 
@@ -126,6 +141,77 @@ struct Sample {
     node_memory_used_bytes: u64,
     node_cpu_count: u32,
     node_load1: f64,
+    /// `None` when the `/proc/vmstat`/`/proc/meminfo` sections are
+    /// missing or don't parse -- see this module's own top-level docs.
+    vm: Option<VmStats>,
+}
+
+/// The `/proc/vmstat` counters and `/proc/meminfo` gauges Phase 18
+/// serves. Counters are cumulative since the worker booted, exactly as
+/// the kernel reports them; `/metrics` passes them through unchanged.
+#[derive(Debug, PartialEq, Default)]
+struct VmStats {
+    pgfault: u64,
+    pgmajfault: u64,
+    pswpin: u64,
+    pswpout: u64,
+    mapped_bytes: u64,
+    cached_bytes: u64,
+    anon_bytes: u64,
+}
+
+/// Parses the two `grep`-filtered sections. `/proc/vmstat` lines are
+/// `name value`; `/proc/meminfo` lines are `Name:   value kB`, where
+/// "kB" really means KiB (the kernel's own long-standing naming), so
+/// values are multiplied by 1024 -- the same conversion node-exporter
+/// does for its `node_memory_*_bytes` metrics. Every field must be
+/// present: a half-filled reading would look like a real zero.
+fn parse_vm_stats(vmstat: &str, meminfo: &str) -> Option<VmStats> {
+    let mut pgfault = None;
+    let mut pgmajfault = None;
+    let mut pswpin = None;
+    let mut pswpout = None;
+    for line in vmstat.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(name), Some(value)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let value: u64 = value.parse().ok()?;
+        match name {
+            "pgfault" => pgfault = Some(value),
+            "pgmajfault" => pgmajfault = Some(value),
+            "pswpin" => pswpin = Some(value),
+            "pswpout" => pswpout = Some(value),
+            _ => {}
+        }
+    }
+
+    let mut mapped = None;
+    let mut cached = None;
+    let mut anon = None;
+    for line in meminfo.lines() {
+        let Some((name, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+        let bytes = kib.checked_mul(1024)?;
+        match name.trim() {
+            "Mapped" => mapped = Some(bytes),
+            "Cached" => cached = Some(bytes),
+            "AnonPages" => anon = Some(bytes),
+            _ => {}
+        }
+    }
+
+    Some(VmStats {
+        pgfault: pgfault?,
+        pgmajfault: pgmajfault?,
+        pswpin: pswpin?,
+        pswpout: pswpout?,
+        mapped_bytes: mapped?,
+        cached_bytes: cached?,
+        anon_bytes: anon?,
+    })
 }
 
 /// `podman stats`' own human-readable byte formatting (`go-units`'
@@ -226,6 +312,10 @@ fn parse_sample(stdout: &str) -> Option<Sample> {
     let free_section = sections.next()?.trim();
     let nproc_section = sections.next()?.trim();
     let loadavg_section = sections.next()?.trim();
+    // Optional (Phase 18): absent or unparseable leaves `vm` as `None`
+    // rather than failing the whole sample.
+    let vmstat_section = sections.next().map(str::trim);
+    let meminfo_section = sections.next().map(str::trim);
 
     let containers = parse_podman_stats(stats_section)?;
     let (node_memory_total_bytes, node_memory_used_bytes, node_cpu_count, node_load1) =
@@ -237,6 +327,10 @@ fn parse_sample(stdout: &str) -> Option<Sample> {
         node_memory_used_bytes,
         node_cpu_count,
         node_load1,
+        vm: match (vmstat_section, meminfo_section) {
+            (Some(vmstat), Some(meminfo)) => parse_vm_stats(vmstat, meminfo),
+            _ => None,
+        },
     })
 }
 
@@ -254,12 +348,21 @@ async fn upsert_sample(pool: &SqlitePool, job_id: &str, sample: &Sample) -> Resu
     let container = sample.containers.first();
     let cpu_millicores = container.map(|c| c.cpu_millicores);
     let memory_usage_bytes = container.map(|c| c.memory_usage_bytes as i64);
+    // SQLite integers are signed 64-bit; saturate rather than wrap on
+    // the (practically impossible) counter beyond i64::MAX.
+    let vm_field = |f: fn(&VmStats) -> u64| {
+        sample
+            .vm
+            .as_ref()
+            .map(|vm| i64::try_from(f(vm)).unwrap_or(i64::MAX))
+    };
 
     sqlx::query(
         "INSERT INTO worker_metrics \
          (job_id, cpu_millicores, memory_usage_bytes, node_memory_total_bytes, \
-          node_memory_used_bytes, node_cpu_count, node_load1, sampled_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+          node_memory_used_bytes, node_cpu_count, node_load1, sampled_at, \
+          pgfault, pgmajfault, pswpin, pswpout, mapped_bytes, cached_bytes, anon_bytes) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(job_id) DO UPDATE SET \
              cpu_millicores = excluded.cpu_millicores, \
              memory_usage_bytes = excluded.memory_usage_bytes, \
@@ -267,7 +370,14 @@ async fn upsert_sample(pool: &SqlitePool, job_id: &str, sample: &Sample) -> Resu
              node_memory_used_bytes = excluded.node_memory_used_bytes, \
              node_cpu_count = excluded.node_cpu_count, \
              node_load1 = excluded.node_load1, \
-             sampled_at = excluded.sampled_at",
+             sampled_at = excluded.sampled_at, \
+             pgfault = excluded.pgfault, \
+             pgmajfault = excluded.pgmajfault, \
+             pswpin = excluded.pswpin, \
+             pswpout = excluded.pswpout, \
+             mapped_bytes = excluded.mapped_bytes, \
+             cached_bytes = excluded.cached_bytes, \
+             anon_bytes = excluded.anon_bytes",
     )
     .bind(job_id)
     .bind(cpu_millicores)
@@ -277,6 +387,13 @@ async fn upsert_sample(pool: &SqlitePool, job_id: &str, sample: &Sample) -> Resu
     .bind(sample.node_cpu_count)
     .bind(sample.node_load1)
     .bind(now)
+    .bind(vm_field(|vm| vm.pgfault))
+    .bind(vm_field(|vm| vm.pgmajfault))
+    .bind(vm_field(|vm| vm.pswpin))
+    .bind(vm_field(|vm| vm.pswpout))
+    .bind(vm_field(|vm| vm.mapped_bytes))
+    .bind(vm_field(|vm| vm.cached_bytes))
+    .bind(vm_field(|vm| vm.anon_bytes))
     .execute(pool)
     .await?;
     Ok(())
@@ -558,6 +675,90 @@ mod tests {
         assert_eq!(sample.node_memory_used_bytes, 479_375_360);
         assert_eq!(sample.node_cpu_count, 1);
         assert_eq!(sample.node_load1, 0.0);
+    }
+
+    #[test]
+    fn test_parse_vm_stats_real_shape() {
+        // The grep-filtered shape of a real Ubuntu 24.04 /proc/vmstat
+        // and /proc/meminfo.
+        let vmstat = "pgfault 123456789\npgmajfault 4321\npswpin 0\npswpout 0\n";
+        let meminfo = "Cached:          2097152 kB\nAnonPages:        524288 kB\n\
+                       Mapped:           262144 kB\n";
+        let vm = parse_vm_stats(vmstat, meminfo).unwrap();
+        assert_eq!(
+            vm,
+            VmStats {
+                pgfault: 123_456_789,
+                pgmajfault: 4321,
+                pswpin: 0,
+                pswpout: 0,
+                mapped_bytes: 262_144 * 1024,
+                cached_bytes: 2_097_152 * 1024,
+                anon_bytes: 524_288 * 1024,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_vm_stats_missing_field_is_none() {
+        // pswpout missing: a partial reading must not show up as zero.
+        let vmstat = "pgfault 1\npgmajfault 2\npswpin 3\n";
+        let meminfo = "Cached: 1 kB\nAnonPages: 2 kB\nMapped: 3 kB\n";
+        assert!(parse_vm_stats(vmstat, meminfo).is_none());
+    }
+
+    #[test]
+    fn test_parse_sample_with_vm_stats() {
+        let stdout = format!(
+            "[]\n{SEP}\n8000000000 4000000000\n{SEP}\n4\n{SEP}\n1.00 0.90 0.80 1/200 999\n\
+             {SEP}\npgfault 10\npgmajfault 2\npswpin 0\npswpout 0\n\
+             {SEP}\nCached: 4 kB\nAnonPages: 8 kB\nMapped: 2 kB\n"
+        );
+        let sample = parse_sample(&stdout).unwrap();
+        let vm = sample.vm.unwrap();
+        assert_eq!(vm.pgfault, 10);
+        assert_eq!(vm.pgmajfault, 2);
+        assert_eq!(vm.mapped_bytes, 2048);
+    }
+
+    #[test]
+    fn test_parse_sample_with_garbled_vm_stats_keeps_node_health() {
+        let stdout = format!(
+            "[]\n{SEP}\n8000000000 4000000000\n{SEP}\n4\n{SEP}\n1.00 0.90 0.80 1/200 999\n\
+             {SEP}\ngrep: /proc/vmstat: No such file\n{SEP}\n"
+        );
+        let sample = parse_sample(&stdout).unwrap();
+        assert!(sample.vm.is_none());
+        assert_eq!(sample.node_cpu_count, 4);
+    }
+
+    #[tokio::test]
+    async fn test_upsert_sample_stores_vm_stats() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let sample = Sample {
+            containers: vec![],
+            node_memory_total_bytes: 2000,
+            node_memory_used_bytes: 1000,
+            node_cpu_count: 1,
+            node_load1: 0.1,
+            vm: Some(VmStats {
+                pgfault: 11,
+                pgmajfault: 7,
+                pswpin: 0,
+                pswpout: 0,
+                mapped_bytes: 4096,
+                cached_bytes: 8192,
+                anon_bytes: 1024,
+            }),
+        };
+        upsert_sample(&pool, "j1", &sample).await.unwrap();
+        let (pgmajfault, mapped): (i64, i64) = sqlx::query_as(
+            "SELECT pgmajfault, mapped_bytes FROM worker_metrics WHERE job_id = 'j1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((pgmajfault, mapped), (7, 4096));
     }
 
     #[test]

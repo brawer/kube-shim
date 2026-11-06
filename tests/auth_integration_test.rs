@@ -263,7 +263,7 @@ async fn test_public_status_page_and_health_endpoints_need_no_token() {
     }])
     .await;
 
-    for path in ["/", "/statusz", "/livez"] {
+    for path in ["/", "/statusz", "/livez", "/metrics"] {
         let resp = insecure_client()
             .get(format!("{base_url}{path}"))
             .send()
@@ -317,7 +317,7 @@ async fn test_public_status_page_rejects_non_get_methods() {
     }])
     .await;
 
-    for path in ["/", "/statusz", "/healthz", "/livez", "/readyz"] {
+    for path in ["/", "/statusz", "/healthz", "/livez", "/readyz", "/metrics"] {
         let resp = insecure_client()
             .post(format!("{base_url}{path}"))
             .send()
