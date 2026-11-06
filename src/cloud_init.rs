@@ -17,7 +17,8 @@
 //! construction, not just by convention.
 
 //!
-//! **Only the image and resource limits travel in `user_data`.** The
+//! **Only the image, resource limits and run options (`securityContext`,
+//! scratch mount path; see `src/run_options.rs`) travel in `user_data`.** The
 //! container's environment (which may hold `Secret` values) and its
 //! `command`/`args` (which may embed them via `$(VAR)` expansion) are
 //! delivered later over SSH instead (`ContainerConfig`, uploaded by
@@ -26,7 +27,7 @@
 //! by anyone who can read the server's `user_data` (issue #84). The
 //! template waits for `READY_PATH` before it starts the container.
 
-use crate::{container_env, volumes, workload};
+use crate::{container_env, run_options, volumes, workload};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde_json::Value as JsonValue;
@@ -78,10 +79,30 @@ pub fn generate(spec: &JsonValue) -> Result<String, String> {
     let cpu_limit = cpu_limit_flag_value(container);
     let memory_limit = memory_limit_flag_value(container);
 
+    // Rejected at admission already; a job stored before that check
+    // existed fails loudly here rather than running without, say, the
+    // fsGroup it needs to write its scratch space.
+    let options = run_options::parse(spec)
+        .map_err(|e| format!("template.spec.{} is invalid: {:?}", e.field, e.value))?;
+    let fs_group = options.fs_group.map(|g| g.to_string()).unwrap_or_default();
+    let user = options.user.unwrap_or_default();
+    let read_only_root = if options.read_only_root_filesystem {
+        "true"
+    } else {
+        ""
+    };
+
     Ok(TEMPLATE
         .replace("__KUBESHIM_IMAGE_B64__", &b64(image))
         .replace("__KUBESHIM_CPU_LIMIT_B64__", &b64(&cpu_limit))
-        .replace("__KUBESHIM_MEMORY_LIMIT_B64__", &b64(&memory_limit)))
+        .replace("__KUBESHIM_MEMORY_LIMIT_B64__", &b64(&memory_limit))
+        .replace("__KUBESHIM_FS_GROUP_B64__", &b64(&fs_group))
+        .replace("__KUBESHIM_RUN_AS_USER_B64__", &b64(&user))
+        .replace("__KUBESHIM_READ_ONLY_ROOT_B64__", &b64(read_only_root))
+        .replace(
+            "__KUBESHIM_SCRATCH_VOLUME_B64__",
+            &b64(&options.scratch_volume),
+        ))
 }
 
 /// `spec.template.spec.containers[0]`.
@@ -281,6 +302,10 @@ mod tests {
             "__KUBESHIM_IMAGE_B64__",
             "__KUBESHIM_CPU_LIMIT_B64__",
             "__KUBESHIM_MEMORY_LIMIT_B64__",
+            "__KUBESHIM_FS_GROUP_B64__",
+            "__KUBESHIM_RUN_AS_USER_B64__",
+            "__KUBESHIM_READ_ONLY_ROOT_B64__",
+            "__KUBESHIM_SCRATCH_VOLUME_B64__",
         ] {
             assert!(
                 !script.contains(placeholder),
@@ -288,6 +313,46 @@ mod tests {
             );
         }
         assert_eq!(decode_between(&script, "IMAGE=$(echo "), "busybox:latest");
+        assert_eq!(decode_between(&script, "FS_GROUP=$(echo "), "");
+        assert_eq!(decode_between(&script, "RUN_AS_USER=$(echo "), "");
+        assert_eq!(decode_between(&script, "READ_ONLY_ROOT=$(echo "), "");
+        assert_eq!(
+            decode_between(&script, "SCRATCH_VOLUME=$(echo "),
+            "/scratch:/scratch"
+        );
+    }
+
+    #[test]
+    fn test_run_options_reach_the_script() {
+        // Issue #86: the osmdiffs CronJob, plus runAsUser and a mountPath.
+        let spec = json!({"template": {"spec": {
+            "securityContext": {"fsGroup": 1000, "runAsUser": 1000},
+            "containers": [{
+                "image": "x",
+                "securityContext": {"readOnlyRootFilesystem": true},
+                "volumeMounts": [{"name": "scratch", "mountPath": "/workdir"}]
+            }],
+            "volumes": [{"name": "scratch", "ephemeral": {"volumeClaimTemplate": {"spec": {}}}}]
+        }}});
+        let script = generate(&spec).unwrap();
+        assert_eq!(decode_between(&script, "FS_GROUP=$(echo "), "1000");
+        assert_eq!(decode_between(&script, "RUN_AS_USER=$(echo "), "1000");
+        assert_eq!(decode_between(&script, "READ_ONLY_ROOT=$(echo "), "true");
+        assert_eq!(
+            decode_between(&script, "SCRATCH_VOLUME=$(echo "),
+            "/scratch:/workdir"
+        );
+        assert!(script.contains("chgrp \"$FS_GROUP\" /scratch"));
+        assert!(script.contains("chmod 2775 /scratch"));
+    }
+
+    #[test]
+    fn test_invalid_run_options_are_an_error() {
+        let spec = json!({"template": {"spec": {
+            "securityContext": {"fsGroup": "1000; reboot"},
+            "containers": [{"image": "x"}]
+        }}});
+        assert!(generate(&spec).is_err());
     }
 
     #[test]

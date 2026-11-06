@@ -181,6 +181,11 @@ pub async fn create_job(
     {
         return response;
     }
+    if let Some(response) =
+        admission::validate_run_options(&object_description, &req.spec, FIELD_PREFIX)
+    {
+        return response;
+    }
 
     // Budget admission (Phase 14b, moved here from a `BudgetWait`
     // state that created the row first and found out later): rejected
