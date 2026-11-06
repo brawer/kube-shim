@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.3](https://github.com/brawer/kube-shim/compare/v0.3.2...v0.3.3) (2026-11-06)
+
+
+### 🆕 Enhancements
+
+* serve Prometheus /metrics with shim and worker VM memory stats ([9cc2187](https://github.com/brawer/kube-shim/commit/9cc2187d4bb3f355ea5561d422075254d0f76da5))
+
 ## [0.3.2](https://github.com/brawer/kube-shim/compare/v0.3.1...v0.3.2) (2026-11-06)
 
 
