@@ -1165,8 +1165,9 @@ async fn handle_container_configuring(
         return Ok(false);
     }
 
-    let uploads: [(&str, &[u8]); 4] = [
+    let uploads: [(&str, &[u8]); 5] = [
         (cloud_init::UPLOAD_ENV_COMMAND, &config.env_file),
+        (cloud_init::UPLOAD_SECRET_ENV_COMMAND, &config.secret_env),
         (cloud_init::UPLOAD_COMMAND_COMMAND, &config.command),
         (cloud_init::UPLOAD_ARGS_COMMAND, &config.args),
         (cloud_init::READY_COMMAND, b""),
@@ -2372,7 +2373,8 @@ mod tests {
         let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
         let data = serde_json::json!({
             "PUBLIC_S3_ENDPOINT": b64("https://s3.example"),
-            "PUBLIC_S3_SECRET_KEY": b64("hunter2")
+            "PUBLIC_S3_SECRET_KEY": b64("hunter2"),
+            "TLS_KEY": b64("-----BEGIN KEY-----\nabc\n-----END KEY-----\n")
         });
         sqlx::query(
             "INSERT INTO secrets (id, name, namespace, data, created_at, updated_at, version) \
@@ -2409,6 +2411,7 @@ mod tests {
             commands,
             [
                 cloud_init::UPLOAD_ENV_COMMAND,
+                cloud_init::UPLOAD_SECRET_ENV_COMMAND,
                 cloud_init::UPLOAD_COMMAND_COMMAND,
                 cloud_init::UPLOAD_ARGS_COMMAND,
                 cloud_init::READY_COMMAND,
@@ -2420,9 +2423,13 @@ mod tests {
              PUBLIC_S3_SECRET_KEY=hunter2\n\
              RUN_ID=osmdiffs-1762410000\n"
         );
-        assert!(received[1].1.is_empty());
         assert_eq!(
-            received[2].1,
+            received[1].1,
+            b"TLS_KEY\0-----BEGIN KEY-----\nabc\n-----END KEY-----\n\0".to_vec()
+        );
+        assert!(received[2].1.is_empty());
+        assert_eq!(
+            received[3].1,
             b"run\0--workdir\0/workdir\0--run_id\0osmdiffs-1762410000\0".to_vec()
         );
     }
