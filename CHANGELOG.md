@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.2](https://github.com/brawer/kube-shim/compare/v0.3.1...v0.3.2) (2026-11-06)
+
+
+### 🆕 Enhancements
+
+* implement runAsNonRoot ([6b968da](https://github.com/brawer/kube-shim/commit/6b968da8623e1b9cacebce2d5412cfb8cd181087))
+* run job containers in a user namespace, map allowPrivilegeEscalation ([304c00d](https://github.com/brawer/kube-shim/commit/304c00d283ce9bd935c5b01dee42ce09eac43b71))
+
 ## [0.3.1](https://github.com/brawer/kube-shim/compare/v0.3.0...v0.3.1) (2026-11-06)
 
 
