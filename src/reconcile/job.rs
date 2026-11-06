@@ -97,7 +97,7 @@ use crate::providers::{
     CloudProvider, CreateServerRequest, CreateVolumeRequest, FirewallAction, FirewallDirection,
     FirewallFamily, FirewallRule, ProviderError,
 };
-use crate::{cloud_init, pricing, ssh, volumes, workload};
+use crate::{cloud_init, container_env, pricing, ssh, volumes, workload};
 use anyhow::Result;
 use chrono::Utc;
 use serde_json::Value as JsonValue;
@@ -138,6 +138,7 @@ const STATE_SEQUENCE: &[&str] = &[
     "VMRunning",
     "VolumeAttaching",
     "VolumeAttached",
+    "ContainerConfiguring",
     "ContainerRunning",
     "Succeeded",
     "VolumeDetaching",
@@ -494,6 +495,17 @@ pub async fn advance_all(pool: &SqlitePool, ctx: &JobContext) -> Result<usize> {
                     .await?
                     .then_some(next)
             }
+            "ContainerConfiguring" => handle_container_configuring(
+                pool,
+                ctx,
+                &id,
+                &namespace,
+                &name,
+                &spec_str,
+                last_transition_time,
+            )
+            .await?
+            .then_some(next),
             "ContainerRunning" => {
                 handle_container_running(pool, ctx, &id, &namespace, &name, &spec_str, created_at)
                     .await?
@@ -718,6 +730,16 @@ async fn handle_vm_pending(
         record_failed_attempt(pool, job_id, namespace, name, &msg, last_transition_time).await?;
         return Ok(false);
     };
+
+    // Issue #84: a job whose env can't be resolved (a missing Secret or
+    // key) never gets a worker VM -- checked here, before anything
+    // billable is created, and again for real in ContainerConfiguring.
+    if resolve_container_config(pool, job_id, namespace, name, &spec, last_transition_time)
+        .await?
+        .is_none()
+    {
+        return Ok(false);
+    }
 
     if ctx.dry_run {
         tracing::info!(
@@ -1028,6 +1050,163 @@ async fn handle_volume_attaching(
             Ok(false)
         }
     }
+}
+
+/// Resolves a job's container env (`container_env::resolve`) and builds
+/// the files its worker starts the container from
+/// (`cloud_init::container_config`). On failure -- a missing Secret or
+/// key, a value podman's `--env-file` can't hold -- records a failed
+/// attempt plus, the first time a given error shows up, a `Warning`
+/// event (`kubectl describe pod` shows it, like Kubernetes'
+/// `CreateContainerConfigError`), and returns `None`: the job then stays
+/// put and retries until the stuck-state timeout fails it, rather than
+/// starting without the variable.
+async fn resolve_container_config(
+    pool: &SqlitePool,
+    job_id: &str,
+    namespace: &str,
+    name: &str,
+    spec: &JsonValue,
+    last_transition_time: Option<i64>,
+) -> Result<Option<cloud_init::ContainerConfig>> {
+    let result = match cloud_init::first_container(spec) {
+        Ok(container) => {
+            let pod = container_env::PodFields { name, namespace };
+            match container_env::resolve(pool, &pod, container).await {
+                Ok(env) => cloud_init::container_config(container, &env),
+                Err(err) => Err(err),
+            }
+        }
+        Err(err) => Err(err),
+    };
+    match result {
+        Ok(config) => Ok(Some(config)),
+        Err(err) => {
+            let msg = format!("CreateContainerConfigError: {err}");
+            let previous: Option<String> =
+                sqlx::query_scalar("SELECT last_error FROM jobs WHERE id = ?")
+                    .bind(job_id)
+                    .fetch_one(pool)
+                    .await?;
+            if previous.as_deref() != Some(msg.as_str()) {
+                record_event(
+                    pool,
+                    Some(job_id),
+                    "CreateContainerConfigError",
+                    &err,
+                    "Warning",
+                )
+                .await?;
+            }
+            record_failed_attempt(pool, job_id, namespace, name, &msg, last_transition_time)
+                .await?;
+            Ok(None)
+        }
+    }
+}
+
+/// `ContainerConfiguring` (issue #84): deliver the container's env file,
+/// command and args to the worker over SSH, into root-only files under
+/// `cloud_init::CONFIG_DIR`, then mark them ready -- the worker's
+/// cloud-init script waits for that before it starts the container. Kept
+/// out of `user_data` on purpose (see `src/cloud_init.rs`'s module docs).
+///
+/// The env is resolved again here, not reused from `VMPending`'s check,
+/// so the container gets the Secret values as they are now. An SSH
+/// connection that isn't up yet is a polling case (still booting); a
+/// resolution error or a failed remote write is a failed attempt.
+async fn handle_container_configuring(
+    pool: &SqlitePool,
+    ctx: &JobContext,
+    job_id: &str,
+    namespace: &str,
+    name: &str,
+    spec_str: &str,
+    last_transition_time: Option<i64>,
+) -> Result<bool> {
+    let spec: JsonValue = serde_json::from_str(spec_str).unwrap_or(JsonValue::Null);
+    let Some(config) =
+        resolve_container_config(pool, job_id, namespace, name, &spec, last_transition_time)
+            .await?
+    else {
+        return Ok(false);
+    };
+    if ctx.dry_run {
+        tracing::info!(
+            "DRY-RUN: would deliver container config for job {namespace}/{name} \
+             ({} bytes of env)",
+            config.env_file.len()
+        );
+        return Ok(true);
+    }
+    let Some(ip) = worker_ssh_ip(pool, job_id).await? else {
+        record_failed_attempt(
+            pool,
+            job_id,
+            namespace,
+            name,
+            "no worker_ssh_ip recorded, cannot deliver the container config",
+            last_transition_time,
+        )
+        .await?;
+        return Ok(false);
+    };
+    if ctx.worker_ssh_private_key.is_empty() {
+        record_failed_attempt(
+            pool,
+            job_id,
+            namespace,
+            name,
+            "upcloud.worker_ssh_private_key is empty -- cannot deliver the container's env \
+             and args to the worker, so its container can never start",
+            last_transition_time,
+        )
+        .await?;
+        return Ok(false);
+    }
+
+    let uploads: [(&str, &[u8]); 4] = [
+        (cloud_init::UPLOAD_ENV_COMMAND, &config.env_file),
+        (cloud_init::UPLOAD_COMMAND_COMMAND, &config.command),
+        (cloud_init::UPLOAD_ARGS_COMMAND, &config.args),
+        (cloud_init::READY_COMMAND, b""),
+    ];
+    for (command, contents) in uploads {
+        match ssh::exec_with_stdin(
+            &ip,
+            ctx.worker_ssh_port,
+            &ctx.worker_ssh_private_key,
+            command,
+            contents,
+        )
+        .await
+        {
+            Ok(output) if output.exit_status == Some(0) => {}
+            Ok(output) => {
+                record_failed_attempt(
+                    pool,
+                    job_id,
+                    namespace,
+                    name,
+                    &format!(
+                        "writing the container config on worker {ip} failed (exit status {:?})",
+                        output.exit_status
+                    ),
+                    last_transition_time,
+                )
+                .await?;
+                return Ok(false);
+            }
+            Err(err) => {
+                tracing::debug!(
+                    "job {namespace}/{name}: SSH to worker {ip} not ready yet, will retry: {err}"
+                );
+                return Ok(false);
+            }
+        }
+    }
+    tracing::info!("job {namespace}/{name}: delivered container config to worker {ip}");
+    Ok(true)
 }
 
 /// `ContainerRunning`: the container itself was already started
@@ -2158,6 +2337,172 @@ mod tests {
         assert_eq!(advanced, 1);
     }
 
+    // --- Issue #84: container env/command/args delivered over SSH ---
+
+    /// The osmdiffs container from issue #84.
+    fn osmdiffs_spec() -> String {
+        serde_json::json!({"template": {"spec": {"containers": [{
+            "image": "ghcr.io/brawer/osmdiffs:latest",
+            "env": [{"name": "RUN_ID", "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}}}],
+            "envFrom": [{"secretRef": {"name": "osmdiffs-s3-credentials"}}],
+            "args": ["run", "--workdir", "/workdir", "--run_id", "$(RUN_ID)"]
+        }]}}})
+        .to_string()
+    }
+
+    async fn insert_job_with_spec(pool: &SqlitePool, status: &str, spec: &str, ip: Option<&str>) {
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, worker_vm_id, worker_ssh_ip, created_at, updated_at, last_transition_time, version) \
+             VALUES ('j1', 'osmdiffs-1762410000', 'default', ?, ?, 'srv1', ?, ?, ?, ?, 1)",
+        )
+        .bind(spec)
+        .bind(status)
+        .bind(ip)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_s3_secret(pool: &SqlitePool) {
+        use base64::Engine;
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+        let data = serde_json::json!({
+            "PUBLIC_S3_ENDPOINT": b64("https://s3.example"),
+            "PUBLIC_S3_SECRET_KEY": b64("hunter2")
+        });
+        sqlx::query(
+            "INSERT INTO secrets (id, name, namespace, data, created_at, updated_at, version) \
+             VALUES ('s1', 'osmdiffs-s3-credentials', 'default', ?, 0, 0, 1)",
+        )
+        .bind(data.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn job_status_and_error(pool: &SqlitePool) -> (String, Option<String>) {
+        sqlx::query_as("SELECT status, last_error FROM jobs WHERE id = 'j1'")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_container_configuring_delivers_env_and_args_over_ssh() {
+        let (host, port, received) = crate::ssh::tests::mock_upload_ssh_server(0).await;
+        let mut ctx = mock_ctx(false);
+        ctx.worker_ssh_port = port;
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_s3_secret(&pool).await;
+        insert_job_with_spec(&pool, "ContainerConfiguring", &osmdiffs_spec(), Some(&host)).await;
+
+        assert_eq!(advance_all(&pool, &ctx).await.unwrap(), 1);
+        assert_eq!(job_status_and_error(&pool).await.0, "ContainerRunning");
+
+        let received = received.lock().unwrap().clone();
+        let commands: Vec<&str> = received.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(
+            commands,
+            [
+                cloud_init::UPLOAD_ENV_COMMAND,
+                cloud_init::UPLOAD_COMMAND_COMMAND,
+                cloud_init::UPLOAD_ARGS_COMMAND,
+                cloud_init::READY_COMMAND,
+            ]
+        );
+        assert_eq!(
+            String::from_utf8(received[0].1.clone()).unwrap(),
+            "PUBLIC_S3_ENDPOINT=https://s3.example\n\
+             PUBLIC_S3_SECRET_KEY=hunter2\n\
+             RUN_ID=osmdiffs-1762410000\n"
+        );
+        assert!(received[1].1.is_empty());
+        assert_eq!(
+            received[2].1,
+            b"run\0--workdir\0/workdir\0--run_id\0osmdiffs-1762410000\0".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_container_configuring_waits_while_ssh_is_not_up() {
+        // Nothing listens on this port: still booting, not a failure.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut ctx = mock_ctx(false);
+        ctx.worker_ssh_port = port;
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_s3_secret(&pool).await;
+        insert_job_with_spec(
+            &pool,
+            "ContainerConfiguring",
+            &osmdiffs_spec(),
+            Some("127.0.0.1"),
+        )
+        .await;
+
+        assert_eq!(advance_all(&pool, &ctx).await.unwrap(), 0);
+        assert_eq!(
+            job_status_and_error(&pool).await,
+            ("ContainerConfiguring".to_string(), None)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_container_configuring_failed_remote_write_is_a_failed_attempt() {
+        let (host, port, _received) = crate::ssh::tests::mock_upload_ssh_server(1).await;
+        let mut ctx = mock_ctx(false);
+        ctx.worker_ssh_port = port;
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_s3_secret(&pool).await;
+        insert_job_with_spec(&pool, "ContainerConfiguring", &osmdiffs_spec(), Some(&host)).await;
+
+        assert_eq!(advance_all(&pool, &ctx).await.unwrap(), 0);
+        let (status, last_error) = job_status_and_error(&pool).await;
+        assert_eq!(status, "ContainerConfiguring");
+        assert!(last_error.unwrap().contains("exit status Some(1)"));
+    }
+
+    #[tokio::test]
+    async fn test_missing_secret_blocks_vm_creation_with_one_warning_event() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_job_with_spec(&pool, "VMPending", &osmdiffs_spec(), None).await;
+
+        for _ in 0..2 {
+            assert_eq!(advance_all(&pool, &mock_ctx(true)).await.unwrap(), 0);
+        }
+        let (status, last_error) = job_status_and_error(&pool).await;
+        assert_eq!(status, "VMPending", "no worker VM without its Secret");
+        let last_error = last_error.unwrap();
+        assert!(
+            last_error.contains("secret \"osmdiffs-s3-credentials\" not found"),
+            "{last_error}"
+        );
+
+        let events: Vec<(String, String)> =
+            sqlx::query_as("SELECT reason, type FROM events WHERE job_id = 'j1'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            events,
+            [(
+                "CreateContainerConfigError".to_string(),
+                "Warning".to_string()
+            )],
+            "one event per distinct error, not one per retry"
+        );
+
+        // Once the Secret exists, the job moves on.
+        insert_s3_secret(&pool).await;
+        assert_eq!(advance_all(&pool, &mock_ctx(true)).await.unwrap(), 1);
+        assert_eq!(job_status_and_error(&pool).await.0, "FirewallApplying");
+    }
+
     async fn insert_job_with_ssh_ip(pool: &SqlitePool, status: &str, ip: &str) {
         let now = Utc::now().timestamp();
         sqlx::query(
@@ -2591,6 +2936,7 @@ mod tests {
             "VMRunning",
             "VolumeAttaching",
             "VolumeAttached",
+            "ContainerConfiguring",
             "ContainerRunning",
         ] {
             assert!(is_pre_completion_state(state), "{state} should be covered");
@@ -2698,7 +3044,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(status, "ContainerRunning");
+        assert_eq!(status, "ContainerConfiguring");
     }
 
     #[tokio::test]

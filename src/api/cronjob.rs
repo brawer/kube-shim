@@ -72,6 +72,11 @@ pub async fn create_cronjob(
     {
         return response;
     }
+    if let Some(response) =
+        admission::validate_env_sources(&object_description, &pod_template_spec, FIELD_PREFIX)
+    {
+        return response;
+    }
 
     let namespace = req
         .metadata

@@ -22,7 +22,11 @@
 //! from a value this project generated itself and validates the shape of
 //! before use (a `podman` container ID -- see `reconcile::job`'s own
 //! validation) -- never job-supplied text, so there's no equivalent of
-//! `src/cloud_init.rs`'s base64-escaping concern here.
+//! `src/cloud_init.rs`'s base64-escaping concern here. Job-supplied data
+//! that does travel over SSH (a container's resolved env, command and
+//! args -- see `exec_with_stdin`) is only ever the command's *stdin*,
+//! written to a file by a fixed `cat > path` command, never part of the
+//! command line.
 
 use axum::body::Bytes;
 use russh::client::{self, Handle};
@@ -185,6 +189,40 @@ pub async fn exec_once(
     })
 }
 
+/// Runs `command` with `stdin` as its standard input (then EOF), and
+/// otherwise behaves like `exec_once`. Used to deliver a job's container
+/// config (env file, command, args) to its worker without it ever
+/// appearing in the VM's `user_data` (issue #84): `command` is always a
+/// fixed `cat > /run/kube-shim/...` string, the job-supplied bytes are
+/// only ever data on the channel.
+pub async fn exec_with_stdin(
+    host: &str,
+    port: u16,
+    private_key_pem: &str,
+    command: &str,
+    stdin: &[u8],
+) -> Result<ExecOutput, SshError> {
+    let mut channel = connect_and_open_channel(host, port, private_key_pem, command).await?;
+    channel.data(stdin).await?;
+    channel.eof().await?;
+
+    let mut stdout = Vec::new();
+    let mut exit_status = None;
+    while let Some(msg) = channel.wait().await {
+        match msg {
+            ChannelMsg::Data { ref data } => stdout.extend_from_slice(data),
+            ChannelMsg::ExitStatus {
+                exit_status: status,
+            } => exit_status = Some(status),
+            _ => {}
+        }
+    }
+    Ok(ExecOutput {
+        stdout,
+        exit_status,
+    })
+}
+
 /// Runs `command` (typically `podman logs -f {id}`), forwarding each
 /// chunk of stdout to the returned stream as it arrives, rather than
 /// buffering it all before returning -- for live log following. The
@@ -325,6 +363,128 @@ pub(crate) mod tests {
             session.close(channel)?;
             Ok(())
         }
+    }
+
+    /// Every `(command, stdin)` pair an upload mock server received, in
+    /// the order the commands were run.
+    pub(crate) type ReceivedUploads = Arc<StdMutex<Vec<(String, Vec<u8>)>>>;
+
+    /// A mock server for `exec_with_stdin`: records each exec'd command
+    /// together with everything sent on its stdin, and only answers
+    /// (exit status `exit_status`) once the client sends EOF -- the same
+    /// order a real `cat > file` follows.
+    pub(crate) async fn mock_upload_ssh_server(exit_status: u32) -> (String, u16, ReceivedUploads) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+
+        let config = Arc::new(server::Config {
+            keys: vec![PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap()],
+            ..Default::default()
+        });
+        let received: ReceivedUploads = Arc::new(StdMutex::new(Vec::new()));
+        let mut server = UploadTestServer {
+            received: received.clone(),
+            exit_status,
+            current: HashMap::new(),
+        };
+
+        tokio::spawn(async move {
+            server.run_on_socket(config, &listener).await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (addr.ip().to_string(), addr.port(), received)
+    }
+
+    #[derive(Clone)]
+    struct UploadTestServer {
+        received: ReceivedUploads,
+        exit_status: u32,
+        current: HashMap<ChannelId, (String, Vec<u8>)>,
+    }
+
+    impl server::Server for UploadTestServer {
+        type Handler = Self;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> Self {
+            self.clone()
+        }
+    }
+
+    impl server::Handler for UploadTestServer {
+        type Error = russh::Error;
+
+        async fn auth_publickey(
+            &mut self,
+            _user: &str,
+            _key: &russh::keys::ssh_key::PublicKey,
+        ) -> Result<server::Auth, Self::Error> {
+            Ok(server::Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _channel: Channel<Msg>,
+            reply: server::ChannelOpenHandle,
+            _session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
+        }
+
+        async fn exec_request(
+            &mut self,
+            channel: ChannelId,
+            data: &[u8],
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            let command = String::from_utf8_lossy(data).to_string();
+            self.current.insert(channel, (command, Vec::new()));
+            session.channel_success(channel)?;
+            Ok(())
+        }
+
+        async fn data(
+            &mut self,
+            channel: ChannelId,
+            data: &[u8],
+            _session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            if let Some((_, stdin)) = self.current.get_mut(&channel) {
+                stdin.extend_from_slice(data);
+            }
+            Ok(())
+        }
+
+        async fn channel_eof(
+            &mut self,
+            channel: ChannelId,
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            if let Some(upload) = self.current.remove(&channel) {
+                self.received.lock().unwrap().push(upload);
+            }
+            session.exit_status_request(channel, self.exit_status)?;
+            session.eof(channel)?;
+            session.close(channel)?;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_exec_with_stdin_sends_stdin_and_returns_exit_status() {
+        let (host, port, received) = mock_upload_ssh_server(0).await;
+        let key = throwaway_private_key_pem();
+
+        let output = exec_with_stdin(&host, port, &key, "cat > /x", b"A=1\nB=2\n")
+            .await
+            .unwrap();
+
+        assert_eq!(output.exit_status, Some(0));
+        let received = received.lock().unwrap();
+        assert_eq!(
+            received.as_slice(),
+            &[("cat > /x".to_string(), b"A=1\nB=2\n".to_vec())]
+        );
     }
 
     // A slow/streaming variant used by the exec_stream test, kept
