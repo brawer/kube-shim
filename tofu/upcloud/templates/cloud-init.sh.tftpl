@@ -15,9 +15,20 @@ echo "=== kube-shim cloud-init starting at $(date -u) ==="
 
 SERVICE_USER="kube-shim"
 
+# Fully non-interactive: unlike provision.sh (run over SSH by a human who
+# can answer prompts), nobody can answer a debconf or "keep your modified
+# config file?" prompt here, and apt would block forever waiting for one
+# (the likeliest explanation for a real first boot whose cloud-init output
+# stopped mid-upgrade, with SSH never coming up). --force-confdef/
+# --force-confold keep any
+# locally modified config file (e.g. sshd_config, which cloud-init edits).
+export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get upgrade -y
-apt-get install -y curl openssl podman systemd-container
+apt-get upgrade -y \
+    -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
+apt-get install -y \
+    -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+    curl openssl podman systemd-container
 
 echo 'net.ipv4.ip_unprivileged_port_start=80' > /etc/sysctl.d/99-podman-unprivileged-ports.conf
 sysctl --system >/dev/null
