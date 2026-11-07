@@ -171,6 +171,11 @@ const RETRY_ESCALATION_THRESHOLD: i64 = 5 * 60;
 /// runtime, as in Kubernetes.
 const CONTAINER_START_TIMEOUT: i64 = 30 * 60;
 
+/// Reads the end of the worker script's status file, where the DNS
+/// setup, the image pull's errors and "Starting container..." are
+/// (issue #130). The start of the file is volume and podman setup.
+const WORKER_STATUS_COMMAND: &str = "tail -c 4096 /tmp/job-status.txt";
+
 use workload::WORKER_BOOT_DISK_GB;
 
 /// Everything a job-advancing tick needs beyond the database: the real
@@ -1341,6 +1346,7 @@ async fn handle_container_running(
         let now = Utc::now().timestamp();
         let waiting = now - last_transition_time.unwrap_or(created_at);
         if waiting > CONTAINER_START_TIMEOUT && !has_container_id(ctx, &ip).await {
+            record_worker_status(pool, ctx, job_id, namespace, name, &ip).await?;
             force_failed(
                 pool,
                 job_id,
@@ -1451,6 +1457,9 @@ async fn handle_container_running(
 
     record_completion(pool, job_id, exit_code, &logs, actual_cost).await?;
     tracing::info!("job {namespace}/{name}: container finished on {ip}, exit code {exit_code}");
+    if exit_code != 0 {
+        record_worker_status(pool, ctx, job_id, namespace, name, &ip).await?;
+    }
     if exit_code != 0 && logs.trim().is_empty() {
         // Without this, `kubectl logs` on a failed job returns an empty
         // body that looks like a container that printed nothing.
@@ -1471,6 +1480,52 @@ async fn handle_container_running(
     } else {
         "Failed"
     }))
+}
+
+/// Records the end of the worker's `/tmp/job-status.txt` as a
+/// `WorkerStatus` warning event, for a job that failed or never started
+/// its container (issue #130). It holds what the container's own logs
+/// can't: a failed image pull, the DNS servers the container was given
+/// and whether the container was started at all. Best-effort: a worker
+/// that can't be read just leaves no event.
+async fn record_worker_status(
+    pool: &SqlitePool,
+    ctx: &JobContext,
+    job_id: &str,
+    namespace: &str,
+    name: &str,
+    ip: &str,
+) -> Result<()> {
+    let output = match ssh::exec_once(
+        ip,
+        ctx.worker_ssh_port,
+        &ctx.worker_ssh_private_key,
+        WORKER_STATUS_COMMAND,
+    )
+    .await
+    {
+        Ok(output) if output.exit_status == Some(0) => output,
+        Ok(_) => return Ok(()),
+        Err(err) => {
+            tracing::warn!(
+                "job {namespace}/{name}: reading the worker status from {ip} failed: {err}"
+            );
+            return Ok(());
+        }
+    };
+    let status = String::from_utf8_lossy(&output.stdout);
+    let status = status.trim();
+    if status.is_empty() {
+        return Ok(());
+    }
+    record_event(
+        pool,
+        Some(job_id),
+        "WorkerStatus",
+        &format!("worker status (/tmp/job-status.txt):\n{status}"),
+        "Warning",
+    )
+    .await
 }
 
 /// Whether the worker has written a container ID. An SSH error counts
@@ -2993,6 +3048,80 @@ mod tests {
         assert_eq!(next_state("Failed"), Some("VolumeDetaching"));
     }
 
+    async fn worker_status_events(pool: &SqlitePool) -> Vec<(String, String)> {
+        sqlx::query_as("SELECT message, type FROM events WHERE reason = 'WorkerStatus'")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_failed_container_records_worker_status_event() {
+        // Issue #130: the status file says what the container's own logs
+        // can't, such as the DNS servers it was given.
+        let mut responses = HashMap::new();
+        responses.insert("cat /tmp/exit-code", ("1", 0));
+        responses.insert("cat /tmp/container-id.txt", ("abc123", 0));
+        responses.insert("podman logs abc123", ("dns error\n", 0));
+        responses.insert(
+            WORKER_STATUS_COMMAND,
+            (
+                "Container DNS servers: 94.237.127.9\nStarting container...\n",
+                0,
+            ),
+        );
+        let (host, port) = crate::ssh::tests::mock_ssh_server(responses).await;
+        let mut ctx = mock_ctx(false);
+        ctx.worker_ssh_port = port;
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_job_with_ssh_ip(&pool, "ContainerRunning", &host).await;
+        assert_eq!(advance_all(&pool, &ctx).await.unwrap(), 1);
+
+        let events = worker_status_events(&pool).await;
+        assert_eq!(events.len(), 1);
+        let (message, event_type) = &events[0];
+        assert_eq!(event_type, "Warning");
+        assert!(message.contains("Container DNS servers: 94.237.127.9"));
+        assert!(message.contains("Starting container..."));
+    }
+
+    #[tokio::test]
+    async fn test_succeeded_container_records_no_worker_status_event() {
+        let mut responses = HashMap::new();
+        responses.insert("cat /tmp/exit-code", ("0", 0));
+        responses.insert("cat /tmp/container-id.txt", ("abc123", 0));
+        responses.insert("podman logs abc123", ("ok\n", 0));
+        responses.insert(WORKER_STATUS_COMMAND, ("Starting container...\n", 0));
+        let (host, port) = crate::ssh::tests::mock_ssh_server(responses).await;
+        let mut ctx = mock_ctx(false);
+        ctx.worker_ssh_port = port;
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_job_with_ssh_ip(&pool, "ContainerRunning", &host).await;
+        assert_eq!(advance_all(&pool, &ctx).await.unwrap(), 1);
+
+        assert!(worker_status_events(&pool).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_failed_container_without_status_file_records_no_event() {
+        let mut responses = HashMap::new();
+        responses.insert("cat /tmp/exit-code", ("1", 0));
+        responses.insert("cat /tmp/container-id.txt", ("abc123", 0));
+        responses.insert("podman logs abc123", ("boom\n", 0));
+        responses.insert(WORKER_STATUS_COMMAND, ("", 1));
+        let (host, port) = crate::ssh::tests::mock_ssh_server(responses).await;
+        let mut ctx = mock_ctx(false);
+        ctx.worker_ssh_port = port;
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_job_with_ssh_ip(&pool, "ContainerRunning", &host).await;
+        assert_eq!(advance_all(&pool, &ctx).await.unwrap(), 1);
+
+        assert!(worker_status_events(&pool).await.is_empty());
+    }
+
     #[tokio::test]
     async fn test_container_never_started_reports_start_error_as_logs() {
         // runAsNonRoot's image check refused to start the container.
@@ -3689,6 +3818,37 @@ mod tests {
         let (status, last_error) = job_status_and_error(&pool).await;
         assert_eq!(status, "Failed");
         assert!(last_error.unwrap().contains("ContainerNeverStarted"));
+    }
+
+    #[tokio::test]
+    async fn test_container_never_started_records_worker_status_event() {
+        // Issue #130: a stuck pull is otherwise indistinguishable from a
+        // silent container.
+        let mut responses = HashMap::new();
+        responses.insert(
+            WORKER_STATUS_COMMAND,
+            (
+                "Starting container...\nTrying to pull docker.io/library/busybox:1.36.1...\n",
+                0,
+            ),
+        );
+        let (host, port) = crate::ssh::tests::mock_ssh_server(responses).await;
+        let mut ctx = mock_ctx(false);
+        ctx.worker_ssh_port = port;
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = Utc::now().timestamp();
+        let entered = now - (CONTAINER_START_TIMEOUT + 1);
+        insert_running_job(&pool, &host, entered - 60, entered, 86400).await;
+
+        advance_all(&pool, &ctx).await.unwrap();
+        let (status, _) = job_status_and_error(&pool).await;
+        assert_eq!(status, "Failed");
+        let events = worker_status_events(&pool).await;
+        assert_eq!(events.len(), 1);
+        assert!(events[0]
+            .0
+            .contains("Trying to pull docker.io/library/busybox"));
     }
 
     #[tokio::test]
