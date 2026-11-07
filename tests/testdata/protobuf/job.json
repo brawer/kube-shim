@@ -1,0 +1,103 @@
+{
+  "kind": "Job",
+  "apiVersion": "batch/v1",
+  "metadata": {
+    "name": "osmdiffs-manual",
+    "namespace": "default",
+    "creationTimestamp": null
+  },
+  "spec": {
+    "activeDeadlineSeconds": 57600,
+    "backoffLimit": 1,
+    "template": {
+      "metadata": {
+        "creationTimestamp": null
+      },
+      "spec": {
+        "volumes": [
+          {
+            "name": "scratch",
+            "ephemeral": {
+              "volumeClaimTemplate": {
+                "metadata": {
+                  "creationTimestamp": null
+                },
+                "spec": {
+                  "accessModes": [
+                    "ReadWriteOnce"
+                  ],
+                  "resources": {
+                    "requests": {
+                      "storage": "250Gi"
+                    }
+                  },
+                  "storageClassName": "kube-shim-fast"
+                }
+              }
+            }
+          }
+        ],
+        "containers": [
+          {
+            "name": "osmdiffs",
+            "image": "ghcr.io/brawer/osmdiffs:latest",
+            "args": [
+              "run",
+              "--workdir",
+              "/scratch",
+              "--run_id",
+              "$(RUN_ID)"
+            ],
+            "envFrom": [
+              {
+                "secretRef": {
+                  "name": "osmdiffs-s3-credentials"
+                }
+              }
+            ],
+            "env": [
+              {
+                "name": "RUN_ID",
+                "valueFrom": {
+                  "fieldRef": {
+                    "fieldPath": "metadata.name"
+                  }
+                }
+              }
+            ],
+            "resources": {
+              "limits": {
+                "cpu": "6",
+                "memory": "8Gi"
+              },
+              "requests": {
+                "cpu": "6",
+                "memory": "8Gi"
+              }
+            },
+            "volumeMounts": [
+              {
+                "name": "scratch",
+                "mountPath": "/scratch",
+                "mountPropagation": "None"
+              }
+            ],
+            "terminationMessagePath": "/dev/termination-log",
+            "terminationMessagePolicy": "File",
+            "securityContext": {
+              "privileged": false,
+              "readOnlyRootFilesystem": true
+            }
+          }
+        ],
+        "restartPolicy": "Never",
+        "terminationGracePeriodSeconds": 30,
+        "dnsPolicy": "ClusterFirst",
+        "securityContext": {
+          "fsGroup": 1000
+        }
+      }
+    }
+  },
+  "status": {}
+}

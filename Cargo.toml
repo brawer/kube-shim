@@ -66,6 +66,10 @@ russh = { version = "0.63", default-features = false, features = ["ring", "rsa",
 # hands-on against the real live feed -- nested <Cube> elements, not a
 # flat list), via the `serde` feature rather than a hand-rolled parser.
 quick-xml = { version = "0.36", features = ["serialize"] }
+# Issue #106: decodes Kubernetes protobuf request bodies (what client-go,
+# and so the hashicorp/kubernetes OpenTofu provider, sends) from the
+# descriptors build.rs compiles -- see src/k8s_protobuf.rs.
+prost-reflect = "0.16"
 
 [dev-dependencies]
 rcgen = "0.13"
@@ -77,3 +81,8 @@ tempfile = "3"
 # (verified via `cargo tree`) -- a mismatched rand_core major version fails
 # to compile against PrivateKey::random's CryptoRng bound.
 rand = "0.10"
+
+[build-dependencies]
+# Compiles proto/'s vendored Kubernetes .proto files in pure Rust, so no
+# protoc is needed in CI, the Containerfile or on developer machines.
+protox = "0.10"

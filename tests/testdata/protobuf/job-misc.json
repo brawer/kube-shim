@@ -1,0 +1,139 @@
+{
+  "kind": "Job",
+  "apiVersion": "batch/v1",
+  "metadata": {
+    "name": "misc",
+    "creationTimestamp": "2026-11-07T01:02:03Z",
+    "labels": {
+      "app": "misc"
+    },
+    "annotations": {
+      "note": ""
+    }
+  },
+  "spec": {
+    "activeDeadlineSeconds": 60,
+    "template": {
+      "metadata": {
+        "creationTimestamp": null
+      },
+      "spec": {
+        "volumes": [
+          {
+            "name": "scratch",
+            "ephemeral": {
+              "volumeClaimTemplate": {
+                "metadata": {
+                  "creationTimestamp": null
+                },
+                "spec": {
+                  "accessModes": [
+                    "ReadWriteOnce"
+                  ],
+                  "resources": {
+                    "requests": {
+                      "storage": "250Gi"
+                    }
+                  },
+                  "storageClassName": "kube-shim-fast"
+                }
+              }
+            }
+          },
+          {
+            "name": "tmp",
+            "emptyDir": {
+              "sizeLimit": "1500m"
+            }
+          }
+        ],
+        "containers": [
+          {
+            "name": "osmdiffs",
+            "image": "ghcr.io/brawer/osmdiffs:latest",
+            "args": [
+              "run",
+              "--workdir",
+              "/scratch",
+              "--run_id",
+              "$(RUN_ID)"
+            ],
+            "ports": [
+              {
+                "name": "http",
+                "containerPort": 8080,
+                "protocol": "TCP"
+              }
+            ],
+            "envFrom": [
+              {
+                "secretRef": {
+                  "name": "osmdiffs-s3-credentials"
+                }
+              }
+            ],
+            "env": [
+              {
+                "name": "RUN_ID",
+                "valueFrom": {
+                  "fieldRef": {
+                    "fieldPath": "metadata.name"
+                  }
+                }
+              }
+            ],
+            "resources": {
+              "limits": {
+                "cpu": "6",
+                "memory": "8Gi"
+              },
+              "requests": {
+                "cpu": "6",
+                "memory": "8Gi"
+              }
+            },
+            "volumeMounts": [
+              {
+                "name": "scratch",
+                "mountPath": "/scratch",
+                "mountPropagation": "None"
+              }
+            ],
+            "livenessProbe": {
+              "httpGet": {
+                "path": "/healthz",
+                "port": "http"
+              },
+              "initialDelaySeconds": 5
+            },
+            "readinessProbe": {
+              "tcpSocket": {
+                "port": 8080
+              }
+            },
+            "terminationMessagePath": "/dev/termination-log",
+            "terminationMessagePolicy": "File",
+            "securityContext": {
+              "privileged": false,
+              "readOnlyRootFilesystem": true
+            }
+          }
+        ],
+        "restartPolicy": "Never",
+        "terminationGracePeriodSeconds": 30,
+        "dnsPolicy": "ClusterFirst",
+        "securityContext": {
+          "fsGroup": 1000
+        },
+        "tolerations": [
+          {
+            "key": "k",
+            "operator": "Exists",
+            "tolerationSeconds": 0
+          }
+        ]
+      }
+    }
+  },
+  "status": {}
+}

@@ -38,7 +38,11 @@ WORKDIR /build
 # db.sqlite someone happened to have on disk) the way a denylist
 # (.dockerignore) could if it ever falls out of sync with what actually
 # exists locally.
-COPY Cargo.toml Cargo.lock .
+COPY Cargo.toml Cargo.lock build.rs .
+# The vendored Kubernetes .proto files and Go field table build.rs and
+# src/k8s_protobuf.rs compile in (issue #106); protox compiles them in
+# pure Rust, so no protoc is needed here.
+COPY proto proto
 COPY src src
 COPY tests tests
 # Only the one file src/cloud_init.rs actually embeds via include_str! at
