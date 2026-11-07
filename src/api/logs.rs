@@ -17,11 +17,13 @@
 //! `timestamps`, `tailLines`, `sinceSeconds`/`sinceTime` and `limitBytes`
 //! work as in Kubernetes (issue #131), on both paths: cached logs are
 //! stored with podman's per-line timestamps, which are stripped unless
-//! asked for, and the live path asks podman for them only when needed.
-//! See `api::log_filter`. `previous=true` and `stream` other than `All`
+//! asked for. The live path always asks podman for them too, because
+//! stdout and stderr arrive over SSH as separate streams and are put
+//! back in time order by those timestamps (issue #139). See
+//! `api::log_filter`. `previous=true` and `stream` other than `All`
 //! are rejected rather than ignored.
 
-use crate::api::log_filter::LogFilter;
+use crate::api::log_filter::{self, LogFilter};
 use crate::k8s_status;
 use crate::ssh::{self, WorkerSshConfig};
 use axum::body::Body;
@@ -147,21 +149,14 @@ impl LogOptions {
         }
     }
 
-    /// Whether the live `podman logs` call needs `--timestamps`: to show
-    /// them, or to filter on them.
-    fn needs_timestamps(&self) -> bool {
-        self.timestamps || self.since.is_some()
-    }
-
-    /// The live `podman logs` command for `container_id`.
+    /// The live `podman logs` command for `container_id`. Always with
+    /// `--timestamps`, to merge stdout and stderr in time order.
     fn podman_command(&self, container_id: &str) -> String {
         let mut command = "podman logs".to_string();
         if self.follow {
             command.push_str(" -f");
         }
-        if self.needs_timestamps() {
-            command.push_str(" --timestamps");
-        }
+        command.push_str(" --timestamps");
         if let Some(n) = self.tail_lines {
             command.push_str(&format!(" --tail {n}"));
         }
@@ -253,7 +248,7 @@ pub async fn get_pod_log(
         let ip = job.worker_ssh_ip.as_deref().unwrap();
         if let Some(container_id) = live_container_id(ip, &ssh_config).await {
             let command = options.podman_command(&container_id);
-            let filter = options.filter(options.needs_timestamps());
+            let filter = options.filter(true);
 
             if options.follow {
                 match ssh::exec_stream(ip, ssh_config.port, &ssh_config.private_key, &command).await
@@ -281,7 +276,10 @@ pub async fn get_pod_log(
                             StatusCode::OK,
                             [("content-type", "text/plain; charset=utf-8")],
                             // podman already applied --tail.
-                            filter.apply(&output.combined, None),
+                            filter.apply(
+                                &log_filter::merge_by_timestamp(&[&output.stdout, &output.stderr]),
+                                None,
+                            ),
                         )
                             .into_response();
                     }
@@ -416,6 +414,23 @@ mod tests {
         let (status, body) = body_of(router, log_request("done-job", false)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "first\nsecond\nthird\n");
+    }
+
+    #[tokio::test]
+    async fn test_cached_logs_from_v0_4_2_are_sorted_by_timestamp() {
+        // Cached by v0.4.2, before issue #139: all of stdout, then stderr.
+        let logs = "2026-11-07T12:30:32.473409000Z first line\n\
+                    2026-11-07T12:30:33.473398000Z second line\n\
+                    2026-11-07T12:30:43.489121000Z timed out\n\
+                    2026-11-07T12:30:33.473721000Z to stderr\n";
+        let router = archived_job_router(logs, true).await;
+        let (status, body) = body_of(router, log_request("done-job", false)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "first line\nsecond line\nto stderr\ntimed out\n");
+
+        let router = archived_job_router(logs, true).await;
+        let (_, body) = body_of(router, log_request_query("done-job", "tailLines=1")).await;
+        assert_eq!(body, "timed out\n");
     }
 
     #[tokio::test]
@@ -635,7 +650,10 @@ mod tests {
     async fn test_live_one_shot_fetch_while_container_running() {
         let mut responses = HashMap::new();
         responses.insert("cat /tmp/container-id.txt", ("abc123", 0));
-        responses.insert("podman logs abc123", ("live output\n", 0));
+        responses.insert(
+            "podman logs --timestamps abc123",
+            ("2026-11-07T10:26:27+00:00 live output\n", 0),
+        );
         let (host, port) = crate::ssh::tests::mock_ssh_server(responses).await;
 
         let pool = crate::db::init_pool(":memory:").await.unwrap();
@@ -698,6 +716,9 @@ mod tests {
         let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     }
 
+    /// `running_job_router_with_logs`' output, merged in time order.
+    const IN_TIME_ORDER: &str = "first line\nsecond line\nto stderr\nnameserver 94.237.127.9\n";
+
     async fn running_job_router_with_logs(follow_command: &'static str) -> axum::Router {
         use crate::ssh::tests::MockOut;
         let mut responses = HashMap::new();
@@ -707,7 +728,19 @@ mod tests {
         );
         responses.insert(
             follow_command,
-            (vec![MockOut::Stdout("out\n"), MockOut::Stderr("err\n")], 0),
+            (
+                vec![
+                    // Issue #139: SSH delivers all of stdout before
+                    // stderr's line that was written in between.
+                    MockOut::Stdout(
+                        "2026-11-07T12:30:32.473409+00:00 first line\n\
+                         2026-11-07T12:30:33.473398+00:00 second line\n\
+                         2026-11-07T12:30:33.475578+00:00 nameserver 94.237.127.9\n",
+                    ),
+                    MockOut::Stderr("2026-11-07T12:30:33.473721+00:00 to stderr\n"),
+                ],
+                0,
+            ),
         );
         let (host, port) = crate::ssh::tests::mock_ssh_server_with_output(responses).await;
 
@@ -729,8 +762,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_live_one_shot_fetch_includes_stderr() {
-        let router = running_job_router_with_logs("podman logs abc123").await;
+    async fn test_live_one_shot_fetch_includes_stderr_in_time_order() {
+        let router = running_job_router_with_logs("podman logs --timestamps abc123").await;
 
         let response = router
             .oneshot(log_request("running-job", false))
@@ -738,12 +771,12 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(body, "out\nerr\n");
+        assert_eq!(body, IN_TIME_ORDER);
     }
 
     #[tokio::test]
-    async fn test_live_follow_includes_stderr() {
-        let router = running_job_router_with_logs("podman logs -f abc123").await;
+    async fn test_live_follow_includes_stderr_in_time_order() {
+        let router = running_job_router_with_logs("podman logs -f --timestamps abc123").await;
 
         let response = router
             .oneshot(log_request("running-job", true))
@@ -751,7 +784,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(body, "out\nerr\n");
+        assert_eq!(body, IN_TIME_ORDER);
     }
 
     #[tokio::test]
