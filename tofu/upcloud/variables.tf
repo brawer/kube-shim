@@ -33,37 +33,18 @@ variable "plan" {
   description = <<-EOT
     UpCloud server plan for the kube-shim host itself (not the worker
     VMs it provisions on demand, which are sized per job). The shim is
-    an HTTP server plus a SQLite database, so the smallest plan is
-    enough. The default, STARTER-1xCPU-1GB, costs about EUR 3.26/month.
-    "1xCPU-1GB" is a legacy plan UpCloud no longer sells, at about
-    EUR 8.26/month; keep it only for a host created with it (see
-    README.md's "Plan and boot disk"). For a plan the module doesn't
-    know, also set storage_size and storage_tier.
+    an HTTP server plus a SQLite database, so STARTER-1xCPU-1GB (the
+    default, about EUR 3.26/month, with a 10 GB disk) is always enough.
+    The only other choice is "1xCPU-1GB", a legacy plan UpCloud no
+    longer sells, at about EUR 8.26/month: keep it only for a host
+    created with it (see README.md's "Plan and boot disk").
   EOT
   type        = string
   default     = "STARTER-1xCPU-1GB"
-}
-
-variable "storage_size" {
-  description = <<-EOT
-    Size of the host's boot disk in GB. Leave null (default) to use the
-    storage the plan includes, so UpCloud bills the disk as part of the
-    plan. Set it, together with storage_tier, only for a plan the module
-    doesn't know. A disk bigger than the plan's storage, or on another
-    tier, is billed on top of the plan.
-  EOT
-  type        = number
-  default     = null
-}
-
-variable "storage_tier" {
-  description = "Storage tier of the host's boot disk, \"standard\" or \"maxiops\". Leave null (default) to use the plan's tier; see storage_size."
-  type        = string
-  default     = null
 
   validation {
-    condition     = var.storage_tier == null ? true : contains(["standard", "maxiops"], var.storage_tier)
-    error_message = "storage_tier must be \"standard\" or \"maxiops\"."
+    condition     = contains(["STARTER-1xCPU-1GB", "1xCPU-1GB"], var.plan)
+    error_message = "plan must be \"STARTER-1xCPU-1GB\", or \"1xCPU-1GB\" for a host created with it."
   }
 }
 

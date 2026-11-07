@@ -133,7 +133,7 @@ provisioners by default.
 
 What still needs a new server: anything cloud-init itself sets up
 (packages, sysctls, the service user), the zone, the plan, and the
-disk (see "Plan and boot disk" for moving a host to another plan).
+disk (see "Plan and boot disk" for moving a host to the cheaper plan).
 Changes to those in `cloud-init.sh.tftpl` only reach hosts created
 after them. To rebuild on purpose:
 
@@ -151,8 +151,7 @@ cleanup).
 
 The host's boot disk is exactly the storage its plan includes, so
 UpCloud bills it as part of the plan (`part_of_plan: "yes"` in
-`GET /1.3/server/{uuid}`). A disk that's bigger, or on another tier,
-is billed on top of the plan.
+`GET /1.3/server/{uuid}`).
 
 | `plan`              | Boot disk        | Host cost (`de-fra1`, 730 h)               |
 | ------------------- | ---------------- | ------------------------------------------ |
@@ -160,18 +159,11 @@ is billed on top of the plan.
 | `1xCPU-1GB`         | 25 GB `maxiops`  | 1.1309 cents/h, ~EUR 8.26/month            |
 
 Prices are as of November 2026 (issue #143); check them for your
-zone. `1xCPU-1GB` is a legacy plan: UpCloud no longer sells it
-(`current_offering: "no"` in `GET /1.3/plan`), and it was this module's
-default up to v0.4.3. Keep it only for a host that already runs on it.
-Before making a plan the default, check that it has
-`current_offering: "yes"`, so a legacy plan doesn't become the default
-by accident.
-
-The module knows the storage of the two plans above. For any other
-plan, also set `storage_size` and `storage_tier` to that plan's
-`storage_size` and `storage_tier` from `GET /1.3/plan` (or
-`upctl server plans`). Without them, `tofu plan` stops with an error
-rather than guess.
+zone. These are the only two plans the module accepts.
+`STARTER-1xCPU-1GB` is always enough for kube-shim. `1xCPU-1GB` is a
+legacy plan: UpCloud no longer sells it (`current_offering: "no"` in
+`GET /1.3/plan`), and it was this module's default up to v0.4.3. Keep
+it only for a host that already runs on it.
 
 kube-shim itself needs little: on `1xCPU-1GB`, kube-shim.brawer.ch uses
 3.6 GB of its disk (the OS, about 140 MB of container images, and under
@@ -193,10 +185,9 @@ before you bump `source`. `tofu plan` should then show no change to
 `upcloud_server.kube_shim`. If it says the server "must be replaced",
 stop and don't apply.
 
-### Moving an existing host to another plan
+### Moving an existing host to `STARTER-1xCPU-1GB`
 
-Moving to a plan with a smaller disk or another storage tier, such as
-from `1xCPU-1GB` to `STARTER-1xCPU-1GB`, replaces the server: a
+Moving from `1xCPU-1GB` to `STARTER-1xCPU-1GB` replaces the server: a
 template disk can't shrink, and its tier can't change in place. That
 means new IP addresses, and the old disk is deleted with the old
 server. OpenTofu destroys the old server before it creates the new one,
@@ -213,9 +204,9 @@ so copy the data off first:
    ssh admin@OLD_IP sudo tar -C /home/kube-shim -czpf - kube-shim-data > kube-shim-data.tgz
    ```
 
-3. Set the new `plan` (or remove `plan = "1xCPU-1GB"` to get the
-   default) and `tofu apply`. Check that the plan replaces only
-   `upcloud_server.kube_shim` and the resources that depend on it.
+3. Remove `plan = "1xCPU-1GB"` and `tofu apply`. Check that the plan
+   replaces only `upcloud_server.kube_shim` and the resources that
+   depend on it.
 4. Point DNS at the new `public_ipv4`/`public_ipv6` outputs (see
    "First apply: DNS").
 5. Put the data back and restart:

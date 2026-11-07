@@ -89,16 +89,14 @@ locals {
   )
 }
 
-# The storage each known plan includes, from UpCloud's GET /1.3/plan.
-# Add a plan here only after checking it there.
+# The storage each plan in var.plan's validation includes, from
+# UpCloud's GET /1.3/plan.
 locals {
   plan_storage = {
     "STARTER-1xCPU-1GB" = { size = 10, tier = "standard" }
     # Legacy (current_offering: "no"), for hosts created with it.
     "1xCPU-1GB" = { size = 25, tier = "maxiops" }
   }
-  storage_size = var.storage_size != null ? var.storage_size : try(local.plan_storage[var.plan].size, null)
-  storage_tier = var.storage_tier != null ? var.storage_tier : try(local.plan_storage[var.plan].tier, null)
 }
 
 resource "upcloud_server" "kube_shim" {
@@ -116,8 +114,8 @@ resource "upcloud_server" "kube_shim" {
   # in place.
   template {
     storage = "Ubuntu Server 24.04 LTS (Noble Numbat)"
-    size    = local.storage_size
-    tier    = local.storage_tier
+    size    = local.plan_storage[var.plan].size
+    tier    = local.plan_storage[var.plan].tier
   }
 
   # Dual-stack: two separate "public" interfaces, not one interface
@@ -164,11 +162,6 @@ resource "upcloud_server" "kube_shim" {
 
   lifecycle {
     ignore_changes = [user_data]
-
-    precondition {
-      condition     = local.storage_size != null && local.storage_tier != null
-      error_message = "The module doesn't know the storage included in plan \"${var.plan}\". Set storage_size and storage_tier to that plan's storage_size and storage_tier (GET /1.3/plan, or `upctl server plans`)."
-    }
   }
 }
 
