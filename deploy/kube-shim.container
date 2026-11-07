@@ -29,6 +29,14 @@ Volume=%h/kube-shim-data:/data:Z
 # host-side publish uses the real, public 443/80.
 PublishPort=443:8443
 PublishPort=80:8080
+# kube-shim stops on SIGTERM (issue #118): the HTTP listeners drain for up
+# to 5 s and the reconciliation loop finishes the step it is on, which
+# can wait for a cloud API call. main.rs gives up after 45 s, so allow 60
+# before podman resorts to SIGKILL (its default is 10). This is
+# PodmanArgs rather than StopTimeout= because the hosts' podman 4.9
+# quadlet doesn't know that key yet. It must stay below systemd's
+# TimeoutStopSec (90 s by default).
+PodmanArgs=--stop-timeout=60
 
 [Service]
 Restart=on-failure

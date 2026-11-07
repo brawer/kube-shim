@@ -3,10 +3,20 @@ use clap::Parser;
 use kube_shim::providers::upcloud::UpCloudProvider;
 use kube_shim::providers::CloudProvider;
 use kube_shim::reconcile::JobContext;
+use kube_shim::shutdown::{self, Shutdown, ShutdownTrigger};
 use kube_shim::{acme, api, app, config, db, metadata, pricing, reconcile, ssh, tls, workload};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Notify;
+
+/// How long `main` waits, after a shutdown signal, for the reconciliation
+/// loops to reach a safe point (issue #118). A job step can make a cloud
+/// API call that takes up to its 30s request timeout, so this is longer
+/// than that. Must stay below `--stop-timeout` in deploy/kube-shim.container
+/// so podman never has to resort to SIGKILL.
+const RECONCILE_DRAIN_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Parser, Debug)]
 #[command(name = "kube-shim")]
@@ -22,6 +32,23 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
+
+    // Installed first, before anything slow: kube-shim is PID 1 in its
+    // container, where a signal without a handler does nothing at all.
+    let mut signals = shutdown::Signals::install()?;
+    let (trigger, shutdown) = shutdown::channel();
+    let trigger = Arc::new(trigger);
+    tokio::spawn({
+        let trigger = trigger.clone();
+        async move {
+            let name = signals.recv().await;
+            tracing::info!("received {name}, shutting down");
+            trigger.trigger();
+            let name = signals.recv().await;
+            tracing::warn!("received {name} again, exiting immediately");
+            std::process::exit(1);
+        }
+    });
 
     let args = Args::parse();
     tracing::info!("Loading configuration from: {}", args.config);
@@ -53,7 +80,10 @@ async fn main() -> Result<()> {
     // implementation, not a hardcoded literal.
     let provider_name = upcloud.provider_name().to_string();
     let invoice_issuer_name = upcloud.invoice_issuer_name().to_string();
-    match upcloud.check_connectivity().await {
+    let Some(connectivity) = unless_shutdown(&shutdown, upcloud.check_connectivity()).await else {
+        return Ok(());
+    };
+    match connectivity {
         Ok(()) => tracing::info!("UpCloud connectivity check succeeded"),
         Err(err) => tracing::warn!("UpCloud connectivity check failed (continuing anyway): {err}"),
     }
@@ -64,7 +94,9 @@ async fn main() -> Result<()> {
     // Best-effort like the connectivity check above: `None` just means a
     // freshly created worker VM gets no inbound SSH access at all (see
     // src/metadata.rs's own docs), never a startup failure.
-    let own_public_ip = metadata::own_public_ipv4().await;
+    let Some(own_public_ip) = unless_shutdown(&shutdown, metadata::own_public_ipv4()).await else {
+        return Ok(());
+    };
     match &own_public_ip {
         Some(ip) => tracing::info!("shim's own public IPv4: {ip}"),
         None => tracing::warn!(
@@ -109,7 +141,15 @@ async fn main() -> Result<()> {
         tracing::info!(
             "No cached pricing/exchange rates yet (first boot) -- syncing once before starting"
         );
-        reconcile::pricing::sync_pricing_and_rates(&pool, &job_context).await?;
+        let synced = unless_shutdown(
+            &shutdown,
+            reconcile::pricing::sync_pricing_and_rates(&pool, &job_context),
+        )
+        .await;
+        let Some(synced) = synced else {
+            return Ok(());
+        };
+        synced?;
     }
 
     // Phase 14b: seeds the rolling budget guard's DB-backed settings
@@ -131,11 +171,12 @@ async fn main() -> Result<()> {
     // real signal -- whether this loop is actually still ticking --
     // rather than a hardcoded 200.
     let tick_health = Arc::new(reconcile::TickHealth::new());
-    tokio::spawn(reconcile::run(
+    let reconcile_loops = tokio::spawn(reconcile::run(
         pool.clone(),
         notify.clone(),
         job_context,
         tick_health.clone(),
+        shutdown.clone(),
     ));
 
     // Build router. The worker SSH private key is handed in separately
@@ -162,11 +203,53 @@ async fn main() -> Result<()> {
         tick_health,
     );
 
-    let addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port)
+    let served = serve(&cfg.server, router, shutdown).await;
+    if let Err(err) = &served {
+        tracing::error!("HTTP server stopped: {err:?}");
+    }
+    finish(trigger, reconcile_loops).await;
+    served
+}
+
+/// Runs a startup step, giving up early if shutdown is requested first.
+/// Only used for steps that change no cloud resources (connectivity
+/// checks, the first pricing sync, waiting for a certificate), so
+/// abandoning one halfway is safe.
+async fn unless_shutdown<T>(shutdown: &Shutdown, step: impl Future<Output = T>) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = shutdown.requested() => {
+            tracing::info!("shutdown requested during startup; exiting");
+            None
+        }
+        value = step => Some(value),
+    }
+}
+
+/// Stops the reconciliation loops (if they aren't stopping already) and
+/// waits up to `RECONCILE_DRAIN_TIMEOUT` for them to reach a safe point.
+async fn finish(trigger: Arc<ShutdownTrigger>, reconcile_loops: tokio::task::JoinHandle<()>) {
+    trigger.trigger();
+    match tokio::time::timeout(RECONCILE_DRAIN_TIMEOUT, reconcile_loops).await {
+        Ok(Ok(())) => tracing::info!("shutdown complete"),
+        Ok(Err(err)) => tracing::error!("reconciliation loop ended abnormally: {err}"),
+        Err(_) => tracing::warn!(
+            "reconciliation loops still busy after {RECONCILE_DRAIN_TIMEOUT:?}; exiting anyway"
+        ),
+    }
+}
+
+/// Serves the API until `shutdown` is requested, then lets in-flight
+/// requests finish (see `shutdown::HTTP_DRAIN_TIMEOUT`) and returns.
+async fn serve(cfg: &config::ServerConfig, router: axum::Router, shutdown: Shutdown) -> Result<()> {
+    let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port)
         .parse()
         .context("Invalid server host/port")?;
 
-    match &cfg.server.hostname {
+    let handle = axum_server::Handle::new();
+    shutdown::graceful_on_shutdown(handle.clone(), shutdown.clone());
+
+    match &cfg.hostname {
         Some(hostname) => {
             // Real, CA-trusted certificate via ACME (Let's Encrypt),
             // Caddy-like -- see docs/IMPLEMENTATION_PLAN.md Phase 4. Blocks
@@ -179,13 +262,19 @@ async fn main() -> Result<()> {
             // certificate -- issuance depends on that responder already
             // being reachable, so starting it only *after* setup()
             // returned would deadlock.
-            let acceptor = acme::setup(&cfg.server).await?;
+            let Some(acceptor) =
+                unless_shutdown(&shutdown, acme::setup(cfg, shutdown.clone())).await
+            else {
+                return Ok(());
+            };
+            let acceptor = acceptor?;
 
             tracing::info!(
                 "Server listening on https://{} (ACME cert for {hostname})",
                 addr
             );
             axum_server::bind(addr)
+                .handle(handle)
                 .acceptor(acceptor)
                 .serve(router.into_make_service())
                 .await
@@ -197,13 +286,13 @@ async fn main() -> Result<()> {
             tracing::info!(
                 "No server.hostname configured; using self-signed certificate (local dev/CI)"
             );
-            let tls_config =
-                tls::load_tls_config(&cfg.server.tls_cert_path, &cfg.server.tls_key_path)
-                    .await
-                    .context("Failed to load TLS configuration")?;
+            let tls_config = tls::load_tls_config(&cfg.tls_cert_path, &cfg.tls_key_path)
+                .await
+                .context("Failed to load TLS configuration")?;
 
             tracing::info!("Server listening on https://{}", addr);
             axum_server::bind_rustls(addr, tls_config)
+                .handle(handle)
                 .serve(router.into_make_service())
                 .await
                 .context("Server error")?;

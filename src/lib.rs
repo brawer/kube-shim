@@ -18,6 +18,7 @@ pub mod pricing;
 pub mod providers;
 pub mod reconcile;
 pub mod run_options;
+pub mod shutdown;
 pub mod ssh;
 pub mod status_page;
 pub mod tls;
