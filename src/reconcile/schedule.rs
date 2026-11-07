@@ -5,10 +5,10 @@
 //! at all.
 
 use crate::pricing;
-use crate::reconcile::job::{active_deadline_seconds, record_event};
+use crate::reconcile::job::{active_deadline_seconds, is_pre_completion_state, record_event};
 use crate::reconcile::JobContext;
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use cron::Schedule;
 use serde_json::Value as JsonValue;
 use sqlx::{Row, SqlitePool};
@@ -32,10 +32,21 @@ fn to_six_field(schedule: &str) -> String {
 /// matters: if the shim was down for a while and several instants were
 /// missed, this deliberately catches up with a single run rather than
 /// bursting one per missed instant (mirrors real Kubernetes' own
-/// "coalesce missed schedules" behavior for `Allow`-policy CronJobs,
-/// though this project only ever behaves as if `concurrencyPolicy: Allow`
-/// -- there's no support for `Forbid`/`Replace` here, since nothing else
-/// in this plan gives a reason to need them).
+/// "coalesce missed schedules" behavior).
+///
+/// Issue #105 adds the scheduling fields of `CronJobSpec`, with
+/// Kubernetes' semantics:
+///
+/// - **`suspend: true`** creates no new runs; runs already started keep
+///   going. Instants that pass while suspended count as missed, so on
+///   unsuspending, the usual catch-up applies (subject to the deadline).
+/// - **`startingDeadlineSeconds`** drops a due instant once it's more
+///   than that many seconds old -- see `is_due`.
+/// - **`concurrencyPolicy: Forbid`** holds a due run back while an
+///   earlier run of the same CronJob is still active. Nothing is
+///   recorded, so the instant stays due and is picked up once the
+///   earlier run finishes, if the deadline still allows. `Replace` is
+///   rejected at admission (`admission::validate_cronjob_schedule_fields`).
 ///
 /// **A due schedule whose estimated cost the current budget can't
 /// cover is skipped, not created and left to wait (Phase 14b)** --
@@ -76,12 +87,26 @@ pub async fn schedule_due_jobs(pool: &SqlitePool, ctx: &JobContext) -> Result<us
             }
         };
 
+        let spec: JsonValue = serde_json::from_str(&spec_str).unwrap_or(JsonValue::Null);
+        if spec.get("suspend").and_then(JsonValue::as_bool) == Some(true) {
+            continue;
+        }
+
         let last_scheduled = last_scheduled_time(pool, &name, &namespace, created_at).await?;
-        let is_due = schedule
-            .after(&last_scheduled)
-            .next()
-            .is_some_and(|next| next <= now);
-        if !is_due {
+        let starting_deadline = spec
+            .get("startingDeadlineSeconds")
+            .and_then(JsonValue::as_i64);
+        if !is_due(&schedule, last_scheduled, now, starting_deadline) {
+            continue;
+        }
+
+        if spec.get("concurrencyPolicy").and_then(JsonValue::as_str) == Some("Forbid")
+            && has_active_run(pool, &name, &namespace).await?
+        {
+            tracing::debug!(
+                "CronJob {namespace}/{name} is due, but its previous run is still active \
+                 (concurrencyPolicy: Forbid)"
+            );
             continue;
         }
 
@@ -91,6 +116,51 @@ pub async fn schedule_due_jobs(pool: &SqlitePool, ctx: &JobContext) -> Result<us
     }
 
     Ok(scheduled)
+}
+
+/// Whether a run is due: some scheduled instant falls after
+/// `last_scheduled` and no later than `now`. With a starting deadline,
+/// that instant must also be at most `starting_deadline` seconds old
+/// (Kubernetes: "If the difference is higher than that limit, it will
+/// skip this execution"), so the search starts at whichever is later.
+/// Either way only the existence of such an instant matters, never how
+/// many there were, so this never walks through a long backlog of
+/// missed instants (e.g. after months of `suspend: true`).
+fn is_due(
+    schedule: &Schedule,
+    last_scheduled: DateTime<Utc>,
+    now: DateTime<Utc>,
+    starting_deadline: Option<i64>,
+) -> bool {
+    let window_start = match starting_deadline {
+        // `after` is exclusive, so start one second early to keep an
+        // instant exactly `deadline` seconds old.
+        Some(deadline) => Duration::try_seconds(deadline.saturating_add(1))
+            .and_then(|deadline| now.checked_sub_signed(deadline))
+            .map_or(last_scheduled, |earliest| last_scheduled.max(earliest)),
+        None => last_scheduled,
+    };
+    schedule
+        .after(&window_start)
+        .next()
+        .is_some_and(|next| next <= now)
+}
+
+/// Whether a run of this CronJob is still before completion (anything
+/// up to `ContainerRunning`), for `concurrencyPolicy: Forbid`. A run
+/// that has finished but is still cleaning up (detaching its volume,
+/// deleting its VM) doesn't count, as a finished Job doesn't in
+/// Kubernetes.
+async fn has_active_run(pool: &SqlitePool, cronjob_name: &str, namespace: &str) -> Result<bool> {
+    let statuses: Vec<String> =
+        sqlx::query_scalar("SELECT status FROM jobs WHERE cronjob_name = ? AND namespace = ?")
+            .bind(cronjob_name)
+            .bind(namespace)
+            .fetch_all(pool)
+            .await?;
+    Ok(statuses
+        .iter()
+        .any(|status| is_pre_completion_state(status)))
 }
 
 /// The most recent instant a run was actually created for this CronJob,
@@ -235,10 +305,25 @@ mod tests {
     }
 
     async fn insert_cronjob(pool: &SqlitePool, name: &str, schedule: &str, created_at: i64) {
-        let spec = json!({
+        insert_cronjob_with(pool, name, schedule, created_at, json!({})).await;
+    }
+
+    /// Like `insert_cronjob`, with extra top-level spec fields (`suspend`,
+    /// `startingDeadlineSeconds`, `concurrencyPolicy`).
+    async fn insert_cronjob_with(
+        pool: &SqlitePool,
+        name: &str,
+        schedule: &str,
+        created_at: i64,
+        extra: JsonValue,
+    ) {
+        let mut spec = json!({
             "schedule": schedule,
             "jobTemplate": {"spec": {"activeDeadlineSeconds": 3600}}
         });
+        for (key, value) in extra.as_object().unwrap() {
+            spec[key] = value.clone();
+        }
         sqlx::query(
             "INSERT INTO cronjobs (id, name, namespace, spec, schedule, created_at, updated_at, version) \
              VALUES (?, ?, 'default', ?, ?, ?, ?, 1)",
@@ -446,5 +531,211 @@ mod tests {
                 .unwrap();
         let spec: JsonValue = serde_json::from_str(&spec_str).unwrap();
         assert_eq!(spec["activeDeadlineSeconds"], 3600);
+    }
+
+    async fn job_count(pool: &SqlitePool, cronjob_name: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE cronjob_name = ?")
+            .bind(cronjob_name)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    fn at(rfc3339: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(rfc3339).unwrap().into()
+    }
+
+    fn weekly_sunday_3am() -> Schedule {
+        Schedule::from_str(&to_six_field("0 3 * * SUN")).unwrap()
+    }
+
+    #[test]
+    fn test_is_due_without_deadline_catches_up_on_any_missed_instant() {
+        // Last run Sunday 2026-11-01 03:00; now Wednesday 2026-11-11, with
+        // Sunday 2026-11-08 03:00 missed (e.g. while suspended).
+        let last = at("2026-11-01T03:00:00Z");
+        let now = at("2026-11-11T12:00:00Z");
+        assert!(is_due(&weekly_sunday_3am(), last, now, None));
+    }
+
+    #[test]
+    fn test_is_due_skips_an_instant_older_than_the_deadline() {
+        // Same as above with osmdiffs' startingDeadlineSeconds: 3600 --
+        // Sunday's slot is days old, so no run until the next Sunday.
+        let last = at("2026-11-01T03:00:00Z");
+        let now = at("2026-11-11T12:00:00Z");
+        assert!(!is_due(&weekly_sunday_3am(), last, now, Some(3600)));
+    }
+
+    #[test]
+    fn test_is_due_within_the_deadline() {
+        let last = at("2026-11-01T03:00:00Z");
+        for now in [
+            "2026-11-08T03:00:00Z", // on the dot
+            "2026-11-08T03:30:00Z",
+            "2026-11-08T04:00:00Z", // exactly 3600 s late: still allowed
+        ] {
+            assert!(
+                is_due(&weekly_sunday_3am(), last, at(now), Some(3600)),
+                "{now}"
+            );
+        }
+        assert!(!is_due(
+            &weekly_sunday_3am(),
+            last,
+            at("2026-11-08T04:00:01Z"),
+            Some(3600)
+        ));
+    }
+
+    #[test]
+    fn test_is_due_deadline_never_reaches_back_before_the_last_run() {
+        // The last run was at 03:00 itself: that instant is used up, even
+        // though it's within the deadline.
+        let last = at("2026-11-08T03:00:00Z");
+        let now = at("2026-11-08T03:10:00Z");
+        assert!(!is_due(&weekly_sunday_3am(), last, now, Some(3600)));
+        assert!(!is_due(&weekly_sunday_3am(), last, now, None));
+    }
+
+    #[test]
+    fn test_is_due_huge_deadline_does_not_overflow() {
+        let last = at("2026-11-01T03:00:00Z");
+        let now = at("2026-11-11T12:00:00Z");
+        assert!(is_due(&weekly_sunday_3am(), last, now, Some(i64::MAX)));
+    }
+
+    #[tokio::test]
+    async fn test_suspended_cronjob_creates_no_jobs() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let created_at = Utc::now().timestamp() - 120;
+        insert_cronjob_with(
+            &pool,
+            "suspended",
+            "* * * * *",
+            created_at,
+            json!({"suspend": true}),
+        )
+        .await;
+
+        for _ in 0..3 {
+            assert_eq!(schedule_due_jobs(&pool, &mock_ctx()).await.unwrap(), 0);
+        }
+        assert_eq!(job_count(&pool, "suspended").await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_unsuspending_catches_up_with_one_run() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        // Several every-minute instants pass while suspended.
+        let created_at = Utc::now().timestamp() - 300;
+        insert_cronjob_with(
+            &pool,
+            "paused",
+            "* * * * *",
+            created_at,
+            json!({"suspend": true}),
+        )
+        .await;
+        assert_eq!(schedule_due_jobs(&pool, &mock_ctx()).await.unwrap(), 0);
+
+        sqlx::query("UPDATE cronjobs SET spec = json_set(spec, '$.suspend', json('false'))")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(schedule_due_jobs(&pool, &mock_ctx()).await.unwrap(), 1);
+        assert_eq!(schedule_due_jobs(&pool, &mock_ctx()).await.unwrap(), 0);
+        assert_eq!(job_count(&pool, "paused").await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_missed_instant_past_the_starting_deadline_is_skipped() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        // Every 1 January: created three years ago, never run, so the
+        // last missed instant is months old -- far past a 30 s deadline.
+        let created_at = Utc::now().timestamp() - 3 * 366 * 24 * 3600;
+        insert_cronjob_with(
+            &pool,
+            "with-deadline",
+            "0 0 1 1 *",
+            created_at,
+            json!({"startingDeadlineSeconds": 30}),
+        )
+        .await;
+        insert_cronjob(&pool, "without-deadline", "0 0 1 1 *", created_at).await;
+
+        assert_eq!(schedule_due_jobs(&pool, &mock_ctx()).await.unwrap(), 1);
+        assert_eq!(job_count(&pool, "with-deadline").await, 0);
+        assert_eq!(job_count(&pool, "without-deadline").await, 1);
+    }
+
+    async fn insert_run(pool: &SqlitePool, cronjob_name: &str, status: &str, created_at: i64) {
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, cronjob_name, spec, status, created_at, updated_at, version) \
+             VALUES (?, ?, 'default', ?, '{}', ?, ?, ?, 1)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(format!("{cronjob_name}-{created_at}"))
+        .bind(cronjob_name)
+        .bind(status)
+        .bind(created_at)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_forbid_holds_a_due_run_while_the_previous_one_is_active() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = Utc::now().timestamp();
+        insert_cronjob_with(
+            &pool,
+            "forbid",
+            "* * * * *",
+            now - 600,
+            json!({"concurrencyPolicy": "Forbid"}),
+        )
+        .await;
+        insert_cronjob(&pool, "allow", "* * * * *", now - 600).await;
+        // Each has a run from 5 minutes ago that is still going.
+        insert_run(&pool, "forbid", "ContainerRunning", now - 300).await;
+        insert_run(&pool, "allow", "ContainerRunning", now - 300).await;
+
+        assert_eq!(schedule_due_jobs(&pool, &mock_ctx()).await.unwrap(), 1);
+        assert_eq!(job_count(&pool, "forbid").await, 1);
+        assert_eq!(job_count(&pool, "allow").await, 2);
+
+        // Once the run has finished (cleanup still in progress counts as
+        // finished), the held-back instant is picked up.
+        sqlx::query("UPDATE jobs SET status = 'VMTerminating' WHERE cronjob_name = 'forbid'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(schedule_due_jobs(&pool, &mock_ctx()).await.unwrap(), 1);
+        assert_eq!(job_count(&pool, "forbid").await, 2);
+    }
+
+    #[tokio::test]
+    async fn test_suspending_leaves_a_running_job_alone() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = Utc::now().timestamp();
+        insert_cronjob_with(
+            &pool,
+            "busy",
+            "* * * * *",
+            now - 600,
+            json!({"suspend": true}),
+        )
+        .await;
+        insert_run(&pool, "busy", "ContainerRunning", now - 300).await;
+
+        assert_eq!(schedule_due_jobs(&pool, &mock_ctx()).await.unwrap(), 0);
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM jobs WHERE cronjob_name = 'busy'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "ContainerRunning");
     }
 }

@@ -181,6 +181,53 @@ pub fn validate_run_options(
     ))
 }
 
+/// Validates the `CronJob`-level scheduling fields (issue #105), the ones
+/// outside `jobTemplate` that `reconcile::schedule` reads:
+///
+/// - `suspend`: a boolean, if set.
+/// - `startingDeadlineSeconds`: a non-negative integer, if set.
+/// - `concurrencyPolicy`: `Allow` (the default) or `Forbid`. `Replace`
+///   would mean stopping a running job's worker VM to start the next
+///   run, which nothing here does, so it's rejected rather than quietly
+///   treated as `Allow`.
+///
+/// The `hashicorp/kubernetes` provider always sends `suspend: false`,
+/// `concurrencyPolicy: Allow` and both history limits, so their default
+/// values must keep passing. The history limits themselves aren't
+/// checked: kube-shim keeps its own job history, and no limit value
+/// changes how a run behaves.
+pub fn validate_cronjob_schedule_fields(
+    object_description: &str,
+    cronjob_spec: &JsonValue,
+) -> Option<Response> {
+    let invalid = |field: &str, value: &JsonValue| {
+        let value = match value {
+            JsonValue::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        Some(k8s_status::invalid_field_value(
+            object_description,
+            field,
+            &value,
+        ))
+    };
+    match cronjob_spec.get("suspend") {
+        None | Some(JsonValue::Null) | Some(JsonValue::Bool(_)) => {}
+        Some(other) => return invalid("spec.suspend", other),
+    }
+    match cronjob_spec.get("startingDeadlineSeconds") {
+        None | Some(JsonValue::Null) => {}
+        Some(value) if value.as_u64().is_some() => {}
+        Some(other) => return invalid("spec.startingDeadlineSeconds", other),
+    }
+    match cronjob_spec.get("concurrencyPolicy") {
+        None | Some(JsonValue::Null) => {}
+        Some(JsonValue::String(s)) if s == "Allow" || s == "Forbid" => {}
+        Some(other) => return invalid("spec.concurrencyPolicy", other),
+    }
+    None
+}
+
 /// Issue #85: rejects a workload whose resource requests no cached
 /// server plan can satisfy, rather than letting each run fail later at
 /// `VMPending`. Accepts it while the plan catalog hasn't been synced
@@ -487,5 +534,55 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("privileged"), "{message}");
+    }
+
+    #[test]
+    fn test_cronjob_schedule_fields_provider_defaults_accepted() {
+        // What hashicorp/kubernetes sends for a CronJob that sets none of
+        // these, plus production's osmdiffs settings.
+        for spec in [
+            json!({"suspend": false, "concurrencyPolicy": "Allow",
+                   "successfulJobsHistoryLimit": 3, "failedJobsHistoryLimit": 1}),
+            json!({"suspend": true, "concurrencyPolicy": "Forbid",
+                   "startingDeadlineSeconds": 3600}),
+            json!({}),
+        ] {
+            assert!(
+                validate_cronjob_schedule_fields("CronJob \"x\"", &spec).is_none(),
+                "{spec}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cronjob_schedule_fields_unsupported_values_rejected() {
+        for (spec, field) in [
+            (
+                json!({"concurrencyPolicy": "Replace"}),
+                "spec.concurrencyPolicy",
+            ),
+            (
+                json!({"concurrencyPolicy": "allow"}),
+                "spec.concurrencyPolicy",
+            ),
+            (
+                json!({"startingDeadlineSeconds": -1}),
+                "spec.startingDeadlineSeconds",
+            ),
+            (
+                json!({"startingDeadlineSeconds": "60"}),
+                "spec.startingDeadlineSeconds",
+            ),
+            (json!({"suspend": "true"}), "spec.suspend"),
+        ] {
+            let response = validate_cronjob_schedule_fields("CronJob \"x\"", &spec)
+                .unwrap_or_else(|| panic!("{spec} must be rejected"));
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY
+            );
+            let message = response_message(response).await;
+            assert!(message.contains(field), "{message}");
+        }
     }
 }
