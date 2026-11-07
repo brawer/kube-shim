@@ -5,7 +5,8 @@
 //! 1. **`kubeshim_*`: the shim's own health.** Process start time and
 //!    uptime, per-loop run counters and durations (job tick, orphan
 //!    scan, metrics poll, pricing sync -- from `reconcile::TickHealth`),
-//!    jobs by state, and the budget balance when the budget guard is on.
+//!    jobs by state, finished job runs by result, and the budget balance
+//!    when the budget guard is on.
 //! 2. **`node_vmstat_*`/`node_memory_*`: each worker VM's virtual
 //!    memory**, from the latest `worker_metrics` sample
 //!    (`reconcile::metrics_collector`). These use node-exporter's exact
@@ -34,6 +35,7 @@
 //! which Prometheus itself sets to the scrape job's name.
 
 use crate::pricing;
+use crate::reconcile::job::is_pre_completion_state;
 use crate::reconcile::{LoopStats, TickHealth, STATE_SEQUENCE};
 use axum::{
     extract::State,
@@ -43,7 +45,7 @@ use axum::{
 };
 use chrono::Utc;
 use sqlx::{Row, SqlitePool};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;
 use std::sync::Arc;
 
@@ -194,6 +196,120 @@ async fn write_jobs_by_state(out: &mut Exposition, pool: &SqlitePool) -> anyhow:
     Ok(())
 }
 
+/// True once a run has a final outcome: `Succeeded`, `Failed`, or any
+/// cleanup state after them up to `Archived`. An unknown status is not
+/// counted, since its outcome can't be told.
+fn is_finished_state(status: &str) -> bool {
+    status == "Failed" || (STATE_SEQUENCE.contains(&status) && !is_pre_completion_state(status))
+}
+
+/// Finished runs of one CronJob (or of the standalone Jobs in one
+/// namespace) with one result.
+#[derive(Default, Clone, Copy)]
+struct RunTally {
+    count: i64,
+    last_completion: i64,
+}
+
+/// `kubeshim_job_runs_total{namespace,cronjob,result}` and
+/// `kubeshim_job_last_completion_timestamp_seconds{...}` (issue #120).
+///
+/// `kubeshim_jobs_by_state` can't show a failure after the fact: a
+/// failed run sits in `Failed` for a few seconds, then cleans up to
+/// `Archived` like a successful one. So this counts finished runs by
+/// outcome, straight from the `jobs` table on every scrape. Archived
+/// rows are kept, so the count only grows and survives a restart. The
+/// one exception: `kubectl delete job` on a finished run removes its
+/// row, and the count drops by one, which Prometheus reads as a counter
+/// reset.
+///
+/// A run failed if it ever entered `Failed`: either a nonzero exit code
+/// or a forced failure (`activeDeadlineSeconds`, a stuck state, or
+/// deletion while running). Both paths record a `Failed` event, and
+/// events are never deleted, so this holds even after `last_error` is
+/// overwritten by a retry during cleanup. A nonzero `exit_code` also
+/// counts, for rows older than the events table.
+///
+/// `cronjob` is the owning CronJob's name, or empty for a standalone
+/// Job, so the labels stay one series per CronJob, not one per run.
+/// Every CronJob gets both `result` series, zero-filled, from the
+/// moment it exists, so `increase()` sees even its first failure. A
+/// last-completion timestamp of 0 means no such run yet.
+async fn write_job_runs(out: &mut Exposition, pool: &SqlitePool) -> anyhow::Result<()> {
+    let rows = sqlx::query(
+        "SELECT namespace, COALESCE(cronjob_name, ''), status, \
+                (COALESCE(exit_code, 0) <> 0 OR EXISTS ( \
+                    SELECT 1 FROM events e WHERE e.job_id = jobs.id AND e.reason = 'Failed' \
+                )) AS failed, \
+                COUNT(*), \
+                MAX(COALESCE(completed_at, ( \
+                    SELECT MIN(e.timestamp) FROM events e \
+                    WHERE e.job_id = jobs.id AND e.reason IN ('Succeeded', 'Failed') \
+                ), updated_at)) \
+         FROM jobs GROUP BY 1, 2, 3, 4",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    // Index 0 is `succeeded`, 1 is `failed`.
+    let mut tallies: BTreeMap<(String, String), [RunTally; 2]> = BTreeMap::new();
+    let cronjobs = sqlx::query("SELECT namespace, name FROM cronjobs")
+        .fetch_all(pool)
+        .await?;
+    for row in cronjobs {
+        tallies.entry((row.get(0), row.get(1))).or_default();
+    }
+    for row in rows {
+        let status: String = row.get(2);
+        if !is_finished_state(&status) {
+            continue;
+        }
+        let failed: bool = row.get(3);
+        let tally = &mut tallies.entry((row.get(0), row.get(1))).or_default()[failed as usize];
+        tally.count += row.get::<i64, _>(4);
+        tally.last_completion = tally.last_completion.max(row.get::<i64, _>(5));
+    }
+
+    const RESULTS: [&str; 2] = ["succeeded", "failed"];
+    out.family(
+        "kubeshim_job_runs_total",
+        "counter",
+        "Finished job runs, by CronJob (empty for a standalone Job) and result.",
+    );
+    for ((namespace, cronjob), by_result) in &tallies {
+        for (result, tally) in RESULTS.iter().zip(by_result) {
+            out.sample(
+                "kubeshim_job_runs_total",
+                &[
+                    ("namespace", namespace),
+                    ("cronjob", cronjob),
+                    ("result", result),
+                ],
+                tally.count,
+            );
+        }
+    }
+    out.family(
+        "kubeshim_job_last_completion_timestamp_seconds",
+        "gauge",
+        "Unix time the most recent job run with this result finished, or 0 if none yet.",
+    );
+    for ((namespace, cronjob), by_result) in &tallies {
+        for (result, tally) in RESULTS.iter().zip(by_result) {
+            out.sample(
+                "kubeshim_job_last_completion_timestamp_seconds",
+                &[
+                    ("namespace", namespace),
+                    ("cronjob", cronjob),
+                    ("result", result),
+                ],
+                tally.last_completion,
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Only when the budget guard is enabled (a daily rate above zero),
 /// matching what the status page shows.
 async fn write_budget(out: &mut Exposition, pool: &SqlitePool) -> anyhow::Result<()> {
@@ -330,6 +446,7 @@ async fn render_all(pool: &SqlitePool, health: &TickHealth) -> anyhow::Result<St
     let mut out = Exposition::default();
     write_self_metrics(&mut out, health, Utc::now().timestamp());
     write_jobs_by_state(&mut out, pool).await?;
+    write_job_runs(&mut out, pool).await?;
     write_budget(&mut out, pool).await?;
     write_worker_vm_metrics(&mut out, &worker_vm_samples(pool).await?);
     Ok(out.0)
@@ -508,5 +625,162 @@ mod tests {
         let (_, _, body) = scrape(pool, Arc::new(TickHealth::new())).await;
         assert!(!body.contains("node_vmstat"));
         assert!(!body.contains("node_memory_"));
+    }
+
+    async fn insert_run(
+        pool: &SqlitePool,
+        id: &str,
+        cronjob: Option<&str>,
+        status: &str,
+        exit_code: Option<i64>,
+        completed_at: Option<i64>,
+    ) {
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, cronjob_name, spec, status, exit_code, \
+             completed_at, created_at, updated_at, version) \
+             VALUES (?, ?, 'default', ?, '{}', ?, ?, ?, 0, 9999, 1)",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(cronjob)
+        .bind(status)
+        .bind(exit_code)
+        .bind(completed_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_event(pool: &SqlitePool, job_id: &str, reason: &str, timestamp: i64) {
+        sqlx::query(
+            "INSERT INTO events (id, job_id, reason, message, timestamp, type) \
+             VALUES (?, ?, ?, '', ?, 'Normal')",
+        )
+        .bind(format!("{job_id}-{reason}"))
+        .bind(job_id)
+        .bind(reason)
+        .bind(timestamp)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_job_runs_count_archived_runs_by_result() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        // The OSMDiffs case from issue #120: a nonzero exit code, then
+        // cleanup to Archived, the same final state as a success.
+        insert_run(
+            &pool,
+            "r1",
+            Some("osmdiffs"),
+            "Archived",
+            Some(1),
+            Some(100),
+        )
+        .await;
+        insert_event(&pool, "r1", "Failed", 100).await;
+        insert_run(
+            &pool,
+            "r2",
+            Some("osmdiffs"),
+            "Archived",
+            Some(0),
+            Some(200),
+        )
+        .await;
+        insert_run(
+            &pool,
+            "r3",
+            Some("osmdiffs"),
+            "VMTerminating",
+            Some(0),
+            Some(300),
+        )
+        .await;
+        // Still running: no outcome yet, so not counted.
+        insert_run(
+            &pool,
+            "r4",
+            Some("osmdiffs"),
+            "ContainerRunning",
+            None,
+            None,
+        )
+        .await;
+
+        let (_, _, body) = scrape(pool, Arc::new(TickHealth::new())).await;
+        let failed = "{namespace=\"default\",cronjob=\"osmdiffs\",result=\"failed\"}";
+        let succeeded = "{namespace=\"default\",cronjob=\"osmdiffs\",result=\"succeeded\"}";
+        assert!(body.contains("# TYPE kubeshim_job_runs_total counter"));
+        assert!(body.contains(&format!("kubeshim_job_runs_total{failed} 1\n")));
+        assert!(body.contains(&format!("kubeshim_job_runs_total{succeeded} 2\n")));
+        assert!(body.contains(&format!(
+            "kubeshim_job_last_completion_timestamp_seconds{failed} 100\n"
+        )));
+        assert!(body.contains(&format!(
+            "kubeshim_job_last_completion_timestamp_seconds{succeeded} 300\n"
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_job_runs_count_forced_failure_without_exit_code() {
+        // activeDeadlineSeconds: forced to Failed with no exit code, and
+        // a retry during cleanup has since overwritten last_error.
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_run(&pool, "r1", Some("osmdiffs"), "Archived", None, None).await;
+        sqlx::query("UPDATE jobs SET last_error = 'delete_volume failed' WHERE id = 'r1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_event(&pool, "r1", "Failed", 500).await;
+        // A dry-run success: no exit code either, and no Failed event.
+        insert_run(&pool, "r2", Some("osmdiffs"), "Archived", None, None).await;
+        insert_event(&pool, "r2", "Succeeded", 600).await;
+
+        let (_, _, body) = scrape(pool, Arc::new(TickHealth::new())).await;
+        let failed = "{namespace=\"default\",cronjob=\"osmdiffs\",result=\"failed\"}";
+        let succeeded = "{namespace=\"default\",cronjob=\"osmdiffs\",result=\"succeeded\"}";
+        assert!(body.contains(&format!("kubeshim_job_runs_total{failed} 1\n")));
+        assert!(body.contains(&format!("kubeshim_job_runs_total{succeeded} 1\n")));
+        assert!(body.contains(&format!(
+            "kubeshim_job_last_completion_timestamp_seconds{failed} 500\n"
+        )));
+        assert!(body.contains(&format!(
+            "kubeshim_job_last_completion_timestamp_seconds{succeeded} 600\n"
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_job_runs_zero_filled_and_standalone_jobs_grouped() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        sqlx::query(
+            "INSERT INTO cronjobs (id, name, namespace, spec, schedule, created_at, updated_at) \
+             VALUES ('c1', 'nightly', 'default', '{}', '0 3 * * *', 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        insert_run(&pool, "manual-1", None, "Failed", Some(2), Some(10)).await;
+        insert_run(&pool, "manual-2", None, "Archived", Some(0), Some(20)).await;
+
+        let (_, _, body) = scrape(pool, Arc::new(TickHealth::new())).await;
+        // A CronJob with no finished run yet reads 0, not absent.
+        for result in ["succeeded", "failed"] {
+            let labels =
+                format!("{{namespace=\"default\",cronjob=\"nightly\",result=\"{result}\"}}");
+            assert!(body.contains(&format!("kubeshim_job_runs_total{labels} 0\n")));
+            assert!(body.contains(&format!(
+                "kubeshim_job_last_completion_timestamp_seconds{labels} 0\n"
+            )));
+        }
+        // Standalone Jobs share one empty cronjob label, never the run name.
+        assert!(body.contains(
+            "kubeshim_job_runs_total{namespace=\"default\",cronjob=\"\",result=\"failed\"} 1\n"
+        ));
+        assert!(body.contains(
+            "kubeshim_job_runs_total{namespace=\"default\",cronjob=\"\",result=\"succeeded\"} 1\n"
+        ));
+        assert!(!body.contains("manual-1"));
     }
 }
