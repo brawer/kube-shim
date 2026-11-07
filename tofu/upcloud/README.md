@@ -133,8 +133,9 @@ provisioners by default.
 
 What still needs a new server: anything cloud-init itself sets up
 (packages, sysctls, the service user), the zone, the plan, and the
-disk. Changes to those in `cloud-init.sh.tftpl` only reach hosts
-created after them. To rebuild on purpose:
+disk (see "Plan and boot disk" for moving a host to another plan).
+Changes to those in `cloud-init.sh.tftpl` only reach hosts created
+after them. To rebuild on purpose:
 
 ```sh
 tofu apply -replace=module.kube_shim.upcloud_server.kube_shim
@@ -145,6 +146,91 @@ That gives the host new public IP addresses (point DNS at the new
 (SQLite database, ACME cache), so do it while no worker VMs are
 running, or they may be orphaned (see the Phase 16 manual orphan
 cleanup).
+
+## Plan and boot disk
+
+The host's boot disk is exactly the storage its plan includes, so
+UpCloud bills it as part of the plan (`part_of_plan: "yes"` in
+`GET /1.3/server/{uuid}`). A disk that's bigger, or on another tier,
+is billed on top of the plan.
+
+| `plan`              | Boot disk        | Host cost (`de-fra1`, 730 h)               |
+| ------------------- | ---------------- | ------------------------------------------ |
+| `STARTER-1xCPU-1GB` | 10 GB `standard` | 0.4464 cents/h, ~EUR 3.26/month (default)  |
+| `1xCPU-1GB`         | 25 GB `maxiops`  | 1.1309 cents/h, ~EUR 8.26/month            |
+
+Prices are as of November 2026 (issue #143); check them for your
+zone. `1xCPU-1GB` is a legacy plan: UpCloud no longer sells it
+(`current_offering: "no"` in `GET /1.3/plan`), and it was this module's
+default up to v0.4.3. Keep it only for a host that already runs on it.
+Before making a plan the default, check that it has
+`current_offering: "yes"`, so a legacy plan doesn't become the default
+by accident.
+
+The module knows the storage of the two plans above. For any other
+plan, also set `storage_size` and `storage_tier` to that plan's
+`storage_size` and `storage_tier` from `GET /1.3/plan` (or
+`upctl server plans`). Without them, `tofu plan` stops with an error
+rather than guess.
+
+kube-shim itself needs little: on `1xCPU-1GB`, kube-shim.brawer.ch uses
+3.6 GB of its disk (the OS, about 140 MB of container images, and under
+1 MB of kube-shim data) and about 420 MB of memory.
+
+### Keeping an existing host on `1xCPU-1GB`
+
+A host created with v0.4.3 or earlier runs on `1xCPU-1GB` with a 25 GB
+`maxiops` disk. To upgrade the module without touching it, set
+
+```hcl
+module "kube_shim" {
+  # ...
+  plan = "1xCPU-1GB"
+}
+```
+
+before you bump `source`. `tofu plan` should then show no change to
+`upcloud_server.kube_shim`. If it says the server "must be replaced",
+stop and don't apply.
+
+### Moving an existing host to another plan
+
+Moving to a plan with a smaller disk or another storage tier, such as
+from `1xCPU-1GB` to `STARTER-1xCPU-1GB`, replaces the server: a
+template disk can't shrink, and its tier can't change in place. That
+means new IP addresses, and the old disk is deleted with the old
+server. OpenTofu destroys the old server before it creates the new one,
+so copy the data off first:
+
+1. Let running Jobs finish, so no worker VMs are left behind (they
+   would be orphaned, see the Phase 16 manual orphan cleanup). Suspend
+   your CronJobs, or move at a time none are due.
+2. Stop kube-shim and copy its data directory (the SQLite database and
+   the ACME cache) to your machine:
+
+   ```sh
+   ssh admin@OLD_IP sudo systemctl --user --machine=kube-shim@ stop kube-shim.service
+   ssh admin@OLD_IP sudo tar -C /home/kube-shim -czpf - kube-shim-data > kube-shim-data.tgz
+   ```
+
+3. Set the new `plan` (or remove `plan = "1xCPU-1GB"` to get the
+   default) and `tofu apply`. Check that the plan replaces only
+   `upcloud_server.kube_shim` and the resources that depend on it.
+4. Point DNS at the new `public_ipv4`/`public_ipv6` outputs (see
+   "First apply: DNS").
+5. Put the data back and restart:
+
+   ```sh
+   ssh admin@NEW_IP sudo systemctl --user --machine=kube-shim@ stop kube-shim.service
+   ssh admin@NEW_IP sudo tar -C /home/kube-shim --numeric-owner -xzpf - < kube-shim-data.tgz
+   ssh admin@NEW_IP sudo systemctl --user --machine=kube-shim@ start kube-shim.service
+   ```
+
+   Then check `https://YOUR_HOSTNAME/livez`, and resume your CronJobs.
+
+Skip steps 2 and 5 if you don't need the old data. kube-shim then
+starts with an empty database: re-apply your CronJobs and Secrets, and
+it fetches a new certificate once DNS points at the new host.
 
 ## Pinning the image
 
@@ -238,6 +324,13 @@ it, but the old values were readable until then, so rotating is still
 the safer fix.
 
 ## Verified vs. not
+
+The plan-matched boot disk ("Plan and boot disk") hasn't been applied
+against a live account yet: on the first real apply, check that the
+disk shows `part_of_plan: "yes"`, and that an existing `1xCPU-1GB`
+host with `plan = "1xCPU-1GB"` plans no change to the server. The
+data copy in "Moving an existing host to another plan" hasn't been
+run either.
 
 Every step in `templates/cloud-init.sh.tftpl` up through writing
 the quadlet unit is lifted directly from

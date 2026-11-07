@@ -4,7 +4,8 @@ terraform {
   required_providers {
     upcloud = {
       source  = "UpCloudLtd/upcloud"
-      version = ">= 5.0.0"
+      # 5.17.0 added template.tier on upcloud_server.
+      version = ">= 5.17.0"
     }
     tls = {
       source  = "hashicorp/tls"

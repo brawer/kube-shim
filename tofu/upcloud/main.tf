@@ -89,6 +89,18 @@ locals {
   )
 }
 
+# The storage each known plan includes, from UpCloud's GET /1.3/plan.
+# Add a plan here only after checking it there.
+locals {
+  plan_storage = {
+    "STARTER-1xCPU-1GB" = { size = 10, tier = "standard" }
+    # Legacy (current_offering: "no"), for hosts created with it.
+    "1xCPU-1GB" = { size = 25, tier = "maxiops" }
+  }
+  storage_size = var.storage_size != null ? var.storage_size : try(local.plan_storage[var.plan].size, null)
+  storage_tier = var.storage_tier != null ? var.storage_tier : try(local.plan_storage[var.plan].tier, null)
+}
+
 resource "upcloud_server" "kube_shim" {
   hostname = "${var.resource_prefix}.local"
   title    = "${var.resource_prefix}-host"
@@ -97,9 +109,15 @@ resource "upcloud_server" "kube_shim" {
   metadata = true
   firewall = true
 
+  # Exactly the storage the plan includes, so UpCloud bills the disk as
+  # part of the plan (part_of_plan: "yes"). A disk that differs in size
+  # or tier is billed on top. A smaller disk or another tier replaces
+  # the server: a template disk can't shrink, and its tier can't change
+  # in place.
   template {
     storage = "Ubuntu Server 24.04 LTS (Noble Numbat)"
-    size    = 25
+    size    = local.storage_size
+    tier    = local.storage_tier
   }
 
   # Dual-stack: two separate "public" interfaces, not one interface
@@ -146,6 +164,11 @@ resource "upcloud_server" "kube_shim" {
 
   lifecycle {
     ignore_changes = [user_data]
+
+    precondition {
+      condition     = local.storage_size != null && local.storage_tier != null
+      error_message = "The module doesn't know the storage included in plan \"${var.plan}\". Set storage_size and storage_tier to that plan's storage_size and storage_tier (GET /1.3/plan, or `upctl server plans`)."
+    }
   }
 }
 
