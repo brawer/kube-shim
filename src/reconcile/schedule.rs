@@ -21,8 +21,90 @@ use uuid::Uuid;
 /// `"0 "` is the standard bridge between the two; this project doesn't
 /// need sub-minute scheduling, so a fixed `0` seconds field is exact, not
 /// an approximation.
+///
+/// The day-of-week field needs translating too: POSIX cron (and
+/// Kubernetes) number the days 0-6 from Sunday, while the `cron` crate
+/// numbers them 1-7 from Sunday. Passed through as is, `0` (Sunday) fails
+/// to parse and every other number is off by one day (`1-5` would mean
+/// Sunday to Thursday). So numeric days become names, which both read
+/// the same way -- see `day_of_week_to_names`.
+///
+/// Descriptors such as `@weekly` and `@daily` mean the same in both and
+/// pass through unchanged.
 fn to_six_field(schedule: &str) -> String {
-    format!("0 {schedule}")
+    let schedule = schedule.trim();
+    if schedule.starts_with('@') {
+        return schedule.to_string();
+    }
+    let mut fields: Vec<&str> = schedule.split_whitespace().collect();
+    if fields.len() != 5 {
+        // Not POSIX cron; let the parser report it.
+        return format!("0 {schedule}");
+    }
+    let day_of_week = day_of_week_to_names(fields[4]);
+    fields[4] = &day_of_week;
+    format!("0 {}", fields.join(" "))
+}
+
+const DAY_NAMES: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+
+/// Rewrites a POSIX day-of-week field as an explicit list of day names,
+/// e.g. `0` -> `SUN`, `1-5` -> `MON,TUE,WED,THU,FRI`, `*/2` ->
+/// `SUN,TUE,THU,SAT`, `FRI-MON` -> `SUN,MON,FRI,SAT`. Expanding ranges
+/// and steps into a list (rather than renaming their ends) keeps every
+/// form the `cron` crate would misread or refuse out of its way,
+/// including `7` (Sunday, in most crons) and ranges that wrap past
+/// Saturday. `*` and `?` stay as they are. Anything unrecognised is
+/// returned unchanged, so the parser still rejects it.
+fn day_of_week_to_names(field: &str) -> String {
+    if field == "*" || field == "?" {
+        return field.to_string();
+    }
+    let day = |s: &str| -> Option<usize> {
+        if let Ok(n) = s.parse::<usize>() {
+            return (n <= 7).then_some(n % 7);
+        }
+        DAY_NAMES
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(s))
+    };
+    let mut days = [false; 7];
+    for item in field.split(',') {
+        let (base, step) = match item.split_once('/') {
+            Some((base, step)) => match step.parse::<usize>() {
+                Ok(step) if step > 0 => (base, step),
+                _ => return field.to_string(),
+            },
+            None => (item, 1),
+        };
+        let (first, last) = if base == "*" {
+            (0, 6)
+        } else if let Some((a, b)) = base.split_once('-') {
+            match (day(a), day(b)) {
+                (Some(a), Some(b)) => (a, b),
+                _ => return field.to_string(),
+            }
+        } else {
+            match day(base) {
+                // `n/step` runs from n to the end of the week.
+                Some(n) if step > 1 || item.contains('/') => (n, 6),
+                Some(n) => (n, n),
+                None => return field.to_string(),
+            }
+        };
+        // A range may wrap past Saturday (`FRI-MON`, or `5-0`); the raw
+        // `7` in `5-7` has already become 0 (Sunday) above.
+        let length = (last + 7 - first) % 7;
+        for offset in (0..=length).step_by(step) {
+            days[(first + offset) % 7] = true;
+        }
+    }
+    DAY_NAMES
+        .iter()
+        .zip(days)
+        .filter_map(|(name, set)| set.then_some(*name))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Checks every `CronJob`'s schedule and creates a new `jobs` row for any
@@ -533,6 +615,50 @@ mod tests {
         assert_eq!(spec["activeDeadlineSeconds"], 3600);
     }
 
+    #[test]
+    fn test_day_of_week_follows_posix_numbering() {
+        for (posix, names) in [
+            ("0", "SUN"),
+            ("7", "SUN"),
+            ("1", "MON"),
+            ("6", "SAT"),
+            ("1-5", "MON,TUE,WED,THU,FRI"),
+            ("5-7", "SUN,FRI,SAT"),
+            ("FRI-MON", "SUN,MON,FRI,SAT"),
+            ("*/2", "SUN,TUE,THU,SAT"),
+            ("1/3", "MON,THU"),
+            ("0,6", "SUN,SAT"),
+            ("sun", "SUN"),
+            ("*", "*"),
+            ("8", "8"),
+            ("x", "x"),
+        ] {
+            assert_eq!(day_of_week_to_names(posix), names, "{posix}");
+        }
+    }
+
+    #[test]
+    fn test_posix_schedules_fire_on_the_right_days() {
+        let after: DateTime<Utc> = DateTime::parse_from_rfc3339("2026-11-01T00:00:00Z")
+            .unwrap()
+            .into(); // a Sunday
+        let first_days = |schedule: &str| -> Vec<String> {
+            Schedule::from_str(&to_six_field(schedule))
+                .unwrap_or_else(|e| panic!("{schedule}: {e}"))
+                .after(&after)
+                .take(2)
+                .map(|t| t.format("%a %H:%M").to_string())
+                .collect()
+        };
+        // brawer/production's osmdiffs schedule, which used to fail to
+        // parse and so never ran.
+        assert_eq!(first_days("0 3 * * 0"), ["Sun 03:00", "Sun 03:00"]);
+        assert_eq!(first_days("0 3 * * 1-5"), ["Mon 03:00", "Tue 03:00"]);
+        assert_eq!(first_days("0 3 * * 6"), ["Sat 03:00", "Sat 03:00"]);
+        assert_eq!(first_days("@weekly"), ["Sun 00:00", "Sun 00:00"]);
+        assert_eq!(first_days("*/15 * * * *"), ["Sun 00:15", "Sun 00:30"]);
+    }
+
     async fn job_count(pool: &SqlitePool, cronjob_name: &str) -> i64 {
         sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE cronjob_name = ?")
             .bind(cronjob_name)
@@ -546,7 +672,7 @@ mod tests {
     }
 
     fn weekly_sunday_3am() -> Schedule {
-        Schedule::from_str(&to_six_field("0 3 * * SUN")).unwrap()
+        Schedule::from_str(&to_six_field("0 3 * * 0")).unwrap()
     }
 
     #[test]
