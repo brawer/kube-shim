@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.3](https://github.com/brawer/kube-shim/compare/v0.4.2...v0.4.3) (2026-11-07)
+
+
+### 🐞 Bug Fixes
+
+* accept DNS replies through the stateless UpCloud firewall ([#140](https://github.com/brawer/kube-shim/issues/140)) ([64ffb5b](https://github.com/brawer/kube-shim/commit/64ffb5b390936fb0f163d5075848904e8966c579)), closes [#138](https://github.com/brawer/kube-shim/issues/138)
+* merge pod log stdout and stderr in timestamp order ([#142](https://github.com/brawer/kube-shim/issues/142)) ([54e6d50](https://github.com/brawer/kube-shim/commit/54e6d50f60ee7afde7c7f2a26178d25aee525f73))
+
 ## [0.4.2](https://github.com/brawer/kube-shim/compare/v0.4.1...v0.4.2) (2026-11-07)
 
 
