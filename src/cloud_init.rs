@@ -376,6 +376,22 @@ mod tests {
     }
 
     #[test]
+    fn test_container_gets_the_workers_ipv4_resolvers() {
+        // Issue #130: explicit `--dns`, from systemd-resolved's upstream
+        // list, without loopback or IPv6 servers.
+        let script = generate(&container_spec(json!({"image": "busybox:latest"}))).unwrap();
+        assert!(script.contains("UPSTREAM_RESOLV_CONF=/run/systemd/resolve/resolv.conf"));
+        assert!(script.contains("127.* | *:*) continue ;;"));
+        assert!(script.contains("DNS_ARGS+=(--dns \"$server\")"));
+        let run_line = script
+            .lines()
+            .find(|l| l.starts_with("CONTAINER_ID=$(podman run"))
+            .unwrap();
+        assert!(run_line.contains("\"${DNS_ARGS[@]}\""));
+        assert!(run_line.ends_with("2>> \"$STATUS_FILE\")"));
+    }
+
+    #[test]
     fn test_user_data_never_contains_env_command_or_args() {
         // Issue #84: these may hold Secret values, so they travel over
         // SSH (ContainerConfig), never in user_data.

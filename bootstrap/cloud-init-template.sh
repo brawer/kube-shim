@@ -91,7 +91,9 @@ fi
 echo "Installing podman..." >> "$STATUS_FILE"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq podman >> "$STATUS_FILE" 2>&1
+# stdout is dpkg's per-package chatter; only errors are worth keeping in
+# the status file, which the shim reports when a job fails (issue #130).
+apt-get install -y -qq podman > /dev/null 2>> "$STATUS_FILE"
 
 # The container always runs in its own user namespace (`--userns auto`
 # below), so root inside it is an unprivileged uid on this VM and a
@@ -177,11 +179,59 @@ if [ "$RUN_AS_NON_ROOT" = true ] && [ -z "$RUN_AS_USER" ]; then
     fi
 fi
 
+# The container's DNS servers (issue #130): the VM's own upstream IPv4
+# resolvers, passed explicitly. /etc/resolv.conf on Ubuntu points at
+# systemd-resolved's stub (127.0.0.53), which a container on podman's
+# bridge network can't reach, and the container has no IPv6, so neither
+# loopback nor IPv6 servers are any use to it. Left to itself, podman
+# guesses the same thing from systemd-resolved's files, but how it does
+# that varies by version; naming the servers makes the result
+# predictable and visible in the status file. With no IPv4 server at
+# all, podman's own default applies.
+if [ -r /run/systemd/resolve/resolv.conf ]; then
+    UPSTREAM_RESOLV_CONF=/run/systemd/resolve/resolv.conf
+else
+    UPSTREAM_RESOLV_CONF=/etc/resolv.conf
+fi
+DNS_ARGS=()
+DNS_SERVERS=""
+while read -r keyword server _; do
+    [ "$keyword" = nameserver ] || continue
+    case "$server" in
+        127.* | *:*) continue ;;
+    esac
+    # A resolver only ever uses the first three.
+    [ ${#DNS_ARGS[@]} -lt 6 ] || break
+    DNS_ARGS+=(--dns "$server")
+    DNS_SERVERS="$DNS_SERVERS $server"
+done < "$UPSTREAM_RESOLV_CONF"
+{
+    echo "Worker DNS ($UPSTREAM_RESOLV_CONF):"
+    grep -E '^(nameserver|search|options)' "$UPSTREAM_RESOLV_CONF"
+    echo "Network backend: $(podman info --format '{{.Host.NetworkBackend}}' 2>&1)"
+    if [ -n "$DNS_SERVERS" ]; then
+        echo "Container DNS servers:$DNS_SERVERS"
+    else
+        echo "Warning: no IPv4 DNS server in $UPSTREAM_RESOLV_CONF, leaving container DNS to podman"
+    fi
+} >> "$STATUS_FILE" 2>&1
+
 echo "Starting container..." >> "$STATUS_FILE"
 # --env-file, not one `-e NAME=VALUE` per variable, so Secret values
-# never show up in this VM's process list.
-CONTAINER_ID=$(podman run -d -v "$SCRATCH_VOLUME" "${RESOURCE_ARGS[@]}" "${SECURITY_ARGS[@]}" --env-file "$CONFIG_DIR/env" "${SECRET_ARGS[@]}" "$IMAGE" "${COMMAND[@]}" "${ARGS[@]}")
+# never show up in this VM's process list. podman's stderr (pull
+# progress and errors) goes to the status file, so a failed or stuck
+# pull shows up there.
+CONTAINER_ID=$(podman run -d -v "$SCRATCH_VOLUME" "${RESOURCE_ARGS[@]}" "${SECURITY_ARGS[@]}" "${DNS_ARGS[@]}" --env-file "$CONFIG_DIR/env" "${SECRET_ARGS[@]}" "$IMAGE" "${COMMAND[@]}" "${ARGS[@]}" 2>> "$STATUS_FILE")
 echo "$CONTAINER_ID" > "$CONTAINER_ID_FILE"
+# What the container actually got, for when its DNS fails anyway.
+if [ -n "$CONTAINER_ID" ]; then
+    RESOLV_CONF_PATH=$(podman inspect --format '{{.ResolvConfPath}}' "$CONTAINER_ID" 2>/dev/null)
+    if [ -n "$RESOLV_CONF_PATH" ] && [ -r "$RESOLV_CONF_PATH" ]; then
+        echo "Container resolv.conf:" >> "$STATUS_FILE"
+        cat "$RESOLV_CONF_PATH" >> "$STATUS_FILE"
+    fi
+    echo "Container started: $CONTAINER_ID" >> "$STATUS_FILE"
+fi
 # podman has copied the env into the container's own config by now.
 rm -f "$CONFIG_DIR/env" "$CONFIG_DIR/secret-env"
 
