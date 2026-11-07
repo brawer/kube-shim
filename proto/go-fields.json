@@ -1,0 +1,2662 @@
+{
+ "k8s.io.api.batch.v1.CronJob": {
+  "1": {
+   "json": "metadata",
+   "omitempty": true
+  },
+  "2": {
+   "json": "spec",
+   "omitempty": true
+  },
+  "3": {
+   "json": "status",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.batch.v1.CronJobSpec": {
+  "1": {
+   "json": "schedule"
+  },
+  "2": {
+   "json": "startingDeadlineSeconds",
+   "omitempty": true,
+   "pointer": true
+  },
+  "3": {
+   "json": "concurrencyPolicy",
+   "omitempty": true
+  },
+  "4": {
+   "json": "suspend",
+   "omitempty": true,
+   "pointer": true
+  },
+  "5": {
+   "json": "jobTemplate"
+  },
+  "6": {
+   "json": "successfulJobsHistoryLimit",
+   "omitempty": true,
+   "pointer": true
+  },
+  "7": {
+   "json": "failedJobsHistoryLimit",
+   "omitempty": true,
+   "pointer": true
+  },
+  "8": {
+   "json": "timeZone",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.batch.v1.CronJobStatus": {
+  "1": {
+   "json": "active",
+   "omitempty": true
+  },
+  "4": {
+   "json": "lastScheduleTime",
+   "omitempty": true,
+   "pointer": true
+  },
+  "5": {
+   "json": "lastSuccessfulTime",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.batch.v1.Job": {
+  "1": {
+   "json": "metadata",
+   "omitempty": true
+  },
+  "2": {
+   "json": "spec",
+   "omitempty": true
+  },
+  "3": {
+   "json": "status",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.batch.v1.JobCondition": {
+  "1": {
+   "json": "type"
+  },
+  "2": {
+   "json": "status"
+  },
+  "3": {
+   "json": "lastProbeTime",
+   "omitempty": true
+  },
+  "4": {
+   "json": "lastTransitionTime",
+   "omitempty": true
+  },
+  "5": {
+   "json": "reason",
+   "omitempty": true
+  },
+  "6": {
+   "json": "message",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.batch.v1.JobSpec": {
+  "1": {
+   "json": "parallelism",
+   "omitempty": true,
+   "pointer": true
+  },
+  "10": {
+   "json": "suspend",
+   "omitempty": true,
+   "pointer": true
+  },
+  "11": {
+   "json": "podFailurePolicy",
+   "omitempty": true,
+   "pointer": true
+  },
+  "12": {
+   "json": "backoffLimitPerIndex",
+   "omitempty": true,
+   "pointer": true
+  },
+  "13": {
+   "json": "maxFailedIndexes",
+   "omitempty": true,
+   "pointer": true
+  },
+  "14": {
+   "json": "podReplacementPolicy",
+   "omitempty": true,
+   "pointer": true
+  },
+  "15": {
+   "json": "managedBy",
+   "omitempty": true,
+   "pointer": true
+  },
+  "16": {
+   "json": "successPolicy",
+   "omitempty": true,
+   "pointer": true
+  },
+  "2": {
+   "json": "completions",
+   "omitempty": true,
+   "pointer": true
+  },
+  "3": {
+   "json": "activeDeadlineSeconds",
+   "omitempty": true,
+   "pointer": true
+  },
+  "4": {
+   "json": "selector",
+   "omitempty": true,
+   "pointer": true
+  },
+  "5": {
+   "json": "manualSelector",
+   "omitempty": true,
+   "pointer": true
+  },
+  "6": {
+   "json": "template"
+  },
+  "7": {
+   "json": "backoffLimit",
+   "omitempty": true,
+   "pointer": true
+  },
+  "8": {
+   "json": "ttlSecondsAfterFinished",
+   "omitempty": true,
+   "pointer": true
+  },
+  "9": {
+   "json": "completionMode",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.batch.v1.JobStatus": {
+  "1": {
+   "json": "conditions",
+   "omitempty": true
+  },
+  "10": {
+   "json": "failedIndexes",
+   "omitempty": true,
+   "pointer": true
+  },
+  "11": {
+   "json": "terminating",
+   "omitempty": true,
+   "pointer": true
+  },
+  "2": {
+   "json": "startTime",
+   "omitempty": true,
+   "pointer": true
+  },
+  "3": {
+   "json": "completionTime",
+   "omitempty": true,
+   "pointer": true
+  },
+  "4": {
+   "json": "active",
+   "omitempty": true
+  },
+  "5": {
+   "json": "succeeded",
+   "omitempty": true
+  },
+  "6": {
+   "json": "failed",
+   "omitempty": true
+  },
+  "7": {
+   "json": "completedIndexes",
+   "omitempty": true
+  },
+  "8": {
+   "json": "uncountedTerminatedPods",
+   "omitempty": true,
+   "pointer": true
+  },
+  "9": {
+   "json": "ready",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.batch.v1.JobTemplateSpec": {
+  "1": {
+   "json": "metadata",
+   "omitempty": true
+  },
+  "2": {
+   "json": "spec",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.batch.v1.PodFailurePolicy": {
+  "1": {
+   "json": "rules"
+  }
+ },
+ "k8s.io.api.batch.v1.PodFailurePolicyOnExitCodesRequirement": {
+  "1": {
+   "json": "containerName",
+   "omitempty": true,
+   "pointer": true
+  },
+  "2": {
+   "json": "operator"
+  },
+  "3": {
+   "json": "values"
+  }
+ },
+ "k8s.io.api.batch.v1.PodFailurePolicyOnPodConditionsPattern": {
+  "1": {
+   "json": "type"
+  },
+  "2": {
+   "json": "status"
+  }
+ },
+ "k8s.io.api.batch.v1.PodFailurePolicyRule": {
+  "1": {
+   "json": "action"
+  },
+  "2": {
+   "json": "onExitCodes",
+   "omitempty": true,
+   "pointer": true
+  },
+  "3": {
+   "json": "onPodConditions",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.batch.v1.SuccessPolicy": {
+  "1": {
+   "json": "rules"
+  }
+ },
+ "k8s.io.api.batch.v1.SuccessPolicyRule": {
+  "1": {
+   "json": "succeededIndexes",
+   "omitempty": true,
+   "pointer": true
+  },
+  "2": {
+   "json": "succeededCount",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.batch.v1.UncountedTerminatedPods": {
+  "1": {
+   "json": "succeeded",
+   "omitempty": true
+  },
+  "2": {
+   "json": "failed",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.AWSElasticBlockStoreVolumeSource": {
+  "1": {
+   "json": "volumeID"
+  },
+  "2": {
+   "json": "fsType",
+   "omitempty": true
+  },
+  "3": {
+   "json": "partition",
+   "omitempty": true
+  },
+  "4": {
+   "json": "readOnly",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.Affinity": {
+  "1": {
+   "json": "nodeAffinity",
+   "omitempty": true,
+   "pointer": true
+  },
+  "2": {
+   "json": "podAffinity",
+   "omitempty": true,
+   "pointer": true
+  },
+  "3": {
+   "json": "podAntiAffinity",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.AppArmorProfile": {
+  "1": {
+   "json": "type"
+  },
+  "2": {
+   "json": "localhostProfile",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.AzureDiskVolumeSource": {
+  "1": {
+   "json": "diskName"
+  },
+  "2": {
+   "json": "diskURI"
+  },
+  "3": {
+   "json": "cachingMode",
+   "omitempty": true,
+   "pointer": true
+  },
+  "4": {
+   "json": "fsType",
+   "omitempty": true,
+   "pointer": true
+  },
+  "5": {
+   "json": "readOnly",
+   "omitempty": true,
+   "pointer": true
+  },
+  "6": {
+   "json": "kind",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.AzureFileVolumeSource": {
+  "1": {
+   "json": "secretName"
+  },
+  "2": {
+   "json": "shareName"
+  },
+  "3": {
+   "json": "readOnly",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.CSIVolumeSource": {
+  "1": {
+   "json": "driver"
+  },
+  "2": {
+   "json": "readOnly",
+   "omitempty": true,
+   "pointer": true
+  },
+  "3": {
+   "json": "fsType",
+   "omitempty": true,
+   "pointer": true
+  },
+  "4": {
+   "json": "volumeAttributes",
+   "omitempty": true
+  },
+  "5": {
+   "json": "nodePublishSecretRef",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.Capabilities": {
+  "1": {
+   "json": "add",
+   "omitempty": true
+  },
+  "2": {
+   "json": "drop",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.CephFSVolumeSource": {
+  "1": {
+   "json": "monitors"
+  },
+  "2": {
+   "json": "path",
+   "omitempty": true
+  },
+  "3": {
+   "json": "user",
+   "omitempty": true
+  },
+  "4": {
+   "json": "secretFile",
+   "omitempty": true
+  },
+  "5": {
+   "json": "secretRef",
+   "omitempty": true,
+   "pointer": true
+  },
+  "6": {
+   "json": "readOnly",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.CinderVolumeSource": {
+  "1": {
+   "json": "volumeID"
+  },
+  "2": {
+   "json": "fsType",
+   "omitempty": true
+  },
+  "3": {
+   "json": "readOnly",
+   "omitempty": true
+  },
+  "4": {
+   "json": "secretRef",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.ClusterTrustBundleProjection": {
+  "1": {
+   "json": "name",
+   "omitempty": true,
+   "pointer": true
+  },
+  "2": {
+   "json": "signerName",
+   "omitempty": true,
+   "pointer": true
+  },
+  "3": {
+   "json": "labelSelector",
+   "omitempty": true,
+   "pointer": true
+  },
+  "4": {
+   "json": "path"
+  },
+  "5": {
+   "json": "optional",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.ConfigMapEnvSource": {
+  "1": {
+   "json": "",
+   "inline": true
+  },
+  "2": {
+   "json": "optional",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.ConfigMapKeySelector": {
+  "1": {
+   "json": "",
+   "inline": true
+  },
+  "2": {
+   "json": "key"
+  },
+  "3": {
+   "json": "optional",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.ConfigMapProjection": {
+  "1": {
+   "json": "",
+   "inline": true
+  },
+  "2": {
+   "json": "items",
+   "omitempty": true
+  },
+  "4": {
+   "json": "optional",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.ConfigMapVolumeSource": {
+  "1": {
+   "json": "",
+   "inline": true
+  },
+  "2": {
+   "json": "items",
+   "omitempty": true
+  },
+  "3": {
+   "json": "defaultMode",
+   "omitempty": true,
+   "pointer": true
+  },
+  "4": {
+   "json": "optional",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.Container": {
+  "1": {
+   "json": "name"
+  },
+  "10": {
+   "json": "livenessProbe",
+   "omitempty": true,
+   "pointer": true
+  },
+  "11": {
+   "json": "readinessProbe",
+   "omitempty": true,
+   "pointer": true
+  },
+  "12": {
+   "json": "lifecycle",
+   "omitempty": true,
+   "pointer": true
+  },
+  "13": {
+   "json": "terminationMessagePath",
+   "omitempty": true
+  },
+  "14": {
+   "json": "imagePullPolicy",
+   "omitempty": true
+  },
+  "15": {
+   "json": "securityContext",
+   "omitempty": true,
+   "pointer": true
+  },
+  "16": {
+   "json": "stdin",
+   "omitempty": true
+  },
+  "17": {
+   "json": "stdinOnce",
+   "omitempty": true
+  },
+  "18": {
+   "json": "tty",
+   "omitempty": true
+  },
+  "19": {
+   "json": "envFrom",
+   "omitempty": true
+  },
+  "2": {
+   "json": "image",
+   "omitempty": true
+  },
+  "20": {
+   "json": "terminationMessagePolicy",
+   "omitempty": true
+  },
+  "21": {
+   "json": "volumeDevices",
+   "omitempty": true
+  },
+  "22": {
+   "json": "startupProbe",
+   "omitempty": true,
+   "pointer": true
+  },
+  "23": {
+   "json": "resizePolicy",
+   "omitempty": true
+  },
+  "24": {
+   "json": "restartPolicy",
+   "omitempty": true,
+   "pointer": true
+  },
+  "3": {
+   "json": "command",
+   "omitempty": true
+  },
+  "4": {
+   "json": "args",
+   "omitempty": true
+  },
+  "5": {
+   "json": "workingDir",
+   "omitempty": true
+  },
+  "6": {
+   "json": "ports",
+   "omitempty": true
+  },
+  "7": {
+   "json": "env",
+   "omitempty": true
+  },
+  "8": {
+   "json": "resources",
+   "omitempty": true
+  },
+  "9": {
+   "json": "volumeMounts",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.ContainerPort": {
+  "1": {
+   "json": "name",
+   "omitempty": true
+  },
+  "2": {
+   "json": "hostPort",
+   "omitempty": true
+  },
+  "3": {
+   "json": "containerPort"
+  },
+  "4": {
+   "json": "protocol",
+   "omitempty": true
+  },
+  "5": {
+   "json": "hostIP",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.ContainerResizePolicy": {
+  "1": {
+   "json": "resourceName"
+  },
+  "2": {
+   "json": "restartPolicy"
+  }
+ },
+ "k8s.io.api.core.v1.DownwardAPIProjection": {
+  "1": {
+   "json": "items",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.DownwardAPIVolumeFile": {
+  "1": {
+   "json": "path"
+  },
+  "2": {
+   "json": "fieldRef",
+   "omitempty": true,
+   "pointer": true
+  },
+  "3": {
+   "json": "resourceFieldRef",
+   "omitempty": true,
+   "pointer": true
+  },
+  "4": {
+   "json": "mode",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.DownwardAPIVolumeSource": {
+  "1": {
+   "json": "items",
+   "omitempty": true
+  },
+  "2": {
+   "json": "defaultMode",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.EmptyDirVolumeSource": {
+  "1": {
+   "json": "medium",
+   "omitempty": true
+  },
+  "2": {
+   "json": "sizeLimit",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.EnvFromSource": {
+  "1": {
+   "json": "prefix",
+   "omitempty": true
+  },
+  "2": {
+   "json": "configMapRef",
+   "omitempty": true,
+   "pointer": true
+  },
+  "3": {
+   "json": "secretRef",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.EnvVar": {
+  "1": {
+   "json": "name"
+  },
+  "2": {
+   "json": "value",
+   "omitempty": true
+  },
+  "3": {
+   "json": "valueFrom",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.EnvVarSource": {
+  "1": {
+   "json": "fieldRef",
+   "omitempty": true,
+   "pointer": true
+  },
+  "2": {
+   "json": "resourceFieldRef",
+   "omitempty": true,
+   "pointer": true
+  },
+  "3": {
+   "json": "configMapKeyRef",
+   "omitempty": true,
+   "pointer": true
+  },
+  "4": {
+   "json": "secretKeyRef",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.EphemeralContainer": {
+  "1": {
+   "json": "",
+   "inline": true
+  },
+  "2": {
+   "json": "targetContainerName",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.EphemeralContainerCommon": {
+  "1": {
+   "json": "name"
+  },
+  "10": {
+   "json": "livenessProbe",
+   "omitempty": true,
+   "pointer": true
+  },
+  "11": {
+   "json": "readinessProbe",
+   "omitempty": true,
+   "pointer": true
+  },
+  "12": {
+   "json": "lifecycle",
+   "omitempty": true,
+   "pointer": true
+  },
+  "13": {
+   "json": "terminationMessagePath",
+   "omitempty": true
+  },
+  "14": {
+   "json": "imagePullPolicy",
+   "omitempty": true
+  },
+  "15": {
+   "json": "securityContext",
+   "omitempty": true,
+   "pointer": true
+  },
+  "16": {
+   "json": "stdin",
+   "omitempty": true
+  },
+  "17": {
+   "json": "stdinOnce",
+   "omitempty": true
+  },
+  "18": {
+   "json": "tty",
+   "omitempty": true
+  },
+  "19": {
+   "json": "envFrom",
+   "omitempty": true
+  },
+  "2": {
+   "json": "image",
+   "omitempty": true
+  },
+  "20": {
+   "json": "terminationMessagePolicy",
+   "omitempty": true
+  },
+  "21": {
+   "json": "volumeDevices",
+   "omitempty": true
+  },
+  "22": {
+   "json": "startupProbe",
+   "omitempty": true,
+   "pointer": true
+  },
+  "23": {
+   "json": "resizePolicy",
+   "omitempty": true
+  },
+  "24": {
+   "json": "restartPolicy",
+   "omitempty": true,
+   "pointer": true
+  },
+  "3": {
+   "json": "command",
+   "omitempty": true
+  },
+  "4": {
+   "json": "args",
+   "omitempty": true
+  },
+  "5": {
+   "json": "workingDir",
+   "omitempty": true
+  },
+  "6": {
+   "json": "ports",
+   "omitempty": true
+  },
+  "7": {
+   "json": "env",
+   "omitempty": true
+  },
+  "8": {
+   "json": "resources",
+   "omitempty": true
+  },
+  "9": {
+   "json": "volumeMounts",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.EphemeralVolumeSource": {
+  "1": {
+   "json": "volumeClaimTemplate",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.ExecAction": {
+  "1": {
+   "json": "command",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.FCVolumeSource": {
+  "1": {
+   "json": "targetWWNs",
+   "omitempty": true
+  },
+  "2": {
+   "json": "lun",
+   "omitempty": true,
+   "pointer": true
+  },
+  "3": {
+   "json": "fsType",
+   "omitempty": true
+  },
+  "4": {
+   "json": "readOnly",
+   "omitempty": true
+  },
+  "5": {
+   "json": "wwids",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.FlexVolumeSource": {
+  "1": {
+   "json": "driver"
+  },
+  "2": {
+   "json": "fsType",
+   "omitempty": true
+  },
+  "3": {
+   "json": "secretRef",
+   "omitempty": true,
+   "pointer": true
+  },
+  "4": {
+   "json": "readOnly",
+   "omitempty": true
+  },
+  "5": {
+   "json": "options",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.FlockerVolumeSource": {
+  "1": {
+   "json": "datasetName",
+   "omitempty": true
+  },
+  "2": {
+   "json": "datasetUUID",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.GCEPersistentDiskVolumeSource": {
+  "1": {
+   "json": "pdName"
+  },
+  "2": {
+   "json": "fsType",
+   "omitempty": true
+  },
+  "3": {
+   "json": "partition",
+   "omitempty": true
+  },
+  "4": {
+   "json": "readOnly",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.GRPCAction": {
+  "1": {
+   "json": "port"
+  },
+  "2": {
+   "json": "service",
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.GitRepoVolumeSource": {
+  "1": {
+   "json": "repository"
+  },
+  "2": {
+   "json": "revision",
+   "omitempty": true
+  },
+  "3": {
+   "json": "directory",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.GlusterfsVolumeSource": {
+  "1": {
+   "json": "endpoints"
+  },
+  "2": {
+   "json": "path"
+  },
+  "3": {
+   "json": "readOnly",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.HTTPGetAction": {
+  "1": {
+   "json": "path",
+   "omitempty": true
+  },
+  "2": {
+   "json": "port"
+  },
+  "3": {
+   "json": "host",
+   "omitempty": true
+  },
+  "4": {
+   "json": "scheme",
+   "omitempty": true
+  },
+  "5": {
+   "json": "httpHeaders",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.HTTPHeader": {
+  "1": {
+   "json": "name"
+  },
+  "2": {
+   "json": "value"
+  }
+ },
+ "k8s.io.api.core.v1.HostAlias": {
+  "1": {
+   "json": "ip"
+  },
+  "2": {
+   "json": "hostnames",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.HostPathVolumeSource": {
+  "1": {
+   "json": "path"
+  },
+  "2": {
+   "json": "type",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.ISCSIVolumeSource": {
+  "1": {
+   "json": "targetPortal"
+  },
+  "10": {
+   "json": "secretRef",
+   "omitempty": true,
+   "pointer": true
+  },
+  "11": {
+   "json": "chapAuthSession",
+   "omitempty": true
+  },
+  "12": {
+   "json": "initiatorName",
+   "omitempty": true,
+   "pointer": true
+  },
+  "2": {
+   "json": "iqn"
+  },
+  "3": {
+   "json": "lun"
+  },
+  "4": {
+   "json": "iscsiInterface",
+   "omitempty": true
+  },
+  "5": {
+   "json": "fsType",
+   "omitempty": true
+  },
+  "6": {
+   "json": "readOnly",
+   "omitempty": true
+  },
+  "7": {
+   "json": "portals",
+   "omitempty": true
+  },
+  "8": {
+   "json": "chapAuthDiscovery",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.ImageVolumeSource": {
+  "1": {
+   "json": "reference",
+   "omitempty": true
+  },
+  "2": {
+   "json": "pullPolicy",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.KeyToPath": {
+  "1": {
+   "json": "key"
+  },
+  "2": {
+   "json": "path"
+  },
+  "3": {
+   "json": "mode",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.Lifecycle": {
+  "1": {
+   "json": "postStart",
+   "omitempty": true,
+   "pointer": true
+  },
+  "2": {
+   "json": "preStop",
+   "omitempty": true,
+   "pointer": true
+  },
+  "3": {
+   "json": "stopSignal",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.LifecycleHandler": {
+  "1": {
+   "json": "exec",
+   "omitempty": true,
+   "pointer": true
+  },
+  "2": {
+   "json": "httpGet",
+   "omitempty": true,
+   "pointer": true
+  },
+  "3": {
+   "json": "tcpSocket",
+   "omitempty": true,
+   "pointer": true
+  },
+  "4": {
+   "json": "sleep",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.LocalObjectReference": {
+  "1": {
+   "json": "name",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.NFSVolumeSource": {
+  "1": {
+   "json": "server"
+  },
+  "2": {
+   "json": "path"
+  },
+  "3": {
+   "json": "readOnly",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.NodeAffinity": {
+  "1": {
+   "json": "requiredDuringSchedulingIgnoredDuringExecution",
+   "omitempty": true,
+   "pointer": true
+  },
+  "2": {
+   "json": "preferredDuringSchedulingIgnoredDuringExecution",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.NodeSelector": {
+  "1": {
+   "json": "nodeSelectorTerms"
+  }
+ },
+ "k8s.io.api.core.v1.NodeSelectorRequirement": {
+  "1": {
+   "json": "key"
+  },
+  "2": {
+   "json": "operator"
+  },
+  "3": {
+   "json": "values",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.NodeSelectorTerm": {
+  "1": {
+   "json": "matchExpressions",
+   "omitempty": true
+  },
+  "2": {
+   "json": "matchFields",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.ObjectFieldSelector": {
+  "1": {
+   "json": "apiVersion",
+   "omitempty": true
+  },
+  "2": {
+   "json": "fieldPath"
+  }
+ },
+ "k8s.io.api.core.v1.ObjectReference": {
+  "1": {
+   "json": "kind",
+   "omitempty": true
+  },
+  "2": {
+   "json": "namespace",
+   "omitempty": true
+  },
+  "3": {
+   "json": "name",
+   "omitempty": true
+  },
+  "4": {
+   "json": "uid",
+   "omitempty": true
+  },
+  "5": {
+   "json": "apiVersion",
+   "omitempty": true
+  },
+  "6": {
+   "json": "resourceVersion",
+   "omitempty": true
+  },
+  "7": {
+   "json": "fieldPath",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.PersistentVolumeClaimSpec": {
+  "1": {
+   "json": "accessModes",
+   "omitempty": true
+  },
+  "2": {
+   "json": "resources",
+   "omitempty": true
+  },
+  "3": {
+   "json": "volumeName",
+   "omitempty": true
+  },
+  "4": {
+   "json": "selector",
+   "omitempty": true,
+   "pointer": true
+  },
+  "5": {
+   "json": "storageClassName",
+   "omitempty": true,
+   "pointer": true
+  },
+  "6": {
+   "json": "volumeMode",
+   "omitempty": true,
+   "pointer": true
+  },
+  "7": {
+   "json": "dataSource",
+   "omitempty": true,
+   "pointer": true
+  },
+  "8": {
+   "json": "dataSourceRef",
+   "omitempty": true,
+   "pointer": true
+  },
+  "9": {
+   "json": "volumeAttributesClassName",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.PersistentVolumeClaimTemplate": {
+  "1": {
+   "json": "metadata",
+   "omitempty": true
+  },
+  "2": {
+   "json": "spec"
+  }
+ },
+ "k8s.io.api.core.v1.PersistentVolumeClaimVolumeSource": {
+  "1": {
+   "json": "claimName"
+  },
+  "2": {
+   "json": "readOnly",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.PhotonPersistentDiskVolumeSource": {
+  "1": {
+   "json": "pdID"
+  },
+  "2": {
+   "json": "fsType",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.PodAffinity": {
+  "1": {
+   "json": "requiredDuringSchedulingIgnoredDuringExecution",
+   "omitempty": true
+  },
+  "2": {
+   "json": "preferredDuringSchedulingIgnoredDuringExecution",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.PodAffinityTerm": {
+  "1": {
+   "json": "labelSelector",
+   "omitempty": true,
+   "pointer": true
+  },
+  "2": {
+   "json": "namespaces",
+   "omitempty": true
+  },
+  "3": {
+   "json": "topologyKey"
+  },
+  "4": {
+   "json": "namespaceSelector",
+   "omitempty": true,
+   "pointer": true
+  },
+  "5": {
+   "json": "matchLabelKeys",
+   "omitempty": true
+  },
+  "6": {
+   "json": "mismatchLabelKeys",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.PodAntiAffinity": {
+  "1": {
+   "json": "requiredDuringSchedulingIgnoredDuringExecution",
+   "omitempty": true
+  },
+  "2": {
+   "json": "preferredDuringSchedulingIgnoredDuringExecution",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.PodDNSConfig": {
+  "1": {
+   "json": "nameservers",
+   "omitempty": true
+  },
+  "2": {
+   "json": "searches",
+   "omitempty": true
+  },
+  "3": {
+   "json": "options",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.PodDNSConfigOption": {
+  "1": {
+   "json": "name",
+   "omitempty": true
+  },
+  "2": {
+   "json": "value",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.PodOS": {
+  "1": {
+   "json": "name"
+  }
+ },
+ "k8s.io.api.core.v1.PodReadinessGate": {
+  "1": {
+   "json": "conditionType"
+  }
+ },
+ "k8s.io.api.core.v1.PodResourceClaim": {
+  "1": {
+   "json": "name"
+  },
+  "3": {
+   "json": "resourceClaimName",
+   "omitempty": true,
+   "pointer": true
+  },
+  "4": {
+   "json": "resourceClaimTemplateName",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.PodSchedulingGate": {
+  "1": {
+   "json": "name"
+  }
+ },
+ "k8s.io.api.core.v1.PodSecurityContext": {
+  "1": {
+   "json": "seLinuxOptions",
+   "omitempty": true,
+   "pointer": true
+  },
+  "10": {
+   "json": "seccompProfile",
+   "omitempty": true,
+   "pointer": true
+  },
+  "11": {
+   "json": "appArmorProfile",
+   "omitempty": true,
+   "pointer": true
+  },
+  "12": {
+   "json": "supplementalGroupsPolicy",
+   "omitempty": true,
+   "pointer": true
+  },
+  "13": {
+   "json": "seLinuxChangePolicy",
+   "omitempty": true,
+   "pointer": true
+  },
+  "2": {
+   "json": "runAsUser",
+   "omitempty": true,
+   "pointer": true
+  },
+  "3": {
+   "json": "runAsNonRoot",
+   "omitempty": true,
+   "pointer": true
+  },
+  "4": {
+   "json": "supplementalGroups",
+   "omitempty": true
+  },
+  "5": {
+   "json": "fsGroup",
+   "omitempty": true,
+   "pointer": true
+  },
+  "6": {
+   "json": "runAsGroup",
+   "omitempty": true,
+   "pointer": true
+  },
+  "7": {
+   "json": "sysctls",
+   "omitempty": true
+  },
+  "8": {
+   "json": "windowsOptions",
+   "omitempty": true,
+   "pointer": true
+  },
+  "9": {
+   "json": "fsGroupChangePolicy",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.PodSpec": {
+  "1": {
+   "json": "volumes",
+   "omitempty": true
+  },
+  "10": {
+   "json": "nodeName",
+   "omitempty": true
+  },
+  "11": {
+   "json": "hostNetwork",
+   "omitempty": true
+  },
+  "12": {
+   "json": "hostPID",
+   "omitempty": true
+  },
+  "13": {
+   "json": "hostIPC",
+   "omitempty": true
+  },
+  "14": {
+   "json": "securityContext",
+   "omitempty": true,
+   "pointer": true
+  },
+  "15": {
+   "json": "imagePullSecrets",
+   "omitempty": true
+  },
+  "16": {
+   "json": "hostname",
+   "omitempty": true
+  },
+  "17": {
+   "json": "subdomain",
+   "omitempty": true
+  },
+  "18": {
+   "json": "affinity",
+   "omitempty": true,
+   "pointer": true
+  },
+  "19": {
+   "json": "schedulerName",
+   "omitempty": true
+  },
+  "2": {
+   "json": "containers"
+  },
+  "20": {
+   "json": "initContainers",
+   "omitempty": true
+  },
+  "21": {
+   "json": "automountServiceAccountToken",
+   "omitempty": true,
+   "pointer": true
+  },
+  "22": {
+   "json": "tolerations",
+   "omitempty": true
+  },
+  "23": {
+   "json": "hostAliases",
+   "omitempty": true
+  },
+  "24": {
+   "json": "priorityClassName",
+   "omitempty": true
+  },
+  "25": {
+   "json": "priority",
+   "omitempty": true,
+   "pointer": true
+  },
+  "26": {
+   "json": "dnsConfig",
+   "omitempty": true,
+   "pointer": true
+  },
+  "27": {
+   "json": "shareProcessNamespace",
+   "omitempty": true,
+   "pointer": true
+  },
+  "28": {
+   "json": "readinessGates",
+   "omitempty": true
+  },
+  "29": {
+   "json": "runtimeClassName",
+   "omitempty": true,
+   "pointer": true
+  },
+  "3": {
+   "json": "restartPolicy",
+   "omitempty": true
+  },
+  "30": {
+   "json": "enableServiceLinks",
+   "omitempty": true,
+   "pointer": true
+  },
+  "31": {
+   "json": "preemptionPolicy",
+   "omitempty": true,
+   "pointer": true
+  },
+  "32": {
+   "json": "overhead",
+   "omitempty": true
+  },
+  "33": {
+   "json": "topologySpreadConstraints",
+   "omitempty": true
+  },
+  "34": {
+   "json": "ephemeralContainers",
+   "omitempty": true
+  },
+  "35": {
+   "json": "setHostnameAsFQDN",
+   "omitempty": true,
+   "pointer": true
+  },
+  "36": {
+   "json": "os",
+   "omitempty": true,
+   "pointer": true
+  },
+  "37": {
+   "json": "hostUsers",
+   "omitempty": true,
+   "pointer": true
+  },
+  "38": {
+   "json": "schedulingGates",
+   "omitempty": true
+  },
+  "39": {
+   "json": "resourceClaims",
+   "omitempty": true
+  },
+  "4": {
+   "json": "terminationGracePeriodSeconds",
+   "omitempty": true,
+   "pointer": true
+  },
+  "40": {
+   "json": "resources",
+   "omitempty": true,
+   "pointer": true
+  },
+  "5": {
+   "json": "activeDeadlineSeconds",
+   "omitempty": true,
+   "pointer": true
+  },
+  "6": {
+   "json": "dnsPolicy",
+   "omitempty": true
+  },
+  "7": {
+   "json": "nodeSelector",
+   "omitempty": true
+  },
+  "8": {
+   "json": "serviceAccountName",
+   "omitempty": true
+  },
+  "9": {
+   "json": "serviceAccount",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.PodTemplateSpec": {
+  "1": {
+   "json": "metadata",
+   "omitempty": true
+  },
+  "2": {
+   "json": "spec",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.PortworxVolumeSource": {
+  "1": {
+   "json": "volumeID"
+  },
+  "2": {
+   "json": "fsType",
+   "omitempty": true
+  },
+  "3": {
+   "json": "readOnly",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.PreferredSchedulingTerm": {
+  "1": {
+   "json": "weight"
+  },
+  "2": {
+   "json": "preference"
+  }
+ },
+ "k8s.io.api.core.v1.Probe": {
+  "1": {
+   "json": "",
+   "inline": true
+  },
+  "2": {
+   "json": "initialDelaySeconds",
+   "omitempty": true
+  },
+  "3": {
+   "json": "timeoutSeconds",
+   "omitempty": true
+  },
+  "4": {
+   "json": "periodSeconds",
+   "omitempty": true
+  },
+  "5": {
+   "json": "successThreshold",
+   "omitempty": true
+  },
+  "6": {
+   "json": "failureThreshold",
+   "omitempty": true
+  },
+  "7": {
+   "json": "terminationGracePeriodSeconds",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.ProbeHandler": {
+  "1": {
+   "json": "exec",
+   "omitempty": true,
+   "pointer": true
+  },
+  "2": {
+   "json": "httpGet",
+   "omitempty": true,
+   "pointer": true
+  },
+  "3": {
+   "json": "tcpSocket",
+   "omitempty": true,
+   "pointer": true
+  },
+  "4": {
+   "json": "grpc",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.ProjectedVolumeSource": {
+  "1": {
+   "json": "sources"
+  },
+  "2": {
+   "json": "defaultMode",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.QuobyteVolumeSource": {
+  "1": {
+   "json": "registry"
+  },
+  "2": {
+   "json": "volume"
+  },
+  "3": {
+   "json": "readOnly",
+   "omitempty": true
+  },
+  "4": {
+   "json": "user",
+   "omitempty": true
+  },
+  "5": {
+   "json": "group",
+   "omitempty": true
+  },
+  "6": {
+   "json": "tenant",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.RBDVolumeSource": {
+  "1": {
+   "json": "monitors"
+  },
+  "2": {
+   "json": "image"
+  },
+  "3": {
+   "json": "fsType",
+   "omitempty": true
+  },
+  "4": {
+   "json": "pool",
+   "omitempty": true
+  },
+  "5": {
+   "json": "user",
+   "omitempty": true
+  },
+  "6": {
+   "json": "keyring",
+   "omitempty": true
+  },
+  "7": {
+   "json": "secretRef",
+   "omitempty": true,
+   "pointer": true
+  },
+  "8": {
+   "json": "readOnly",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.ResourceClaim": {
+  "1": {
+   "json": "name"
+  },
+  "2": {
+   "json": "request",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.ResourceFieldSelector": {
+  "1": {
+   "json": "containerName",
+   "omitempty": true
+  },
+  "2": {
+   "json": "resource"
+  },
+  "3": {
+   "json": "divisor",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.ResourceRequirements": {
+  "1": {
+   "json": "limits",
+   "omitempty": true
+  },
+  "2": {
+   "json": "requests",
+   "omitempty": true
+  },
+  "3": {
+   "json": "claims",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.SELinuxOptions": {
+  "1": {
+   "json": "user",
+   "omitempty": true
+  },
+  "2": {
+   "json": "role",
+   "omitempty": true
+  },
+  "3": {
+   "json": "type",
+   "omitempty": true
+  },
+  "4": {
+   "json": "level",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.ScaleIOVolumeSource": {
+  "1": {
+   "json": "gateway"
+  },
+  "10": {
+   "json": "readOnly",
+   "omitempty": true
+  },
+  "2": {
+   "json": "system"
+  },
+  "3": {
+   "json": "secretRef",
+   "pointer": true
+  },
+  "4": {
+   "json": "sslEnabled",
+   "omitempty": true
+  },
+  "5": {
+   "json": "protectionDomain",
+   "omitempty": true
+  },
+  "6": {
+   "json": "storagePool",
+   "omitempty": true
+  },
+  "7": {
+   "json": "storageMode",
+   "omitempty": true
+  },
+  "8": {
+   "json": "volumeName",
+   "omitempty": true
+  },
+  "9": {
+   "json": "fsType",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.SeccompProfile": {
+  "1": {
+   "json": "type"
+  },
+  "2": {
+   "json": "localhostProfile",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.Secret": {
+  "1": {
+   "json": "metadata",
+   "omitempty": true
+  },
+  "2": {
+   "json": "data",
+   "omitempty": true
+  },
+  "3": {
+   "json": "type",
+   "omitempty": true
+  },
+  "4": {
+   "json": "stringData",
+   "omitempty": true
+  },
+  "5": {
+   "json": "immutable",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.SecretEnvSource": {
+  "1": {
+   "json": "",
+   "inline": true
+  },
+  "2": {
+   "json": "optional",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.SecretKeySelector": {
+  "1": {
+   "json": "",
+   "inline": true
+  },
+  "2": {
+   "json": "key"
+  },
+  "3": {
+   "json": "optional",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.SecretProjection": {
+  "1": {
+   "json": "",
+   "inline": true
+  },
+  "2": {
+   "json": "items",
+   "omitempty": true
+  },
+  "4": {
+   "json": "optional",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.SecretVolumeSource": {
+  "1": {
+   "json": "secretName",
+   "omitempty": true
+  },
+  "2": {
+   "json": "items",
+   "omitempty": true
+  },
+  "3": {
+   "json": "defaultMode",
+   "omitempty": true,
+   "pointer": true
+  },
+  "4": {
+   "json": "optional",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.SecurityContext": {
+  "1": {
+   "json": "capabilities",
+   "omitempty": true,
+   "pointer": true
+  },
+  "10": {
+   "json": "windowsOptions",
+   "omitempty": true,
+   "pointer": true
+  },
+  "11": {
+   "json": "seccompProfile",
+   "omitempty": true,
+   "pointer": true
+  },
+  "12": {
+   "json": "appArmorProfile",
+   "omitempty": true,
+   "pointer": true
+  },
+  "2": {
+   "json": "privileged",
+   "omitempty": true,
+   "pointer": true
+  },
+  "3": {
+   "json": "seLinuxOptions",
+   "omitempty": true,
+   "pointer": true
+  },
+  "4": {
+   "json": "runAsUser",
+   "omitempty": true,
+   "pointer": true
+  },
+  "5": {
+   "json": "runAsNonRoot",
+   "omitempty": true,
+   "pointer": true
+  },
+  "6": {
+   "json": "readOnlyRootFilesystem",
+   "omitempty": true,
+   "pointer": true
+  },
+  "7": {
+   "json": "allowPrivilegeEscalation",
+   "omitempty": true,
+   "pointer": true
+  },
+  "8": {
+   "json": "runAsGroup",
+   "omitempty": true,
+   "pointer": true
+  },
+  "9": {
+   "json": "procMount",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.ServiceAccountTokenProjection": {
+  "1": {
+   "json": "audience",
+   "omitempty": true
+  },
+  "2": {
+   "json": "expirationSeconds",
+   "omitempty": true,
+   "pointer": true
+  },
+  "3": {
+   "json": "path"
+  }
+ },
+ "k8s.io.api.core.v1.SleepAction": {
+  "1": {
+   "json": "seconds"
+  }
+ },
+ "k8s.io.api.core.v1.StorageOSVolumeSource": {
+  "1": {
+   "json": "volumeName",
+   "omitempty": true
+  },
+  "2": {
+   "json": "volumeNamespace",
+   "omitempty": true
+  },
+  "3": {
+   "json": "fsType",
+   "omitempty": true
+  },
+  "4": {
+   "json": "readOnly",
+   "omitempty": true
+  },
+  "5": {
+   "json": "secretRef",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.Sysctl": {
+  "1": {
+   "json": "name"
+  },
+  "2": {
+   "json": "value"
+  }
+ },
+ "k8s.io.api.core.v1.TCPSocketAction": {
+  "1": {
+   "json": "port"
+  },
+  "2": {
+   "json": "host",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.Toleration": {
+  "1": {
+   "json": "key",
+   "omitempty": true
+  },
+  "2": {
+   "json": "operator",
+   "omitempty": true
+  },
+  "3": {
+   "json": "value",
+   "omitempty": true
+  },
+  "4": {
+   "json": "effect",
+   "omitempty": true
+  },
+  "5": {
+   "json": "tolerationSeconds",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.TopologySpreadConstraint": {
+  "1": {
+   "json": "maxSkew"
+  },
+  "2": {
+   "json": "topologyKey"
+  },
+  "3": {
+   "json": "whenUnsatisfiable"
+  },
+  "4": {
+   "json": "labelSelector",
+   "omitempty": true,
+   "pointer": true
+  },
+  "5": {
+   "json": "minDomains",
+   "omitempty": true,
+   "pointer": true
+  },
+  "6": {
+   "json": "nodeAffinityPolicy",
+   "omitempty": true,
+   "pointer": true
+  },
+  "7": {
+   "json": "nodeTaintsPolicy",
+   "omitempty": true,
+   "pointer": true
+  },
+  "8": {
+   "json": "matchLabelKeys",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.TypedLocalObjectReference": {
+  "1": {
+   "json": "apiGroup",
+   "pointer": true
+  },
+  "2": {
+   "json": "kind"
+  },
+  "3": {
+   "json": "name"
+  }
+ },
+ "k8s.io.api.core.v1.TypedObjectReference": {
+  "1": {
+   "json": "apiGroup",
+   "pointer": true
+  },
+  "2": {
+   "json": "kind"
+  },
+  "3": {
+   "json": "name"
+  },
+  "4": {
+   "json": "namespace",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.Volume": {
+  "1": {
+   "json": "name"
+  },
+  "2": {
+   "json": "",
+   "inline": true
+  }
+ },
+ "k8s.io.api.core.v1.VolumeDevice": {
+  "1": {
+   "json": "name"
+  },
+  "2": {
+   "json": "devicePath"
+  }
+ },
+ "k8s.io.api.core.v1.VolumeMount": {
+  "1": {
+   "json": "name"
+  },
+  "2": {
+   "json": "readOnly",
+   "omitempty": true
+  },
+  "3": {
+   "json": "mountPath"
+  },
+  "4": {
+   "json": "subPath",
+   "omitempty": true
+  },
+  "5": {
+   "json": "mountPropagation",
+   "omitempty": true,
+   "pointer": true
+  },
+  "6": {
+   "json": "subPathExpr",
+   "omitempty": true
+  },
+  "7": {
+   "json": "recursiveReadOnly",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.VolumeProjection": {
+  "1": {
+   "json": "secret",
+   "omitempty": true,
+   "pointer": true
+  },
+  "2": {
+   "json": "downwardAPI",
+   "omitempty": true,
+   "pointer": true
+  },
+  "3": {
+   "json": "configMap",
+   "omitempty": true,
+   "pointer": true
+  },
+  "4": {
+   "json": "serviceAccountToken",
+   "omitempty": true,
+   "pointer": true
+  },
+  "5": {
+   "json": "clusterTrustBundle",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.VolumeResourceRequirements": {
+  "1": {
+   "json": "limits",
+   "omitempty": true
+  },
+  "2": {
+   "json": "requests",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.VolumeSource": {
+  "1": {
+   "json": "hostPath",
+   "omitempty": true,
+   "pointer": true
+  },
+  "10": {
+   "json": "persistentVolumeClaim",
+   "omitempty": true,
+   "pointer": true
+  },
+  "11": {
+   "json": "rbd",
+   "omitempty": true,
+   "pointer": true
+  },
+  "12": {
+   "json": "flexVolume",
+   "omitempty": true,
+   "pointer": true
+  },
+  "13": {
+   "json": "cinder",
+   "omitempty": true,
+   "pointer": true
+  },
+  "14": {
+   "json": "cephfs",
+   "omitempty": true,
+   "pointer": true
+  },
+  "15": {
+   "json": "flocker",
+   "omitempty": true,
+   "pointer": true
+  },
+  "16": {
+   "json": "downwardAPI",
+   "omitempty": true,
+   "pointer": true
+  },
+  "17": {
+   "json": "fc",
+   "omitempty": true,
+   "pointer": true
+  },
+  "18": {
+   "json": "azureFile",
+   "omitempty": true,
+   "pointer": true
+  },
+  "19": {
+   "json": "configMap",
+   "omitempty": true,
+   "pointer": true
+  },
+  "2": {
+   "json": "emptyDir",
+   "omitempty": true,
+   "pointer": true
+  },
+  "20": {
+   "json": "vsphereVolume",
+   "omitempty": true,
+   "pointer": true
+  },
+  "21": {
+   "json": "quobyte",
+   "omitempty": true,
+   "pointer": true
+  },
+  "22": {
+   "json": "azureDisk",
+   "omitempty": true,
+   "pointer": true
+  },
+  "23": {
+   "json": "photonPersistentDisk",
+   "omitempty": true,
+   "pointer": true
+  },
+  "24": {
+   "json": "portworxVolume",
+   "omitempty": true,
+   "pointer": true
+  },
+  "25": {
+   "json": "scaleIO",
+   "omitempty": true,
+   "pointer": true
+  },
+  "26": {
+   "json": "projected",
+   "omitempty": true,
+   "pointer": true
+  },
+  "27": {
+   "json": "storageos",
+   "omitempty": true,
+   "pointer": true
+  },
+  "28": {
+   "json": "csi",
+   "omitempty": true,
+   "pointer": true
+  },
+  "29": {
+   "json": "ephemeral",
+   "omitempty": true,
+   "pointer": true
+  },
+  "3": {
+   "json": "gcePersistentDisk",
+   "omitempty": true,
+   "pointer": true
+  },
+  "30": {
+   "json": "image",
+   "omitempty": true,
+   "pointer": true
+  },
+  "4": {
+   "json": "awsElasticBlockStore",
+   "omitempty": true,
+   "pointer": true
+  },
+  "5": {
+   "json": "gitRepo",
+   "omitempty": true,
+   "pointer": true
+  },
+  "6": {
+   "json": "secret",
+   "omitempty": true,
+   "pointer": true
+  },
+  "7": {
+   "json": "nfs",
+   "omitempty": true,
+   "pointer": true
+  },
+  "8": {
+   "json": "iscsi",
+   "omitempty": true,
+   "pointer": true
+  },
+  "9": {
+   "json": "glusterfs",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.api.core.v1.VsphereVirtualDiskVolumeSource": {
+  "1": {
+   "json": "volumePath"
+  },
+  "2": {
+   "json": "fsType",
+   "omitempty": true
+  },
+  "3": {
+   "json": "storagePolicyName",
+   "omitempty": true
+  },
+  "4": {
+   "json": "storagePolicyID",
+   "omitempty": true
+  }
+ },
+ "k8s.io.api.core.v1.WeightedPodAffinityTerm": {
+  "1": {
+   "json": "weight"
+  },
+  "2": {
+   "json": "podAffinityTerm"
+  }
+ },
+ "k8s.io.api.core.v1.WindowsSecurityContextOptions": {
+  "1": {
+   "json": "gmsaCredentialSpecName",
+   "omitempty": true,
+   "pointer": true
+  },
+  "2": {
+   "json": "gmsaCredentialSpec",
+   "omitempty": true,
+   "pointer": true
+  },
+  "3": {
+   "json": "runAsUserName",
+   "omitempty": true,
+   "pointer": true
+  },
+  "4": {
+   "json": "hostProcess",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.apimachinery.pkg.apis.meta.v1.LabelSelector": {
+  "1": {
+   "json": "matchLabels",
+   "omitempty": true
+  },
+  "2": {
+   "json": "matchExpressions",
+   "omitempty": true
+  }
+ },
+ "k8s.io.apimachinery.pkg.apis.meta.v1.LabelSelectorRequirement": {
+  "1": {
+   "json": "key"
+  },
+  "2": {
+   "json": "operator"
+  },
+  "3": {
+   "json": "values",
+   "omitempty": true
+  }
+ },
+ "k8s.io.apimachinery.pkg.apis.meta.v1.ManagedFieldsEntry": {
+  "1": {
+   "json": "manager",
+   "omitempty": true
+  },
+  "2": {
+   "json": "operation",
+   "omitempty": true
+  },
+  "3": {
+   "json": "apiVersion",
+   "omitempty": true
+  },
+  "4": {
+   "json": "time",
+   "omitempty": true,
+   "pointer": true
+  },
+  "6": {
+   "json": "fieldsType",
+   "omitempty": true
+  },
+  "7": {
+   "json": "fieldsV1",
+   "omitempty": true,
+   "pointer": true
+  },
+  "8": {
+   "json": "subresource",
+   "omitempty": true
+  }
+ },
+ "k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta": {
+  "1": {
+   "json": "name",
+   "omitempty": true
+  },
+  "10": {
+   "json": "deletionGracePeriodSeconds",
+   "omitempty": true,
+   "pointer": true
+  },
+  "11": {
+   "json": "labels",
+   "omitempty": true
+  },
+  "12": {
+   "json": "annotations",
+   "omitempty": true
+  },
+  "13": {
+   "json": "ownerReferences",
+   "omitempty": true
+  },
+  "14": {
+   "json": "finalizers",
+   "omitempty": true
+  },
+  "17": {
+   "json": "managedFields",
+   "omitempty": true
+  },
+  "2": {
+   "json": "generateName",
+   "omitempty": true
+  },
+  "3": {
+   "json": "namespace",
+   "omitempty": true
+  },
+  "4": {
+   "json": "selfLink",
+   "omitempty": true
+  },
+  "5": {
+   "json": "uid",
+   "omitempty": true
+  },
+  "6": {
+   "json": "resourceVersion",
+   "omitempty": true
+  },
+  "7": {
+   "json": "generation",
+   "omitempty": true
+  },
+  "8": {
+   "json": "creationTimestamp",
+   "omitempty": true
+  },
+  "9": {
+   "json": "deletionTimestamp",
+   "omitempty": true,
+   "pointer": true
+  }
+ },
+ "k8s.io.apimachinery.pkg.apis.meta.v1.OwnerReference": {
+  "1": {
+   "json": "kind"
+  },
+  "3": {
+   "json": "name"
+  },
+  "4": {
+   "json": "uid"
+  },
+  "5": {
+   "json": "apiVersion"
+  },
+  "6": {
+   "json": "controller",
+   "omitempty": true,
+   "pointer": true
+  },
+  "7": {
+   "json": "blockOwnerDeletion",
+   "omitempty": true,
+   "pointer": true
+  }
+ }
+}

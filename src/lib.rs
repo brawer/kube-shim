@@ -9,6 +9,7 @@ pub mod config;
 pub mod container_env;
 pub mod currency;
 pub mod db;
+pub mod k8s_protobuf;
 pub mod k8s_status;
 pub mod metadata;
 pub mod metrics_export;

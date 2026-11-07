@@ -10,7 +10,7 @@
 //! hand-rolled duplicate.
 
 use crate::reconcile::TickHealth;
-use crate::{api, auth, config, metrics_export, ssh, status_page};
+use crate::{api, auth, config, k8s_protobuf, metrics_export, ssh, status_page};
 use axum::{
     http::{HeaderName, HeaderValue},
     middleware,
@@ -161,6 +161,10 @@ fn authenticated_router(
             "/apis/cost.kube-shim.brawer.ch/v1/budget/topup",
             post(api::budget::topup),
         )
+        // Protobuf request bodies become JSON before any handler sees
+        // them (issue #106); inside the auth layer below, so nothing is
+        // decoded for an unauthenticated request.
+        .layer(middleware::from_fn(k8s_protobuf::protobuf_bodies))
         .layer(Extension(notify))
         .layer(Extension(worker_ssh))
         .layer(Extension(cost_report_config))
