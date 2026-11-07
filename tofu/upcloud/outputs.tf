@@ -14,8 +14,8 @@ output "server_id" {
 }
 
 output "api_tokens" {
-  description = "The bearer token(s) minted for the authenticated API (config.toml's server.api_tokens) -- feed these into your kubernetes_provider's token argument or kubectl config. Index 0 is always the first-minted token; raising api_token_count only ever appends, so existing indices keep their values across a rotation."
-  value       = [for t in random_password.api_token : t.result]
+  description = "The bearer tokens minted for the authenticated API (config.toml's server.api_tokens), as a map from the names in var.api_tokens to token values -- feed one into your kubernetes_provider's token argument or kubectl config. Adding or removing a name never changes the value of any other token."
+  value       = { for name, t in random_password.api_token : name => t.result }
   sensitive   = true
 }
 
