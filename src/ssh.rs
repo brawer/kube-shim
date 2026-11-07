@@ -76,14 +76,54 @@ pub enum SshError {
     ConnectTimeout(Duration),
 }
 
-/// The result of a one-shot (non-streaming) command: everything the
-/// remote side wrote to stdout, and its exit status if the channel
-/// reported one before closing (`None` is rare -- an abrupt disconnect --
-/// but real, so callers must not assume it's always present).
+/// The SSH extended-data type code for stderr (RFC 4254, section 5.2).
+const SSH_EXTENDED_DATA_STDERR: u32 = 1;
+
+/// The result of a one-shot (non-streaming) command, and its exit status
+/// if the channel reported one before closing (`None` is rare -- an
+/// abrupt disconnect -- but real, so callers must not assume it's always
+/// present).
+///
+/// `stdout` and `stderr` hold each stream on its own. `combined` holds
+/// both, interleaved in the order the chunks arrived -- what `kubectl
+/// logs` shows for a container, since Kubernetes merges a container's
+/// stdout and stderr into one log (issue #121). Callers that parse a
+/// value (`cat /tmp/exit-code`) read `stdout`; callers that show a
+/// container's log (`podman logs`, which writes the container's stderr
+/// to its own stderr) read `combined`.
 #[derive(Debug)]
 pub struct ExecOutput {
     pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub combined: Vec<u8>,
     pub exit_status: Option<u32>,
+}
+
+/// Reads `channel` until it closes, collecting stdout, stderr and their
+/// interleaved combination. Other extended-data types and channel
+/// messages are ignored.
+async fn collect_output(channel: &mut russh::Channel<client::Msg>) -> ExecOutput {
+    let mut output = ExecOutput {
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        combined: Vec::new(),
+        exit_status: None,
+    };
+    while let Some(msg) = channel.wait().await {
+        match msg {
+            ChannelMsg::Data { ref data } => {
+                output.stdout.extend_from_slice(data);
+                output.combined.extend_from_slice(data);
+            }
+            ChannelMsg::ExtendedData { ref data, ext } if ext == SSH_EXTENDED_DATA_STDERR => {
+                output.stderr.extend_from_slice(data);
+                output.combined.extend_from_slice(data);
+            }
+            ChannelMsg::ExitStatus { exit_status } => output.exit_status = Some(exit_status),
+            _ => {}
+        }
+    }
+    output
 }
 
 struct Client;
@@ -158,9 +198,9 @@ async fn connect_and_open_channel_with_timeout(
     Ok(channel)
 }
 
-/// Runs `command` once, collecting every byte written to stdout (stderr
-/// and other channel messages are discarded) until the channel closes,
-/// then returns it along with the exit status. Used for short, quick
+/// Runs `command` once, collecting everything it writes to stdout and
+/// stderr until the channel closes, then returns that along with the
+/// exit status (see `ExecOutput`). Used for short, quick
 /// checks (`cat /tmp/exit-code`) and one-shot full-log fetches (`podman
 /// logs {id}`) -- never for a `-f`/follow command, which would never
 /// return; see `exec_stream` for that.
@@ -171,22 +211,7 @@ pub async fn exec_once(
     command: &str,
 ) -> Result<ExecOutput, SshError> {
     let mut channel = connect_and_open_channel(host, port, private_key_pem, command).await?;
-
-    let mut stdout = Vec::new();
-    let mut exit_status = None;
-    while let Some(msg) = channel.wait().await {
-        match msg {
-            ChannelMsg::Data { ref data } => stdout.extend_from_slice(data),
-            ChannelMsg::ExitStatus {
-                exit_status: status,
-            } => exit_status = Some(status),
-            _ => {}
-        }
-    }
-    Ok(ExecOutput {
-        stdout,
-        exit_status,
-    })
+    Ok(collect_output(&mut channel).await)
 }
 
 /// Runs `command` with `stdin` as its standard input (then EOF), and
@@ -205,26 +230,12 @@ pub async fn exec_with_stdin(
     let mut channel = connect_and_open_channel(host, port, private_key_pem, command).await?;
     channel.data(stdin).await?;
     channel.eof().await?;
-
-    let mut stdout = Vec::new();
-    let mut exit_status = None;
-    while let Some(msg) = channel.wait().await {
-        match msg {
-            ChannelMsg::Data { ref data } => stdout.extend_from_slice(data),
-            ChannelMsg::ExitStatus {
-                exit_status: status,
-            } => exit_status = Some(status),
-            _ => {}
-        }
-    }
-    Ok(ExecOutput {
-        stdout,
-        exit_status,
-    })
+    Ok(collect_output(&mut channel).await)
 }
 
 /// Runs `command` (typically `podman logs -f {id}`), forwarding each
-/// chunk of stdout to the returned stream as it arrives, rather than
+/// chunk of stdout and stderr to the returned stream as it arrives, in
+/// arrival order (one merged log, as `kubectl logs` shows it), rather than
 /// buffering it all before returning -- for live log following. The
 /// connection and authentication happen before this returns, so a
 /// connection/auth failure comes back as a normal `Err` the caller can
@@ -245,13 +256,16 @@ pub async fn exec_stream(
     let (tx, rx) = mpsc::channel(16);
     tokio::spawn(async move {
         while let Some(msg) = channel.wait().await {
-            if let ChannelMsg::Data { data } = msg {
-                if tx.send(Bytes::copy_from_slice(&data)).await.is_err() {
-                    // Receiver (the HTTP response body) is gone -- the
-                    // client disconnected. Stop reading, let `channel`
-                    // drop and close the SSH side too.
-                    break;
-                }
+            let data = match msg {
+                ChannelMsg::Data { data } => data,
+                ChannelMsg::ExtendedData { data, ext } if ext == SSH_EXTENDED_DATA_STDERR => data,
+                _ => continue,
+            };
+            if tx.send(data).await.is_err() {
+                // Receiver (the HTTP response body) is gone -- the
+                // client disconnected. Stop reading, let `channel`
+                // drop and close the SSH side too.
+                break;
             }
         }
     });
@@ -278,6 +292,28 @@ pub(crate) mod tests {
     /// `responses`; an unlisted command gets empty output and exit 1.
     pub(crate) async fn mock_ssh_server(
         responses: HashMap<&'static str, (&'static str, u32)>,
+    ) -> (String, u16) {
+        let responses = responses
+            .into_iter()
+            .map(|(command, (stdout, exit_status))| {
+                (command, (vec![MockOut::Stdout(stdout)], exit_status))
+            })
+            .collect();
+        mock_ssh_server_with_output(responses).await
+    }
+
+    /// One chunk a mock server writes, on stdout or on stderr.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum MockOut {
+        Stdout(&'static str),
+        Stderr(&'static str),
+    }
+
+    /// Like `mock_ssh_server`, but each command's reply is a sequence of
+    /// stdout/stderr chunks, sent in order -- for testing that callers
+    /// see a container's stderr too (issue #121).
+    pub(crate) async fn mock_ssh_server_with_output(
+        responses: HashMap<&'static str, (Vec<MockOut>, u32)>,
     ) -> (String, u16) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
@@ -311,7 +347,20 @@ pub(crate) mod tests {
 
     #[derive(Clone)]
     struct TestServer {
-        responses: Arc<HashMap<&'static str, (&'static str, u32)>>,
+        responses: Arc<HashMap<&'static str, (Vec<MockOut>, u32)>>,
+    }
+
+    fn send_mock_out(
+        session: &mut Session,
+        channel: ChannelId,
+        out: MockOut,
+    ) -> Result<(), russh::Error> {
+        match out {
+            MockOut::Stdout(text) => session.data(channel, Bytes::from(text)),
+            MockOut::Stderr(text) => {
+                session.extended_data(channel, SSH_EXTENDED_DATA_STDERR, Bytes::from(text))
+            }
+        }
     }
 
     impl server::Server for TestServer {
@@ -350,13 +399,15 @@ pub(crate) mod tests {
         ) -> Result<(), Self::Error> {
             let command = String::from_utf8_lossy(data).to_string();
             session.channel_success(channel)?;
-            let (stdout, exit_status) = self
+            let (output, exit_status) = self
                 .responses
                 .get(command.as_str())
-                .copied()
-                .unwrap_or(("", 1));
-            if !stdout.is_empty() {
-                session.data(channel, Bytes::from(stdout.to_string()))?;
+                .cloned()
+                .unwrap_or((Vec::new(), 1));
+            for out in output {
+                if !matches!(out, MockOut::Stdout("") | MockOut::Stderr("")) {
+                    send_mock_out(session, channel, out)?;
+                }
             }
             session.exit_status_request(channel, exit_status)?;
             session.eof(channel)?;
@@ -492,7 +543,7 @@ pub(crate) mod tests {
     // Data messages over time rather than one fixed canned reply.
     #[derive(Clone)]
     struct StreamingTestServer {
-        chunks: Arc<StdMutex<Vec<&'static str>>>,
+        chunks: Arc<StdMutex<Vec<MockOut>>>,
     }
 
     impl server::Server for StreamingTestServer {
@@ -534,7 +585,14 @@ pub(crate) mod tests {
             let handle = session.handle();
             tokio::spawn(async move {
                 for chunk in chunks {
-                    let _ = handle.data(channel, Bytes::from(chunk)).await;
+                    let _ = match chunk {
+                        MockOut::Stdout(text) => handle.data(channel, Bytes::from(text)).await,
+                        MockOut::Stderr(text) => {
+                            handle
+                                .extended_data(channel, SSH_EXTENDED_DATA_STDERR, Bytes::from(text))
+                                .await
+                        }
+                    };
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
                 let _ = handle.eof(channel).await;
@@ -544,7 +602,7 @@ pub(crate) mod tests {
         }
     }
 
-    async fn mock_streaming_ssh_server(chunks: Vec<&'static str>) -> (String, u16) {
+    async fn mock_streaming_ssh_server(chunks: Vec<MockOut>) -> (String, u16) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
 
@@ -643,7 +701,12 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_exec_stream_forwards_chunks_as_they_arrive() {
-        let (host, port) = mock_streaming_ssh_server(vec!["chunk-1", "chunk-2", "chunk-3"]).await;
+        let (host, port) = mock_streaming_ssh_server(vec![
+            MockOut::Stdout("chunk-1"),
+            MockOut::Stderr("chunk-2"),
+            MockOut::Stdout("chunk-3"),
+        ])
+        .await;
         let key = throwaway_private_key_pem();
 
         let mut stream = exec_stream(&host, port, &key, "podman logs -f abc")
@@ -656,6 +719,37 @@ pub(crate) mod tests {
             collected.push(String::from_utf8(chunk.to_vec()).unwrap());
         }
 
-        assert_eq!(collected, vec!["chunk-1", "chunk-2", "chunk-3"]);
+        assert_eq!(
+            collected,
+            vec!["chunk-1", "chunk-2", "chunk-3"],
+            "stderr chunks are forwarded too, in arrival order"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exec_once_collects_stderr_separately_and_combined() {
+        let mut responses = HashMap::new();
+        responses.insert(
+            "podman logs abc",
+            (
+                vec![
+                    MockOut::Stdout("out 1\n"),
+                    MockOut::Stderr("err 1\n"),
+                    MockOut::Stdout("out 2\n"),
+                ],
+                0,
+            ),
+        );
+        let (host, port) = mock_ssh_server_with_output(responses).await;
+        let key = throwaway_private_key_pem();
+
+        let output = exec_once(&host, port, &key, "podman logs abc")
+            .await
+            .unwrap();
+
+        assert_eq!(output.stdout, b"out 1\nout 2\n");
+        assert_eq!(output.stderr, b"err 1\n");
+        assert_eq!(output.combined, b"out 1\nerr 1\nout 2\n");
+        assert_eq!(output.exit_status, Some(0));
     }
 }

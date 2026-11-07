@@ -1293,16 +1293,28 @@ async fn handle_container_running(
     // below -- container_id is normally our own cloud-init script's own
     // output, but a defensive check costs nothing and means a garbled/
     // unexpected read can never become a shell-injection vector.
+    //
+    // `podman logs` writes what the container wrote to stderr on its own
+    // stderr, so the log is `combined`, not just `stdout` (issue #121).
+    let mut logs_fetch_error = None;
     let logs = if !container_id.is_empty() && container_id.chars().all(|c| c.is_ascii_hexdigit()) {
-        ssh::exec_once(
+        match ssh::exec_once(
             &ip,
             ctx.worker_ssh_port,
             &ctx.worker_ssh_private_key,
             &format!("podman logs {container_id}"),
         )
         .await
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default()
+        {
+            Ok(output) => String::from_utf8_lossy(&output.combined).into_owned(),
+            Err(err) => {
+                tracing::warn!(
+                    "job {namespace}/{name}: fetching container logs from {ip} failed: {err}"
+                );
+                logs_fetch_error = Some(err.to_string());
+                String::new()
+            }
+        }
     } else {
         // No container was started: the worker script says why, if it
         // refused to start one (runAsNonRoot's image check).
@@ -1321,6 +1333,7 @@ async fn handle_container_running(
             tracing::warn!(
                 "job {namespace}/{name}: no valid container ID read from {ip}, logs unavailable"
             );
+            logs_fetch_error = Some("no valid container ID on the worker".to_string());
         }
         start_error
     };
@@ -1357,6 +1370,21 @@ async fn handle_container_running(
 
     record_completion(pool, job_id, exit_code, &logs, actual_cost).await?;
     tracing::info!("job {namespace}/{name}: container finished on {ip}, exit code {exit_code}");
+    if exit_code != 0 && logs.trim().is_empty() {
+        // Without this, `kubectl logs` on a failed job returns an empty
+        // body that looks like a container that printed nothing.
+        let message = match logs_fetch_error {
+            Some(err) => format!(
+                "container exited with code {exit_code}, but its logs could not be fetched \
+                 from the worker: {err}"
+            ),
+            None => format!(
+                "container exited with code {exit_code} without writing anything to stdout \
+                 or stderr"
+            ),
+        };
+        record_event(pool, Some(job_id), "EmptyLogs", &message, "Warning").await?;
+    }
     Ok(Some(if exit_code == 0 {
         "Succeeded"
     } else {
@@ -2815,6 +2843,94 @@ mod tests {
                 .unwrap();
         assert_eq!(status, "Failed");
         assert!(logs.unwrap().contains("will run as root"));
+    }
+
+    #[tokio::test]
+    async fn test_failed_container_caches_both_stdout_and_stderr() {
+        use crate::ssh::tests::MockOut;
+        let mut responses = HashMap::new();
+        responses.insert("cat /tmp/exit-code", (vec![MockOut::Stdout("1")], 0));
+        responses.insert(
+            "cat /tmp/container-id.txt",
+            (vec![MockOut::Stdout("abc123")], 0),
+        );
+        responses.insert(
+            "podman logs abc123",
+            (vec![MockOut::Stdout("out\n"), MockOut::Stderr("err\n")], 0),
+        );
+        let (host, port) = crate::ssh::tests::mock_ssh_server_with_output(responses).await;
+        let mut ctx = mock_ctx(false);
+        ctx.worker_ssh_port = port;
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_job_with_ssh_ip(&pool, "ContainerRunning", &host).await;
+        assert_eq!(advance_all(&pool, &ctx).await.unwrap(), 1);
+
+        let (status, logs): (String, Option<String>) =
+            sqlx::query_as("SELECT status, cached_logs FROM jobs WHERE id = 'j1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "Failed");
+        assert_eq!(logs.as_deref(), Some("out\nerr\n"));
+
+        let empty_log_events: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE reason = 'EmptyLogs'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(empty_log_events, 0, "the log isn't empty");
+    }
+
+    #[tokio::test]
+    async fn test_failed_container_with_empty_logs_records_a_warning() {
+        let mut responses = HashMap::new();
+        responses.insert("cat /tmp/exit-code", ("1", 0));
+        responses.insert("cat /tmp/container-id.txt", ("abc123", 0));
+        responses.insert("podman logs abc123", ("", 0));
+        let (host, port) = crate::ssh::tests::mock_ssh_server(responses).await;
+        let mut ctx = mock_ctx(false);
+        ctx.worker_ssh_port = port;
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_job_with_ssh_ip(&pool, "ContainerRunning", &host).await;
+        assert_eq!(advance_all(&pool, &ctx).await.unwrap(), 1);
+
+        let events: Vec<(String, String)> = sqlx::query_as(
+            "SELECT type, message FROM events WHERE job_id = 'j1' AND reason = 'EmptyLogs'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "Warning");
+        assert!(
+            events[0].1.contains("exited with code 1"),
+            "{}",
+            events[0].1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_succeeded_container_with_empty_logs_records_no_warning() {
+        let mut responses = HashMap::new();
+        responses.insert("cat /tmp/exit-code", ("0", 0));
+        responses.insert("cat /tmp/container-id.txt", ("abc123", 0));
+        responses.insert("podman logs abc123", ("", 0));
+        let (host, port) = crate::ssh::tests::mock_ssh_server(responses).await;
+        let mut ctx = mock_ctx(false);
+        ctx.worker_ssh_port = port;
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_job_with_ssh_ip(&pool, "ContainerRunning", &host).await;
+        assert_eq!(advance_all(&pool, &ctx).await.unwrap(), 1);
+
+        let empty_log_events: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE reason = 'EmptyLogs'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(empty_log_events, 0);
     }
 
     #[tokio::test]
