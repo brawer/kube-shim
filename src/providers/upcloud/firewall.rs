@@ -30,6 +30,10 @@ struct FirewallRuleParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     source_address_end: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    source_port_start: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_port_end: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     destination_port_start: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     destination_port_end: Option<String>,
@@ -71,6 +75,8 @@ fn to_params(rule: &FirewallRule) -> FirewallRuleParams {
         protocol: rule.protocol.clone(),
         source_address_start,
         source_address_end,
+        source_port_start: rule.source_port_start.clone(),
+        source_port_end: rule.source_port_end.clone(),
         destination_port_start: rule.destination_port_start.clone(),
         destination_port_end: rule.destination_port_end.clone(),
     }
@@ -123,6 +129,10 @@ struct FirewallRuleObject {
     #[serde(default)]
     source_address_start: String,
     #[serde(default)]
+    source_port_start: String,
+    #[serde(default)]
+    source_port_end: String,
+    #[serde(default)]
     destination_port_start: String,
     #[serde(default)]
     destination_port_end: String,
@@ -166,6 +176,8 @@ pub(super) async fn list_firewall_rules(
             },
             protocol: non_empty(rule.protocol),
             source_address: non_empty(rule.source_address_start),
+            source_port_start: non_empty(rule.source_port_start),
+            source_port_end: non_empty(rule.source_port_end),
             destination_port_start: non_empty(rule.destination_port_start),
             destination_port_end: non_empty(rule.destination_port_end),
         })
@@ -188,6 +200,8 @@ mod tests {
             family: FirewallFamily::Ipv4,
             protocol: Some("tcp".to_string()),
             source_address: Some("203.0.113.5".to_string()),
+            source_port_start: None,
+            source_port_end: None,
             destination_port_start: Some("22".to_string()),
             destination_port_end: Some("22".to_string()),
         }
@@ -207,6 +221,36 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn test_source_port_is_serialized() {
+        // Issue #138: DNS replies are matched by their source port.
+        let rule = FirewallRule {
+            direction: FirewallDirection::In,
+            action: FirewallAction::Accept,
+            family: FirewallFamily::Ipv4,
+            protocol: Some("udp".to_string()),
+            source_address: Some("94.237.127.9".to_string()),
+            source_port_start: Some("53".to_string()),
+            source_port_end: Some("53".to_string()),
+            destination_port_start: None,
+            destination_port_end: None,
+        };
+        let body = serde_json::to_value(super::to_params(&rule)).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "direction": "in", "action": "accept", "family": "IPv4",
+                "protocol": "udp",
+                "source_address_start": "94.237.127.9",
+                "source_address_end": "94.237.127.9",
+                "source_port_start": "53", "source_port_end": "53"
+            })
+        );
+        // A rule without ports leaves the port fields out entirely.
+        let body = serde_json::to_value(super::to_params(&ssh_from_shim_rule())).unwrap();
+        assert!(body.get("source_port_start").is_none());
+    }
+
     #[tokio::test]
     async fn test_list_firewall_rules_parses_response() {
         let app = axum::Router::new().route(
@@ -220,6 +264,12 @@ mod tests {
                         "destination_port_start": "22", "destination_port_end": "22"
                     },
                     {
+                        "direction": "in", "action": "accept", "family": "IPv4",
+                        "protocol": "udp", "source_address_start": "94.237.127.9",
+                        "source_address_end": "94.237.127.9",
+                        "source_port_start": "53", "source_port_end": "53"
+                    },
+                    {
                         "direction": "in", "action": "drop", "family": "IPv4",
                         "protocol": "", "source_address_start": "", "source_address_end": "",
                         "destination_port_start": "", "destination_port_end": ""
@@ -231,10 +281,14 @@ mod tests {
 
         let rules = provider.list_firewall_rules("srv1").await.unwrap();
 
-        assert_eq!(rules.len(), 2);
+        assert_eq!(rules.len(), 3);
         assert_eq!(rules[0].action, FirewallAction::Accept);
         assert_eq!(rules[0].source_address.as_deref(), Some("203.0.113.5"));
-        assert_eq!(rules[1].action, FirewallAction::Drop);
-        assert_eq!(rules[1].source_address, None);
+        assert_eq!(rules[0].source_port_start, None);
+        assert_eq!(rules[1].protocol.as_deref(), Some("udp"));
+        assert_eq!(rules[1].source_port_start.as_deref(), Some("53"));
+        assert_eq!(rules[1].source_port_end.as_deref(), Some("53"));
+        assert_eq!(rules[2].action, FirewallAction::Drop);
+        assert_eq!(rules[2].source_address, None);
     }
 }
