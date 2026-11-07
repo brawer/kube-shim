@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.4.0](https://github.com/brawer/kube-shim/compare/v0.3.4...v0.4.0) (2026-11-07)
+
+
+### ⚠ BREAKING CHANGES
+
+* **tofu:** api_token_count is replaced by api_tokens, and the api_tokens output is a map instead of a list. The default is one token named "default". Existing tokens get new values on upgrade.
+
+### 🆕 Enhancements
+
+* accept Kubernetes protobuf request bodies ([#112](https://github.com/brawer/kube-shim/issues/112)) ([e5796af](https://github.com/brawer/kube-shim/commit/e5796af62f92197c43a6e1d4a822d13655a7b5ee)), closes [#106](https://github.com/brawer/kube-shim/issues/106)
+* honor CronJob suspend and startingDeadlineSeconds, support updates ([d19e21f](https://github.com/brawer/kube-shim/commit/d19e21f944c77b5a2dc5bb3531bf351819464440))
+* support Secret updates with JSON Patch ([#113](https://github.com/brawer/kube-shim/issues/113)) ([439f7f9](https://github.com/brawer/kube-shim/commit/439f7f9a693513908c38df41891d8cf0f2ca006d))
+* **tofu:** key API tokens by name so any one can be retired ([#114](https://github.com/brawer/kube-shim/issues/114)) ([f53b2a6](https://github.com/brawer/kube-shim/commit/f53b2a6ee9668c2e1af92f4fb22b6d49cb1bbf03)), closes [#102](https://github.com/brawer/kube-shim/issues/102)
+
+
+### 🐞 Bug Fixes
+
+* fire CronJobs on day-of-month OR day-of-week, as Kubernetes does ([#116](https://github.com/brawer/kube-shim/issues/116)) ([bc3e2af](https://github.com/brawer/kube-shim/commit/bc3e2af553e34f6a7858d2b9ab4cd942f870d86f)), closes [#110](https://github.com/brawer/kube-shim/issues/110)
+* read CronJob day-of-week numbers the way POSIX cron does ([#108](https://github.com/brawer/kube-shim/issues/108)) ([9f21473](https://github.com/brawer/kube-shim/commit/9f21473c14df139b06d8e81aa938fa057524d6c7))
+* reject CronJobs with an unparseable schedule at admission ([#115](https://github.com/brawer/kube-shim/issues/115)) ([4a580ab](https://github.com/brawer/kube-shim/commit/4a580abbe90db0141dbbdd02b76dc692172e095c)), closes [#111](https://github.com/brawer/kube-shim/issues/111)
+* **tofu:** keep secrets out of the host's user_data ([#117](https://github.com/brawer/kube-shim/issues/117)) ([d6959ad](https://github.com/brawer/kube-shim/commit/d6959ad9f7967fbc55555fdccb8b7fb8a3ee04de)), closes [#103](https://github.com/brawer/kube-shim/issues/103)
+
 ## [0.3.4](https://github.com/brawer/kube-shim/compare/v0.3.3...v0.3.4) (2026-11-06)
 
 
