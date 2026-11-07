@@ -77,7 +77,9 @@ fn authenticated_router(
         )
         .route(
             "/api/v1/namespaces/:namespace/secrets/:name",
-            get(api::secret::get_secret).delete(api::secret::delete_secret),
+            get(api::secret::get_secret)
+                .patch(api::secret::patch_secret)
+                .delete(api::secret::delete_secret),
         )
         // Pods (Phase 12's minimal synthetic GET; Phase 10's /log
         // subresource) -- one pod per job run, so "pod name" is a job's

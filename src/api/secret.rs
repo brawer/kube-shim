@@ -1,6 +1,9 @@
+use crate::k8s_status;
 use axum::{
+    body::Bytes,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -186,6 +189,165 @@ pub async fn get_secret(
     };
 
     Ok(Json(secret))
+}
+
+/// `PATCH /api/v1/namespaces/{ns}/secrets/{name}` (issue #106), JSON
+/// Patch only (RFC 6902, `application/json-patch+json`): what the
+/// `hashicorp/kubernetes` provider sends to change a Secret, e.g.
+/// `[{"op":"add","path":"/data","value":{...}}]`. The patch is applied
+/// to the stored Secret, and the result goes through the same checks as
+/// a create. kube-shim stores only `data`, so a patch that would leave
+/// labels, annotations, `immutable: true` or another `type` behind is
+/// refused rather than silently dropped.
+pub async fn patch_secret(
+    State(pool): State<SqlitePool>,
+    Path((namespace, name)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let content_type = crate::k8s_protobuf::media_type(&headers);
+    if content_type != "application/json-patch+json" {
+        return k8s_status::unsupported_media_type(format!(
+            "the body of the request was in an unknown format - accepted media types \
+             include: application/json-patch+json (got {content_type:?}; with kubectl, \
+             use `kubectl patch --type json`)"
+        ));
+    }
+    let patch: json_patch::Patch = match serde_json::from_slice(&body) {
+        Ok(patch) => patch,
+        Err(e) => return k8s_status::bad_request(format!("invalid JSON patch: {e}")),
+    };
+
+    let row = match sqlx::query("SELECT id, data FROM secrets WHERE name = ? AND namespace = ?")
+        .bind(&name)
+        .bind(&namespace)
+        .fetch_optional(&pool)
+        .await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => return k8s_status::not_found("Secret", &name),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let id: String = row.get(0);
+    let data: JsonValue = match serde_json::from_str(&row.get::<String, _>(1)) {
+        Ok(data) => data,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let metadata = serde_json::json!({"name": name, "namespace": namespace, "uid": id});
+    let mut object = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": metadata,
+        "data": data,
+        "type": SECRET_TYPE,
+    });
+    if let Err(e) = json_patch::patch(&mut object, &patch) {
+        return k8s_status::invalid(format!("the patch could not be applied: {e}"));
+    }
+
+    let (data, string_data) = match check_patched_secret(object, &metadata) {
+        Ok(fields) => fields,
+        Err(message) => {
+            return k8s_status::invalid(format!("Secret \"{name}\" is invalid: {message}"))
+        }
+    };
+    let data = match merge_string_data(data, string_data) {
+        Ok(data) => data,
+        Err(e) => return k8s_status::invalid(format!("Secret \"{name}\" is invalid: {e}")),
+    };
+    let result = sqlx::query(
+        r#"
+        UPDATE secrets SET data = ?, updated_at = ?, version = version + 1
+        WHERE name = ? AND namespace = ?
+        "#,
+    )
+    .bind(data.to_string())
+    .bind(Utc::now().timestamp())
+    .bind(&name)
+    .bind(&namespace)
+    .execute(&pool)
+    .await;
+    match result {
+        Ok(done) if done.rows_affected() == 0 => return k8s_status::not_found("Secret", &name),
+        Ok(_) => {}
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+
+    let secret = Secret {
+        api_version: "v1".to_string(),
+        kind: "Secret".to_string(),
+        metadata: ObjectMeta {
+            name,
+            namespace: Some(namespace),
+            uid: Some(id),
+            creation_timestamp: None,
+        },
+        data,
+        secret_type: Some(SECRET_TYPE.to_string()),
+    };
+    (StatusCode::OK, Json(secret)).into_response()
+}
+
+/// Checks a patched Secret for anything kube-shim wouldn't store, and
+/// returns its `data` and `stringData`.
+fn check_patched_secret(
+    object: JsonValue,
+    metadata: &JsonValue,
+) -> Result<(Option<JsonValue>, Option<JsonValue>), String> {
+    let JsonValue::Object(mut fields) = object else {
+        return Err("the patched object is not an object".to_string());
+    };
+    if fields.remove("apiVersion") != Some(JsonValue::from("v1"))
+        || fields.remove("kind") != Some(JsonValue::from("Secret"))
+    {
+        return Err("a patch can't change apiVersion or kind".to_string());
+    }
+    let mut patched_metadata = fields.remove("metadata").unwrap_or(JsonValue::Null);
+    if let Some(meta) = patched_metadata.as_object_mut() {
+        for key in ["labels", "annotations"] {
+            match meta.get(key) {
+                Some(v) if !is_empty(v) => {
+                    return Err(format!(
+                        "metadata.{key}: kube-shim doesn't store {key} on Secrets"
+                    ))
+                }
+                Some(_) => {
+                    meta.remove(key);
+                }
+                None => {}
+            }
+        }
+    }
+    if &patched_metadata != metadata {
+        return Err("a patch can't change metadata".to_string());
+    }
+    match fields.remove("type") {
+        None | Some(JsonValue::Null) => {}
+        Some(JsonValue::String(t)) if t == SECRET_TYPE => {}
+        Some(other) => return Err(format!("type: Unsupported value: {other}")),
+    }
+    match fields.remove("immutable") {
+        None | Some(JsonValue::Null) | Some(JsonValue::Bool(false)) => {}
+        Some(other) => {
+            return Err(format!(
+                "immutable: Unsupported value: {other} (immutable Secrets aren't supported)"
+            ));
+        }
+    }
+    let data = fields.remove("data");
+    let string_data = fields.remove("stringData");
+    if let Some(key) = fields.keys().next() {
+        return Err(format!("{key}: field not supported on Secrets"));
+    }
+    Ok((data, string_data))
+}
+
+fn is_empty(value: &JsonValue) -> bool {
+    match value {
+        JsonValue::Null => true,
+        JsonValue::Object(map) => map.is_empty(),
+        _ => false,
+    }
 }
 
 pub async fn list_secrets(

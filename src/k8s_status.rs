@@ -144,6 +144,13 @@ pub fn unsupported_media_type(message: impl Into<String>) -> axum::response::Res
     )
 }
 
+/// 422 Unprocessable Entity, `reason: Invalid`, with only a message:
+/// e.g. a Secret patch that sets a field kube-shim doesn't store
+/// (issue #106).
+pub fn invalid(message: impl Into<String>) -> axum::response::Response {
+    status_error(StatusCode::UNPROCESSABLE_ENTITY, "Invalid", message)
+}
+
 /// 422 Unprocessable Entity, `reason: Invalid`: a field's value isn't one
 /// of the values this API supports for it -- the same shape a real cluster
 /// uses for an unsupported enum-style field value (e.g. an unknown
