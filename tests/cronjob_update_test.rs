@@ -15,6 +15,10 @@ const ITEM_URI: &str = "/apis/batch/v1/namespaces/default/cronjobs/osmdiffs-week
 
 async fn test_router() -> axum::Router {
     let pool = kube_shim::db::init_pool(":memory:").await.unwrap();
+    router_for(pool)
+}
+
+fn router_for(pool: sqlx::SqlitePool) -> axum::Router {
     kube_shim::app::build_router(
         pool,
         Arc::new(vec![ApiToken {
@@ -373,4 +377,125 @@ async fn test_merge_patch_with_an_unparseable_schedule_is_rejected() {
     }
     let (_, fetched) = send(&router, get(ITEM_URI)).await;
     assert_eq!(fetched["spec"], osmdiffs_spec(true));
+}
+
+/// The `hashicorp/kubernetes` provider leaves `successfulJobsHistoryLimit`
+/// out when it's 3 and `failedJobsHistoryLimit` when it's 1, then reads
+/// them back only if the server returns them (issue #119).
+fn spec_without_defaulted_fields() -> Value {
+    let mut spec = osmdiffs_spec(true);
+    let fields = spec.as_object_mut().unwrap();
+    for key in [
+        "suspend",
+        "concurrencyPolicy",
+        "successfulJobsHistoryLimit",
+        "failedJobsHistoryLimit",
+    ] {
+        fields.remove(key);
+    }
+    spec
+}
+
+fn assert_kubernetes_defaults(spec: &Value) {
+    assert_eq!(spec["concurrencyPolicy"], "Allow");
+    assert_eq!(spec["suspend"], false);
+    assert_eq!(spec["successfulJobsHistoryLimit"], 3);
+    assert_eq!(spec["failedJobsHistoryLimit"], 1);
+    // Fields that were set come back as sent.
+    assert_eq!(spec["schedule"], "0 3 * * 0");
+    assert_eq!(spec["startingDeadlineSeconds"], 3600);
+}
+
+#[tokio::test]
+async fn test_create_applies_kubernetes_defaults() {
+    let router = test_router().await;
+    let (status, created) = send(
+        &router,
+        request(
+            "POST",
+            "/apis/batch/v1/namespaces/default/cronjobs",
+            "application/json",
+            cronjob_body("osmdiffs-weekly", spec_without_defaulted_fields()),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_kubernetes_defaults(&created["spec"]);
+
+    let (status, fetched) = send(&router, get(ITEM_URI)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_kubernetes_defaults(&fetched["spec"]);
+
+    let (status, list) = send(&router, get("/apis/batch/v1/namespaces/default/cronjobs")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_kubernetes_defaults(&list["items"][0]["spec"]);
+}
+
+#[tokio::test]
+async fn test_explicit_values_are_not_overwritten_by_defaults() {
+    let router = test_router().await;
+    let mut spec = osmdiffs_spec(true);
+    spec["successfulJobsHistoryLimit"] = json!(0);
+    create(&router, "osmdiffs-weekly", spec.clone()).await;
+    let (_, fetched) = send(&router, get(ITEM_URI)).await;
+    assert_eq!(fetched["spec"], spec);
+}
+
+#[tokio::test]
+async fn test_put_applies_kubernetes_defaults() {
+    let router = test_router().await;
+    create(&router, "osmdiffs-weekly", osmdiffs_spec(true)).await;
+    let (status, updated) = send(
+        &router,
+        request(
+            "PUT",
+            ITEM_URI,
+            "application/json",
+            cronjob_body("osmdiffs-weekly", spec_without_defaulted_fields()),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_kubernetes_defaults(&updated["spec"]);
+    let (_, fetched) = send(&router, get(ITEM_URI)).await;
+    assert_kubernetes_defaults(&fetched["spec"]);
+}
+
+#[tokio::test]
+async fn test_merge_patch_removing_a_field_resets_it_to_its_default() {
+    let router = test_router().await;
+    create(&router, "osmdiffs-weekly", osmdiffs_spec(true)).await;
+    let (status, patched) = send(
+        &router,
+        request(
+            "PATCH",
+            ITEM_URI,
+            "application/merge-patch+json",
+            json!({"spec": {"failedJobsHistoryLimit": null}}).to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(patched["spec"]["failedJobsHistoryLimit"], 1);
+}
+
+/// A CronJob stored by kube-shim v0.4.0 or earlier, without the
+/// defaulted fields, reads back defaulted -- so production's existing
+/// `osmdiffs-weekly` converges without a migration.
+#[tokio::test]
+async fn test_cronjob_stored_without_defaults_reads_back_defaulted() {
+    let pool = kube_shim::db::init_pool(":memory:").await.unwrap();
+    sqlx::query(
+        "INSERT INTO cronjobs (id, name, namespace, spec, created_at, updated_at, schedule, version)
+         VALUES ('legacy', 'osmdiffs-weekly', 'default', ?, 0, 0, '0 3 * * 0', 1)",
+    )
+    .bind(spec_without_defaulted_fields().to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let router = router_for(pool);
+
+    let (status, fetched) = send(&router, get(ITEM_URI)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_kubernetes_defaults(&fetched["spec"]);
 }
