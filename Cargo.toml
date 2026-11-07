@@ -70,6 +70,9 @@ quick-xml = { version = "0.36", features = ["serialize"] }
 # and so the hashicorp/kubernetes OpenTofu provider, sends) from the
 # descriptors build.rs compiles -- see src/k8s_protobuf.rs.
 prost-reflect = "0.16"
+# Secret PATCH (issue #106): the hashicorp/kubernetes provider updates a
+# Secret with an RFC 6902 JSON Patch.
+json-patch = { version = "5", default-features = false }
 
 [dev-dependencies]
 rcgen = "0.13"
