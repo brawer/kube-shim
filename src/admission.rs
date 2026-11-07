@@ -215,9 +215,10 @@ pub fn validate_cronjob_schedule(
 ///   run, which nothing here does, so it's rejected rather than quietly
 ///   treated as `Allow`.
 ///
-/// The `hashicorp/kubernetes` provider always sends `suspend: false`,
-/// `concurrencyPolicy: Allow` and both history limits, so their default
-/// values must keep passing. The history limits themselves aren't
+/// The `hashicorp/kubernetes` provider sends `suspend` and
+/// `concurrencyPolicy` even at their defaults, and
+/// `api::cronjob::apply_cronjob_defaults` fills in any that are missing
+/// (issue #119), so their default values must keep passing. The history limits themselves aren't
 /// checked: kube-shim keeps its own job history, and no limit value
 /// changes how a run behaves.
 pub fn validate_cronjob_schedule_fields(

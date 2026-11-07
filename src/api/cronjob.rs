@@ -41,8 +41,9 @@ pub async fn create_cronjob(
     State(pool): State<SqlitePool>,
     Extension(notify): Extension<Arc<Notify>>,
     Extension(cost_report_config): Extension<Arc<CostReportConfig>>,
-    Json(req): Json<CreateCronJobRequest>,
+    Json(mut req): Json<CreateCronJobRequest>,
 ) -> Response {
+    apply_cronjob_defaults(&mut req.spec);
     // Admission checks first, before anything is written -- same ordering
     // a real cluster's admission chain uses (validate, then persist), and
     // it means neither check needs to worry about cleaning up a
@@ -258,8 +259,9 @@ async fn update_cronjob(
     zone: &str,
     namespace: &str,
     name: &str,
-    spec: JsonValue,
+    mut spec: JsonValue,
 ) -> Response {
+    apply_cronjob_defaults(&mut spec);
     if let Some(response) = admit_cronjob(pool, zone, name, &spec).await {
         return response;
     }
@@ -354,6 +356,35 @@ async fn admit_cronjob(
     admission::validate_plan_fits(pool, zone, &pod_template_spec).await
 }
 
+/// Kubernetes' `SetDefaults_CronJob` (`pkg/apis/batch/v1/defaults.go`)
+/// for the CronJob-level fields (issue #119). A real API server fills
+/// these in before storing, and the `hashicorp/kubernetes` provider
+/// relies on that: it leaves `successfulJobsHistoryLimit` out of the
+/// request when it's 3 (and `failedJobsHistoryLimit` when it's 1), then
+/// reads the field back only if the server returns it. Without the
+/// default, the next `tofu plan` wants `0 -> 3` forever. A `null` counts
+/// as unset, as in Kubernetes, so a merge patch that removes a field
+/// resets it to its default.
+///
+/// Applied on create and update before storing, and again on every read
+/// so CronJobs stored before this existed come back defaulted too.
+pub fn apply_cronjob_defaults(spec: &mut JsonValue) {
+    let Some(fields) = spec.as_object_mut() else {
+        return;
+    };
+    let defaults = [
+        ("concurrencyPolicy", json!("Allow")),
+        ("suspend", json!(false)),
+        ("successfulJobsHistoryLimit", json!(3)),
+        ("failedJobsHistoryLimit", json!(1)),
+    ];
+    for (key, default) in defaults {
+        if fields.get(key).is_none_or(JsonValue::is_null) {
+            fields.insert(key.to_string(), default);
+        }
+    }
+}
+
 /// `spec.schedule`, kept in its own column for the reconciliation loop
 /// (src/reconcile/schedule.rs) to check due-ness against.
 fn schedule_of(spec: &JsonValue) -> String {
@@ -405,7 +436,11 @@ async fn load_cronjob(
             uid: Some(id),
             creation_timestamp: Some(super::secret::rfc3339(created_at)),
         },
-        spec: serde_json::from_str(&spec_str)?,
+        spec: {
+            let mut spec = serde_json::from_str(&spec_str)?;
+            apply_cronjob_defaults(&mut spec);
+            spec
+        },
         status: status_opt.and_then(|s| serde_json::from_str(&s).ok()),
     }))
 }
@@ -458,7 +493,8 @@ pub async fn list_cronjobs(
             let spec_str: String = row.get(3);
             let status_opt: Option<String> = row.get(4);
 
-            let spec: JsonValue = serde_json::from_str(&spec_str).unwrap_or(JsonValue::Null);
+            let mut spec: JsonValue = serde_json::from_str(&spec_str).unwrap_or(JsonValue::Null);
+            apply_cronjob_defaults(&mut spec);
             let status = status_opt.and_then(|s| serde_json::from_str(&s).ok());
 
             CronJob {
@@ -516,8 +552,34 @@ pub struct ListCronJobsResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::merge_patch;
+    use super::{apply_cronjob_defaults, merge_patch};
     use serde_json::json;
+
+    #[test]
+    fn test_apply_cronjob_defaults_fills_only_unset_fields() {
+        let mut spec = json!({"schedule": "0 3 * * 0", "suspend": null});
+        apply_cronjob_defaults(&mut spec);
+        assert_eq!(
+            spec,
+            json!({
+                "schedule": "0 3 * * 0",
+                "concurrencyPolicy": "Allow",
+                "suspend": false,
+                "successfulJobsHistoryLimit": 3,
+                "failedJobsHistoryLimit": 1,
+            })
+        );
+
+        let explicit = json!({
+            "concurrencyPolicy": "Forbid",
+            "suspend": true,
+            "successfulJobsHistoryLimit": 0,
+            "failedJobsHistoryLimit": 3,
+        });
+        let mut spec = explicit.clone();
+        apply_cronjob_defaults(&mut spec);
+        assert_eq!(spec, explicit);
+    }
 
     #[test]
     fn test_merge_patch_rfc7386_examples() {
