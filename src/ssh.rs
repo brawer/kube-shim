@@ -84,40 +84,35 @@ const SSH_EXTENDED_DATA_STDERR: u32 = 1;
 /// abrupt disconnect -- but real, so callers must not assume it's always
 /// present).
 ///
-/// `stdout` and `stderr` hold each stream on its own. `combined` holds
-/// both, interleaved in the order the chunks arrived -- what `kubectl
-/// logs` shows for a container, since Kubernetes merges a container's
-/// stdout and stderr into one log (issue #121). Callers that parse a
-/// value (`cat /tmp/exit-code`) read `stdout`; callers that show a
+/// `stdout` and `stderr` hold each stream on its own. Callers that parse
+/// a value (`cat /tmp/exit-code`) read `stdout`. Callers that show a
 /// container's log (`podman logs`, which writes the container's stderr
-/// to its own stderr) read `combined`.
+/// to its own stderr, issue #121) read both and merge them by podman's
+/// timestamps (`api::log_filter::merge_by_timestamp`): the order in
+/// which their chunks arrive over SSH says nothing about the order the
+/// container wrote them in (issue #139).
 #[derive(Debug)]
 pub struct ExecOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
-    pub combined: Vec<u8>,
     pub exit_status: Option<u32>,
 }
 
-/// Reads `channel` until it closes, collecting stdout, stderr and their
-/// interleaved combination. Other extended-data types and channel
+/// Reads `channel` until it closes, collecting stdout and stderr. Other extended-data types and channel
 /// messages are ignored.
 async fn collect_output(channel: &mut russh::Channel<client::Msg>) -> ExecOutput {
     let mut output = ExecOutput {
         stdout: Vec::new(),
         stderr: Vec::new(),
-        combined: Vec::new(),
         exit_status: None,
     };
     while let Some(msg) = channel.wait().await {
         match msg {
             ChannelMsg::Data { ref data } => {
                 output.stdout.extend_from_slice(data);
-                output.combined.extend_from_slice(data);
             }
             ChannelMsg::ExtendedData { ref data, ext } if ext == SSH_EXTENDED_DATA_STDERR => {
                 output.stderr.extend_from_slice(data);
-                output.combined.extend_from_slice(data);
             }
             ChannelMsg::ExitStatus { exit_status } => output.exit_status = Some(exit_status),
             _ => {}
@@ -233,11 +228,21 @@ pub async fn exec_with_stdin(
     Ok(collect_output(&mut channel).await)
 }
 
+/// Which of a command's output streams a chunk came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
 /// Runs `command` (typically `podman logs -f {id}`), forwarding each
-/// chunk of stdout and stderr to the returned stream as it arrives, in
-/// arrival order (one merged log, as `kubectl logs` shows it), rather than
-/// buffering it all before returning -- for live log following. The
-/// connection and authentication happen before this returns, so a
+/// chunk of stdout and stderr to the returned stream as it arrives,
+/// tagged with the stream it came from, rather than buffering it all
+/// before returning -- for live log following. The two streams are kept
+/// apart because SSH carries them separately, so a chunk boundary can
+/// fall mid-line on either; `api::log_filter` reassembles each stream's
+/// lines and merges them by timestamp (issue #139). The connection and
+/// authentication happen before this returns, so a
 /// connection/auth failure comes back as a normal `Err` the caller can
 /// turn into a proper HTTP error response; only data arriving *after*
 /// that point is streamed. The stream simply ends (no error surfaced to
@@ -250,18 +255,20 @@ pub async fn exec_stream(
     port: u16,
     private_key_pem: &str,
     command: &str,
-) -> Result<ReceiverStream<Bytes>, SshError> {
+) -> Result<ReceiverStream<(OutputStream, Bytes)>, SshError> {
     let mut channel = connect_and_open_channel(host, port, private_key_pem, command).await?;
 
     let (tx, rx) = mpsc::channel(16);
     tokio::spawn(async move {
         while let Some(msg) = channel.wait().await {
-            let data = match msg {
-                ChannelMsg::Data { data } => data,
-                ChannelMsg::ExtendedData { data, ext } if ext == SSH_EXTENDED_DATA_STDERR => data,
+            let chunk = match msg {
+                ChannelMsg::Data { data } => (OutputStream::Stdout, data),
+                ChannelMsg::ExtendedData { data, ext } if ext == SSH_EXTENDED_DATA_STDERR => {
+                    (OutputStream::Stderr, data)
+                }
                 _ => continue,
             };
-            if tx.send(data).await.is_err() {
+            if tx.send(chunk).await.is_err() {
                 // Receiver (the HTTP response body) is gone -- the
                 // client disconnected. Stop reading, let `channel`
                 // drop and close the SSH side too.
@@ -715,19 +722,23 @@ pub(crate) mod tests {
 
         use tokio_stream::StreamExt;
         let mut collected = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            collected.push(String::from_utf8(chunk.to_vec()).unwrap());
+        while let Some((kind, chunk)) = stream.next().await {
+            collected.push((kind, String::from_utf8(chunk.to_vec()).unwrap()));
         }
 
         assert_eq!(
             collected,
-            vec!["chunk-1", "chunk-2", "chunk-3"],
-            "stderr chunks are forwarded too, in arrival order"
+            vec![
+                (OutputStream::Stdout, "chunk-1".to_string()),
+                (OutputStream::Stderr, "chunk-2".to_string()),
+                (OutputStream::Stdout, "chunk-3".to_string()),
+            ],
+            "stderr chunks are forwarded too, tagged, in arrival order"
         );
     }
 
     #[tokio::test]
-    async fn test_exec_once_collects_stderr_separately_and_combined() {
+    async fn test_exec_once_collects_stdout_and_stderr_separately() {
         let mut responses = HashMap::new();
         responses.insert(
             "podman logs abc",
@@ -749,7 +760,6 @@ pub(crate) mod tests {
 
         assert_eq!(output.stdout, b"out 1\nout 2\n");
         assert_eq!(output.stderr, b"err 1\n");
-        assert_eq!(output.combined, b"out 1\nerr 1\nout 2\n");
         assert_eq!(output.exit_status, Some(0));
     }
 }

@@ -1442,7 +1442,7 @@ async fn handle_container_running(
     // unexpected read can never become a shell-injection vector.
     //
     // `podman logs` writes what the container wrote to stderr on its own
-    // stderr, so the log is `combined`, not just `stdout` (issue #121).
+    // stderr, so the log is both streams, not just `stdout` (issue #121).
     // This is the only chance to fetch the logs, so they're fetched with
     // timestamps, which `api::logs` strips unless asked for (issue #131).
     let mut logs_fetch_error = None;
@@ -1458,7 +1458,12 @@ async fn handle_container_running(
         {
             Ok(output) => {
                 logs_timestamped = true;
-                let logs = log_filter::normalize_timestamps(&output.combined);
+                // Merged by timestamp: SSH carries stdout and stderr as
+                // separate streams, so their order is lost (issue #139).
+                let logs = log_filter::normalize_timestamps(&log_filter::merge_by_timestamp(&[
+                    &output.stdout,
+                    &output.stderr,
+                ]));
                 String::from_utf8_lossy(&logs).into_owned()
             }
             Err(err) => {
@@ -3151,6 +3156,51 @@ mod tests {
             Some("2026-11-07T10:26:27.501234500Z first\n2026-11-07T10:26:28.500000000Z second\n")
         );
         assert_eq!(timestamped, 1);
+    }
+
+    #[tokio::test]
+    async fn test_container_running_caches_stdout_and_stderr_in_time_order() {
+        use crate::ssh::tests::MockOut;
+        let mut responses = HashMap::new();
+        responses.insert("cat /tmp/exit-code", (vec![MockOut::Stdout("0")], 0));
+        responses.insert(
+            "cat /tmp/container-id.txt",
+            (vec![MockOut::Stdout("abc123")], 0),
+        );
+        responses.insert(
+            "podman logs --timestamps abc123",
+            (
+                vec![
+                    MockOut::Stdout(
+                        "2026-11-07T12:30:32.473409+00:00 first line\n\
+                         2026-11-07T12:30:33.475578+00:00 nameserver 94.237.127.9\n",
+                    ),
+                    MockOut::Stderr("2026-11-07T12:30:33.473721+00:00 to stderr\n"),
+                ],
+                0,
+            ),
+        );
+        let (host, port) = crate::ssh::tests::mock_ssh_server_with_output(responses).await;
+        let mut ctx = mock_ctx(false);
+        ctx.worker_ssh_port = port;
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_job_with_ssh_ip(&pool, "ContainerRunning", &host).await;
+        advance_all(&pool, &ctx).await.unwrap();
+
+        let cached_logs: Option<String> =
+            sqlx::query_scalar("SELECT cached_logs FROM jobs WHERE id = 'j1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            cached_logs.as_deref(),
+            Some(
+                "2026-11-07T12:30:32.473409000Z first line\n\
+                 2026-11-07T12:30:33.473721000Z to stderr\n\
+                 2026-11-07T12:30:33.475578000Z nameserver 94.237.127.9\n"
+            )
+        );
     }
 
     async fn insert_provider_price(pool: &SqlitePool, price_key: &str, amount: f64, price: f64) {

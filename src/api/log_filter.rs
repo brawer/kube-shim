@@ -13,12 +13,31 @@
 //! A line whose first field isn't an RFC3339 timestamp is passed through
 //! unchanged. That covers logs cached before this change and the
 //! worker's own start-error text, which never had timestamps.
+//!
+//! podman writes a container's stdout and stderr to separate file
+//! descriptors, and SSH carries them as separate streams, so their
+//! relative order is lost on the way (issue #139). Timestamped logs are
+//! therefore put back in time order here: `merge_by_timestamp` for a
+//! complete log, and a short merge buffer in `apply_stream` for a
+//! followed one. The sort is stable, so lines with equal timestamps keep
+//! their order, and a line without a timestamp stays with the line
+//! before it.
 
+use crate::ssh::OutputStream;
 use axum::body::Bytes;
 use chrono::{DateTime, SecondsFormat, Utc};
+use std::collections::VecDeque;
+use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
+
+/// How long `apply_stream` holds a followed line back, waiting for an
+/// earlier line from the other stream, before writing it anyway. podman
+/// writes both streams within microseconds of each other, so this only
+/// needs to cover how far apart they can arrive over SSH.
+const MERGE_WINDOW: Duration = Duration::from_millis(200);
 
 /// What to do with each line, from the request's query parameters.
 #[derive(Debug, Clone, Default)]
@@ -35,11 +54,6 @@ pub struct LogFilter {
 }
 
 impl LogFilter {
-    /// True if the input can be passed through unchanged.
-    fn is_identity(&self) -> bool {
-        !self.input_has_timestamps && self.limit_bytes.is_none()
-    }
-
     /// Applies the filter to one line, terminator included.
     fn line(&self, line: &[u8], out: &mut Vec<u8>) {
         if !self.input_has_timestamps {
@@ -62,8 +76,18 @@ impl LogFilter {
     }
 
     /// Applies the filter to a complete log, keeping only its last
-    /// `tail_lines` lines first, as the kubelet does.
+    /// `tail_lines` lines first, as the kubelet does. Timestamped input
+    /// is sorted by timestamp before anything else.
     pub fn apply(&self, input: &[u8], tail_lines: Option<usize>) -> Vec<u8> {
+        // Logs cached by v0.4.2 hold all of stdout before all of stderr,
+        // so they're sorted here too, not only when they're captured.
+        let sorted;
+        let input = if self.input_has_timestamps {
+            sorted = merge_by_timestamp(&[input]);
+            &sorted[..]
+        } else {
+            input
+        };
         let lines: Vec<&[u8]> = input.split_inclusive(|&b| b == b'\n').collect();
         let start = match tail_lines {
             Some(n) => lines.len().saturating_sub(n),
@@ -79,42 +103,54 @@ impl LogFilter {
         out
     }
 
-    /// Applies the filter to a live log stream (`follow=true`). Lines are
-    /// buffered until their newline when they carry a timestamp, since
-    /// the timestamp has to be read before the line can be written.
-    /// The stream ends once `limit_bytes` is reached, which also closes
-    /// the SSH channel behind `input`.
-    pub fn apply_stream(self, mut input: ReceiverStream<Bytes>) -> ReceiverStream<Bytes> {
-        if self.is_identity() {
-            return input;
-        }
+    /// Applies the filter to a live log stream (`follow=true`).
+    ///
+    /// Without timestamps, chunks of both streams are passed on as they
+    /// arrive. With timestamps, each stream's lines are reassembled until
+    /// their newline (a chunk may end mid-line), then merged by timestamp:
+    /// a line is written once the other stream has a line at least as
+    /// late, or after `MERGE_WINDOW` (issue #139). The stream ends once
+    /// `limit_bytes` is reached, which also closes the SSH channel behind
+    /// `input`.
+    pub fn apply_stream(
+        self,
+        mut input: ReceiverStream<(OutputStream, Bytes)>,
+    ) -> ReceiverStream<Bytes> {
         let (tx, rx) = mpsc::channel(16);
         tokio::spawn(async move {
-            let mut pending: Vec<u8> = Vec::new();
+            let mut merger = StreamMerger::default();
             let mut remaining = self.limit_bytes;
+            let mut ended = false;
             loop {
-                let chunk = input.next().await;
                 let mut out = Vec::new();
-                match &chunk {
-                    Some(data) if self.input_has_timestamps => {
-                        pending.extend_from_slice(data);
-                        let complete = match pending.iter().rposition(|&b| b == b'\n') {
-                            Some(i) => i + 1,
-                            None => 0,
-                        };
-                        for line in pending[..complete].split_inclusive(|&b| b == b'\n') {
-                            self.line(line, &mut out);
+                if self.input_has_timestamps {
+                    let next = match merger.deadline() {
+                        Some(deadline) => {
+                            tokio::select! {
+                                chunk = input.next() => Some(chunk),
+                                _ = tokio::time::sleep_until(deadline) => None,
+                            }
                         }
-                        pending.drain(..complete);
+                        None => Some(input.next().await),
+                    };
+                    match next {
+                        Some(Some((kind, data))) => merger.push(kind, &data, Instant::now()),
+                        Some(None) => {
+                            merger.finish(Instant::now());
+                            ended = true;
+                        }
+                        None => {}
                     }
-                    Some(data) => out.extend_from_slice(data),
-                    None => {
-                        if !pending.is_empty() {
-                            self.line(&pending, &mut out);
-                        }
+                    for line in merger.ready(Instant::now(), ended) {
+                        self.line(&line, &mut out);
+                    }
+                } else {
+                    match input.next().await {
+                        Some((_, data)) => out.extend_from_slice(&data),
+                        None => ended = true,
                     }
                 }
-                let mut done = chunk.is_none();
+                let mut done = ended;
                 if let Some(left) = remaining.as_mut() {
                     if out.len() >= *left {
                         out.truncate(*left);
@@ -132,6 +168,142 @@ impl LogFilter {
         });
         ReceiverStream::new(rx)
     }
+}
+
+/// One complete line of a followed log, waiting in `StreamMerger`.
+struct PendingLine {
+    time: Option<DateTime<Utc>>,
+    received: Instant,
+    line: Vec<u8>,
+}
+
+/// One stream's state in `StreamMerger`.
+#[derive(Default)]
+struct MergerInput {
+    /// The start of a line whose newline hasn't arrived yet.
+    partial: Vec<u8>,
+    /// The timestamp of this stream's last line, for lines without one.
+    last_time: Option<DateTime<Utc>>,
+    lines: VecDeque<PendingLine>,
+}
+
+impl MergerInput {
+    fn push_line(&mut self, line: Vec<u8>, received: Instant) {
+        if let Some((time, _)) = split_timestamp(&line) {
+            self.last_time = Some(time);
+        }
+        self.lines.push_back(PendingLine {
+            time: self.last_time,
+            received,
+            line,
+        });
+    }
+}
+
+/// Merges the stdout and stderr of a followed log by timestamp.
+#[derive(Default)]
+struct StreamMerger {
+    inputs: [MergerInput; 2],
+}
+
+impl StreamMerger {
+    fn input(&mut self, kind: OutputStream) -> &mut MergerInput {
+        match kind {
+            OutputStream::Stdout => &mut self.inputs[0],
+            OutputStream::Stderr => &mut self.inputs[1],
+        }
+    }
+
+    /// Adds a chunk of `kind`'s output.
+    fn push(&mut self, kind: OutputStream, data: &[u8], received: Instant) {
+        let input = self.input(kind);
+        input.partial.extend_from_slice(data);
+        let complete = match input.partial.iter().rposition(|&b| b == b'\n') {
+            Some(i) => i + 1,
+            None => return,
+        };
+        let complete: Vec<u8> = input.partial.drain(..complete).collect();
+        for line in complete.split_inclusive(|&b| b == b'\n') {
+            input.push_line(line.to_vec(), received);
+        }
+    }
+
+    /// Ends both streams: an unterminated last line counts as a line.
+    fn finish(&mut self, received: Instant) {
+        for input in &mut self.inputs {
+            if !input.partial.is_empty() {
+                let line = std::mem::take(&mut input.partial);
+                input.push_line(line, received);
+            }
+        }
+    }
+
+    /// When the oldest waiting line must be written at the latest.
+    fn deadline(&self) -> Option<Instant> {
+        self.inputs
+            .iter()
+            .filter_map(|input| input.lines.front())
+            .map(|line| line.received + MERGE_WINDOW)
+            .min()
+    }
+
+    /// Takes the lines that can be written now, in timestamp order: all
+    /// of them once `ended`.
+    fn ready(&mut self, now: Instant, ended: bool) -> Vec<Vec<u8>> {
+        let mut ready = Vec::new();
+        loop {
+            let [stdout, stderr] = &mut self.inputs;
+            let next = match (stdout.lines.front(), stderr.lines.front()) {
+                (Some(a), Some(b)) => {
+                    if b.time < a.time {
+                        stderr
+                    } else {
+                        stdout
+                    }
+                }
+                (Some(a), None) if ended || now >= a.received + MERGE_WINDOW => stdout,
+                (None, Some(b)) if ended || now >= b.received + MERGE_WINDOW => stderr,
+                _ => break,
+            };
+            let mut line = next.lines.pop_front().unwrap().line;
+            let more = self.inputs.iter().any(|input| !input.lines.is_empty());
+            if more && line.last() != Some(&b'\n') {
+                line.push(b'\n');
+            }
+            ready.push(line);
+        }
+        ready
+    }
+}
+
+/// Merges complete logs, each a stream of podman-timestamped lines
+/// (typically a container's stdout and stderr), into one log in
+/// timestamp order (issue #139). The sort is stable and earlier
+/// `streams` win ties. A line without a timestamp keeps the timestamp of
+/// the line before it in its stream, so it stays with that line; one
+/// before any timestamped line sorts first. An unterminated last line
+/// gets a newline if another line follows it.
+pub fn merge_by_timestamp(streams: &[&[u8]]) -> Vec<u8> {
+    let mut lines: Vec<(Option<DateTime<Utc>>, &[u8])> = Vec::new();
+    for stream in streams {
+        let mut last_time = None;
+        for line in stream.split_inclusive(|&b| b == b'\n') {
+            if let Some((time, _)) = split_timestamp(line) {
+                last_time = Some(time);
+            }
+            lines.push((last_time, line));
+        }
+    }
+    lines.sort_by_key(|(time, _)| *time);
+    let mut out = Vec::with_capacity(lines.iter().map(|(_, line)| line.len() + 1).sum());
+    let count = lines.len();
+    for (i, (_, line)) in lines.into_iter().enumerate() {
+        out.extend_from_slice(line);
+        if i + 1 < count && line.last() != Some(&b'\n') {
+            out.push(b'\n');
+        }
+    }
+    out
 }
 
 /// Splits a line into its leading RFC3339 timestamp and the rest after
@@ -259,10 +431,11 @@ mod tests {
         chunks.concat()
     }
 
-    fn stream_of(chunks: &[&'static [u8]]) -> ReceiverStream<Bytes> {
+    fn stream_of(chunks: &[&'static [u8]]) -> ReceiverStream<(OutputStream, Bytes)> {
         let (tx, rx) = mpsc::channel(chunks.len().max(1));
         for chunk in chunks {
-            tx.try_send(Bytes::from_static(chunk)).unwrap();
+            tx.try_send((OutputStream::Stdout, Bytes::from_static(chunk)))
+                .unwrap();
         }
         ReceiverStream::new(rx)
     }
@@ -296,9 +469,159 @@ mod tests {
         assert_eq!(collect(filter.apply_stream(input)).await, b"abcde");
     }
 
+    #[test]
+    fn test_merge_interleaves_stdout_and_stderr_by_timestamp() {
+        // Issue #139's job: stderr's line belongs between stdout's.
+        let stdout = b"2026-11-07T12:30:32.473409000Z first line\n\
+                       2026-11-07T12:30:33.473398000Z second line\n\
+                       2026-11-07T12:30:33.475578000Z nameserver 94.237.127.9\n";
+        let stderr = b"2026-11-07T12:30:33.473721000Z to stderr\n";
+        assert_eq!(
+            merge_by_timestamp(&[stdout, stderr]),
+            b"2026-11-07T12:30:32.473409000Z first line\n\
+              2026-11-07T12:30:33.473398000Z second line\n\
+              2026-11-07T12:30:33.473721000Z to stderr\n\
+              2026-11-07T12:30:33.475578000Z nameserver 94.237.127.9\n"
+        );
+    }
+
+    #[test]
+    fn test_merge_compares_times_not_text() {
+        // Same instant in podman's offset form and kubelet's form, and
+        // an earlier one written with a later-looking local offset.
+        let stdout = b"2026-11-07T12:00:00+02:00 b\n";
+        let stderr = b"2026-11-07T10:00:00.5Z c\n2026-11-07T11:59:59+02:00 a\n";
+        assert_eq!(
+            merge_by_timestamp(&[stdout, stderr]),
+            b"2026-11-07T11:59:59+02:00 a\n\
+              2026-11-07T12:00:00+02:00 b\n\
+              2026-11-07T10:00:00.5Z c\n"
+        );
+    }
+
+    #[test]
+    fn test_merge_is_stable_and_keeps_untimestamped_lines_in_place() {
+        let stdout = b"2026-11-07T10:00:01Z out 1\ncontinued\n2026-11-07T10:00:01Z out 2\n";
+        let stderr = b"no time yet\n2026-11-07T10:00:00Z err\n2026-11-07T10:00:01Z err 2";
+        assert_eq!(
+            merge_by_timestamp(&[stdout, stderr]),
+            b"no time yet\n\
+              2026-11-07T10:00:00Z err\n\
+              2026-11-07T10:00:01Z out 1\n\
+              continued\n\
+              2026-11-07T10:00:01Z out 2\n\
+              2026-11-07T10:00:01Z err 2"
+        );
+    }
+
+    #[test]
+    fn test_merge_terminates_a_line_that_is_followed() {
+        let stdout = b"2026-11-07T10:00:02Z late, no newline";
+        let stderr = b"2026-11-07T10:00:01Z early\n";
+        assert_eq!(
+            merge_by_timestamp(&[stderr, stdout]),
+            b"2026-11-07T10:00:01Z early\n2026-11-07T10:00:02Z late, no newline"
+        );
+        assert_eq!(
+            merge_by_timestamp(&[stdout, stderr]),
+            b"2026-11-07T10:00:01Z early\n2026-11-07T10:00:02Z late, no newline"
+        );
+        let stderr = b"2026-11-07T10:00:03Z later\n";
+        assert_eq!(
+            merge_by_timestamp(&[stdout, stderr]),
+            b"2026-11-07T10:00:02Z late, no newline\n2026-11-07T10:00:03Z later\n"
+        );
+    }
+
+    #[test]
+    fn test_apply_sorts_timestamped_logs_before_tail() {
+        // A log cached by v0.4.2: all of stdout, then all of stderr.
+        let filter = LogFilter {
+            input_has_timestamps: true,
+            ..Default::default()
+        };
+        let input = b"2026-11-07T10:00:00Z a\n\
+                      2026-11-07T10:00:02Z c\n\
+                      2026-11-07T10:00:01Z b\n";
+        assert_eq!(filter.apply(input, None), b"a\nb\nc\n");
+        assert_eq!(filter.apply(input, Some(1)), b"c\n");
+    }
+
+    #[test]
+    fn test_apply_does_not_sort_untimestamped_logs() {
+        let filter = LogFilter::default();
+        let input = b"2026-11-07T10:00:02Z b\n2026-11-07T10:00:01Z a\n";
+        assert_eq!(filter.apply(input, None), input);
+    }
+
+    type Chunk = (OutputStream, Bytes);
+
+    fn tagged_stream() -> (mpsc::Sender<Chunk>, ReceiverStream<Chunk>) {
+        let (tx, rx) = mpsc::channel(16);
+        (tx, ReceiverStream::new(rx))
+    }
+
+    async fn send(
+        tx: &mpsc::Sender<(OutputStream, Bytes)>,
+        kind: OutputStream,
+        data: &'static [u8],
+    ) {
+        tx.send((kind, Bytes::from_static(data))).await.unwrap();
+    }
+
     #[tokio::test]
-    async fn test_identity_stream_is_passed_through() {
-        let input = stream_of(&[b"a", b"b\n"]);
+    async fn test_stream_merges_stdout_and_stderr_by_timestamp() {
+        let filter = LogFilter {
+            input_has_timestamps: true,
+            ..Default::default()
+        };
+        let (tx, input) = tagged_stream();
+        let output = tokio::spawn(collect(filter.apply_stream(input)));
+        // stdout's lines arrive first, and split mid-line; stderr's
+        // earlier line arrives a little later, within the window.
+        send(
+            &tx,
+            OutputStream::Stdout,
+            b"2026-11-07T10:00:00Z first\n2026-11-07T10:00:02Z th",
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        send(&tx, OutputStream::Stderr, b"2026-11-07T10:00:01Z second\n").await;
+        send(&tx, OutputStream::Stdout, b"ird\n").await;
+        drop(tx);
+        assert_eq!(output.await.unwrap(), b"first\nsecond\nthird\n");
+    }
+
+    #[tokio::test]
+    async fn test_stream_writes_a_line_after_the_merge_window() {
+        let filter = LogFilter {
+            input_has_timestamps: true,
+            ..Default::default()
+        };
+        let (tx, input) = tagged_stream();
+        let mut output = filter.apply_stream(input);
+        send(
+            &tx,
+            OutputStream::Stderr,
+            b"2026-11-07T10:00:00Z only stderr\n",
+        )
+        .await;
+        // Written without waiting for stdout or the end of the stream.
+        let chunk = tokio::time::timeout(MERGE_WINDOW * 2, output.next())
+            .await
+            .expect("line written after the merge window")
+            .unwrap();
+        assert_eq!(&chunk[..], b"only stderr\n");
+        drop(tx);
+        assert!(output.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_untimestamped_stream_passes_both_streams_through() {
+        let (tx, input) = tagged_stream();
+        send(&tx, OutputStream::Stdout, b"a").await;
+        send(&tx, OutputStream::Stderr, b"b\n").await;
+        drop(tx);
         assert_eq!(
             collect(LogFilter::default().apply_stream(input)).await,
             b"ab\n"
