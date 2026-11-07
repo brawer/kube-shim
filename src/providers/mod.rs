@@ -128,6 +128,12 @@ pub enum FirewallAction {
 /// (`source_address_start == source_address_end`) against UpCloud's own
 /// range-shaped fields, which is a real, simpler subset of what the API
 /// allows, not the full range feature.
+///
+/// `source_port_start`/`source_port_end` exist because UpCloud's firewall
+/// is stateless (issue #138): a reply to an outbound request is just
+/// another inbound packet, so e.g. DNS replies need an inbound rule
+/// matching their source port 53. UpCloud only accepts port fields
+/// together with a `protocol` of `tcp` or `udp`.
 #[derive(Debug, Clone)]
 pub struct FirewallRule {
     pub direction: FirewallDirection,
@@ -135,6 +141,8 @@ pub struct FirewallRule {
     pub family: FirewallFamily,
     pub protocol: Option<String>,
     pub source_address: Option<String>,
+    pub source_port_start: Option<String>,
+    pub source_port_end: Option<String>,
     pub destination_port_start: Option<String>,
     pub destination_port_end: Option<String>,
 }

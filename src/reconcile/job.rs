@@ -904,11 +904,57 @@ async fn handle_vm_pending(
     }
 }
 
+/// UpCloud's DNS resolvers, the same in every zone
+/// (<https://upcloud.com/docs/guides/dns-servers/>). Job containers get
+/// the IPv4 ones as `--dns` (issue #130); the IPv6 ones serve the worker
+/// VM itself.
+const UPCLOUD_DNS_RESOLVERS: &[(FirewallFamily, &str)] = &[
+    (FirewallFamily::Ipv4, "94.237.127.9"),
+    (FirewallFamily::Ipv4, "94.237.40.9"),
+    (FirewallFamily::Ipv6, "2a04:3540:53::1"),
+    (FirewallFamily::Ipv6, "2a04:3544:53::1"),
+];
+
+/// Inbound accept rules for replies from UpCloud's DNS resolvers, UDP and
+/// TCP from source port 53 (issue #138). UpCloud's firewall is stateless,
+/// so the replies to the worker's own outbound DNS queries are dropped
+/// like any other inbound packet unless a rule lets them in. systemd-
+/// resolved on the VM got by through its TCP fallback, but musl's
+/// resolver (alpine, statically linked binaries) only uses UDP, so DNS
+/// in job containers failed outright.
+fn dns_reply_rules() -> Vec<FirewallRule> {
+    let mut rules = Vec::new();
+    for &(family, address) in UPCLOUD_DNS_RESOLVERS {
+        for protocol in ["udp", "tcp"] {
+            rules.push(FirewallRule {
+                direction: FirewallDirection::In,
+                action: FirewallAction::Accept,
+                family,
+                protocol: Some(protocol.to_string()),
+                source_address: Some(address.to_string()),
+                source_port_start: Some("53".to_string()),
+                source_port_end: Some("53".to_string()),
+                destination_port_start: None,
+                destination_port_end: None,
+            });
+        }
+    }
+    rules
+}
+
+/// Whether `rule` is one of `dns_reply_rules`.
+fn is_dns_reply_rule(rule: &FirewallRule) -> bool {
+    rule.direction == FirewallDirection::In
+        && rule.action == FirewallAction::Accept
+        && rule.source_port_start.as_deref() == Some("53")
+}
+
 /// `FirewallApplying`: request the worker's firewall rules -- all inbound
-/// denied except SSH from the shim's own public IP (if known), all
-/// outbound allowed (both address families) -- as early as the server
-/// UUID exists, per this module's own top-level docs on why that's before
-/// `VMCreating`, not after.
+/// denied except SSH from the shim's own public IP (if known) and replies
+/// from UpCloud's DNS resolvers (issue #138), all outbound allowed (both
+/// address families) -- as early as the server UUID exists, per this
+/// module's own top-level docs on why that's before `VMCreating`, not
+/// after.
 async fn handle_firewall_applying(
     pool: &SqlitePool,
     ctx: &JobContext,
@@ -933,6 +979,8 @@ async fn handle_firewall_applying(
             family: FirewallFamily::Ipv4,
             protocol: None,
             source_address: None,
+            source_port_start: None,
+            source_port_end: None,
             destination_port_start: None,
             destination_port_end: None,
         },
@@ -942,6 +990,8 @@ async fn handle_firewall_applying(
             family: FirewallFamily::Ipv6,
             protocol: None,
             source_address: None,
+            source_port_start: None,
+            source_port_end: None,
             destination_port_start: None,
             destination_port_end: None,
         },
@@ -954,6 +1004,8 @@ async fn handle_firewall_applying(
             family: FirewallFamily::Ipv4,
             protocol: Some("tcp".to_string()),
             source_address: Some(own_ip.clone()),
+            source_port_start: None,
+            source_port_end: None,
             destination_port_start: Some("22".to_string()),
             destination_port_end: Some("22".to_string()),
         }),
@@ -962,6 +1014,10 @@ async fn handle_firewall_applying(
              have no inbound SSH access at all (see src/metadata.rs)"
         ),
     }
+
+    // Last, so that `FirewallVerified` seeing one of them means the
+    // rules before them are in place too.
+    rules.extend(dns_reply_rules());
 
     match ctx.provider.create_firewall_rules(&vm_id, &rules).await {
         Ok(()) => {
@@ -1007,7 +1063,10 @@ async fn handle_firewall_verified(
             let outbound_allowed = rules.iter().any(|r| {
                 r.direction == FirewallDirection::Out && r.action == FirewallAction::Accept
             });
-            if outbound_allowed {
+            // Without the DNS reply rules, the container would start
+            // with broken DNS (issue #138).
+            let dns_replies_allowed = rules.iter().any(is_dns_reply_rule);
+            if outbound_allowed && dns_replies_allowed {
                 tracing::info!(
                     "job {namespace}/{name}: firewall rules confirmed applied on {vm_id}"
                 );
@@ -2572,10 +2631,63 @@ mod tests {
         assert_eq!(status, "FirewallVerified");
 
         let bodies = bodies.lock().unwrap();
-        assert_eq!(bodies.len(), 3, "2 outbound rules + 1 inbound SSH rule");
+        assert_eq!(
+            bodies.len(),
+            11,
+            "2 outbound rules + 1 inbound SSH rule + 8 DNS reply rules"
+        );
         assert!(bodies
             .iter()
             .any(|b| b.contains("203.0.113.5") && b.contains("\"destination_port_start\":\"22\"")));
+    }
+
+    #[tokio::test]
+    async fn test_firewall_applying_accepts_dns_replies_from_upcloud_resolvers() {
+        // Issue #138: UpCloud's firewall is stateless, so replies from its
+        // resolvers need their own inbound rules, UDP and TCP from port 53.
+        let bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let bodies_clone = bodies.clone();
+        let app = axum::Router::new().route(
+            "/1.3/server/:uuid/firewall_rule",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let bodies = bodies_clone.clone();
+                async move {
+                    bodies.lock().unwrap().push(body["firewall_rule"].clone());
+                    axum::Json(serde_json::json!({"firewall_rule": {}}))
+                }
+            }),
+        );
+        let provider = crate::providers::upcloud::tests::mock_server(app).await;
+        let mut ctx = mock_ctx(false);
+        ctx.provider = Arc::new(provider);
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_job_with_vm(&pool, "FirewallApplying", "srv1").await;
+        advance_all(&pool, &ctx).await.unwrap();
+
+        let bodies = bodies.lock().unwrap();
+        for (family, address) in [
+            ("IPv4", "94.237.127.9"),
+            ("IPv4", "94.237.40.9"),
+            ("IPv6", "2a04:3540:53::1"),
+            ("IPv6", "2a04:3544:53::1"),
+        ] {
+            for protocol in ["udp", "tcp"] {
+                let expected = serde_json::json!({
+                    "direction": "in", "action": "accept", "family": family,
+                    "protocol": protocol,
+                    "source_address_start": address, "source_address_end": address,
+                    "source_port_start": "53", "source_port_end": "53"
+                });
+                assert!(
+                    bodies.contains(&expected),
+                    "missing {protocol} rule for {address}"
+                );
+            }
+        }
+        // The DNS rules come last, which `FirewallVerified` relies on.
+        assert_eq!(bodies.last().unwrap()["source_port_start"], "53");
     }
 
     #[tokio::test]
@@ -2583,7 +2695,7 @@ mod tests {
         let app = axum::Router::new().route(
             "/1.3/server/:uuid/firewall_rule",
             axum::routing::post(|body: String| async move {
-                assert!(!body.contains("\"direction\":\"in\""));
+                assert!(!body.contains("\"destination_port_start\":\"22\""));
                 axum::Json(serde_json::json!({"firewall_rule": {}}))
             }),
         );
@@ -2633,7 +2745,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_firewall_verified_advances_once_outbound_rule_present() {
+    async fn test_firewall_verified_advances_once_outbound_and_dns_rules_present() {
+        let app = axum::Router::new().route(
+            "/1.3/server/:uuid/firewall_rule",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"firewall_rules": {"firewall_rule": [
+                    {"direction": "out", "action": "accept", "family": "IPv4"},
+                    {"direction": "in", "action": "accept", "family": "IPv6",
+                     "protocol": "tcp", "source_address_start": "2a04:3544:53::1",
+                     "source_port_start": "53", "source_port_end": "53"}
+                ]}}))
+            }),
+        );
+        let provider = crate::providers::upcloud::tests::mock_server(app).await;
+        let mut ctx = mock_ctx(false);
+        ctx.provider = Arc::new(provider);
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_job_with_vm(&pool, "FirewallVerified", "srv1").await;
+
+        let advanced = advance_all(&pool, &ctx).await.unwrap();
+        assert_eq!(advanced, 1);
+    }
+
+    #[tokio::test]
+    async fn test_firewall_verified_waits_for_dns_reply_rules() {
+        // Outbound alone isn't enough: the DNS reply rules are posted
+        // last and may not be visible yet (issue #138).
         let app = axum::Router::new().route(
             "/1.3/server/:uuid/firewall_rule",
             axum::routing::get(|| async {
@@ -2650,7 +2788,7 @@ mod tests {
         insert_job_with_vm(&pool, "FirewallVerified", "srv1").await;
 
         let advanced = advance_all(&pool, &ctx).await.unwrap();
-        assert_eq!(advanced, 1);
+        assert_eq!(advanced, 0);
     }
 
     #[tokio::test]

@@ -149,6 +149,23 @@ resource "upcloud_server" "kube_shim" {
   }
 }
 
+# UpCloud's DNS resolvers, one accept rule per resolver and protocol.
+# Keep in step with UPCLOUD_DNS_RESOLVERS in src/reconcile/job.rs,
+# which does the same for worker VMs.
+locals {
+  upcloud_dns_resolvers = [
+    { family = "IPv4", address = "94.237.127.9" },
+    { family = "IPv4", address = "94.237.40.9" },
+    { family = "IPv6", address = "2a04:3540:53::1" },
+    { family = "IPv6", address = "2a04:3544:53::1" },
+  ]
+  upcloud_dns_reply_rules = flatten([
+    for resolver in local.upcloud_dns_resolvers : [
+      for protocol in ["udp", "tcp"] : merge(resolver, { protocol = protocol })
+    ]
+  ])
+}
+
 resource "upcloud_firewall_rules" "kube_shim" {
   server_id = upcloud_server.kube_shim.id
 
@@ -233,6 +250,28 @@ resource "upcloud_firewall_rules" "kube_shim" {
     source_address_start   = "::"
     source_address_end     = "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"
     comment                = "ACME HTTP-01 challenge responder (IPv6)"
+  }
+
+  # Replies from UpCloud's DNS resolvers (issue #138). UpCloud's
+  # firewall is stateless, so the replies to the host's own DNS queries
+  # are inbound packets like any other and need their own accept rule,
+  # UDP and TCP from source port 53. Without these, systemd-resolved
+  # still gets answers, but only through its TCP fallback after a UDP
+  # timeout. Same resolvers in every zone:
+  # https://upcloud.com/docs/guides/dns-servers/
+  dynamic "firewall_rule" {
+    for_each = local.upcloud_dns_reply_rules
+    content {
+      action               = "accept"
+      direction            = "in"
+      family               = firewall_rule.value.family
+      protocol             = firewall_rule.value.protocol
+      source_address_start = firewall_rule.value.address
+      source_address_end   = firewall_rule.value.address
+      source_port_start    = "53"
+      source_port_end      = "53"
+      comment              = "DNS replies from UpCloud resolver (${firewall_rule.value.protocol})"
+    }
   }
 
   # "drop", not "deny" -- the only two valid `action` values the real
