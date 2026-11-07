@@ -100,23 +100,46 @@ variable "budget_rollover_cap_days" {
   default     = 7
 }
 
-variable "api_token_count" {
+variable "api_tokens" {
   description = <<-EOT
-    How many bearer tokens to mint for the authenticated API
-    (config.toml's [[server.api_tokens]]), each tracked as its own
-    random_password resource/output. Rotation with an overlap window,
-    the same way config.toml's own docs describe, now driven by
-    `tofu apply` instead of SSH + a text editor: bump this to add a
-    new token, migrate your kubernetes_provider/kubectl config to it
-    (see the api_tokens output), then lower it back down to retire the
-    old one(s) -- random_password's own indexing means raising the
-    count only ever adds a new token at the end, never reshuffles an
-    existing one's value. Each change is applied in place over SSH,
-    keeping the server and its IP addresses -- see README.md's
+    The bearer tokens to mint for the authenticated API (config.toml's
+    [[server.api_tokens]]), keyed by a name of your choice, e.g. one per
+    client. Each name gets its own random_password, so adding or removing
+    one never changes any other token's value. To rotate: add a new
+    name, move your client to it (see the api_tokens output), then
+    remove the old name. Optionally give a token an RFC 3339 expires_at,
+    e.g. "2027-01-01T00:00:00Z", after which kube-shim rejects it.
+    Every change is pushed to the existing host over SSH; see README.md's
     "Rotating credentials".
   EOT
-  type        = number
-  default     = 1
+  type = map(object({
+    expires_at = optional(string)
+  }))
+  default = { default = {} }
+
+  validation {
+    condition     = length(var.api_tokens) > 0
+    error_message = "api_tokens needs at least one token: kube-shim refuses to start without one."
+  }
+
+  validation {
+    condition = alltrue([
+      for t in values(var.api_tokens) : t.expires_at == null || can(timeadd(t.expires_at, "0s"))
+    ])
+    error_message = "Each expires_at must be an RFC 3339 timestamp, e.g. \"2027-01-01T00:00:00Z\"."
+  }
+
+  validation {
+    condition     = alltrue([for name in keys(var.api_tokens) : can(regex("^[A-Za-z0-9_.-]+$", name))])
+    error_message = "Token names may only use letters, digits, '_', '.' and '-' (they're written into config.toml as comments)."
+  }
+
+  validation {
+    condition = anytrue([
+      for t in values(var.api_tokens) : t.expires_at == null || try(timecmp(t.expires_at, plantimestamp()) > 0, false)
+    ])
+    error_message = "At least one token must not have expired yet: kube-shim refuses to start if every token has expired."
+  }
 }
 
 variable "reconciliation_interval_secs" {

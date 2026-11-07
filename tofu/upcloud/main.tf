@@ -5,7 +5,7 @@
 # pointing DNS at the result), plus the credentials it needs, minted
 # and tracked as real OpenTofu-managed state instead of hand-edited
 # file contents over SSH:
-#   - bearer token(s) for the authenticated API (server.api_tokens)
+#   - named bearer token(s) for the authenticated API (server.api_tokens)
 #   - an SSH keypair the shim itself uses against the worker VMs it
 #     provisions (upcloud.worker_ssh_private_key/worker_ssh_public_keys)
 #
@@ -24,10 +24,13 @@
 # log2(62)*43 ~= 256 bits of entropy -- the same real strength as
 # `openssl rand -base64 32` (this project's own existing convention,
 # bootstrap/provision.sh), just over a safer charset.
+#
+# Keyed by name (var.api_tokens), so any one token can be added or
+# retired without touching the others.
 resource "random_password" "api_token" {
-  count   = var.api_token_count
-  length  = 43
-  special = false
+  for_each = var.api_tokens
+  length   = 43
+  special  = false
 }
 
 resource "tls_private_key" "worker_ssh" {
@@ -35,11 +38,17 @@ resource "tls_private_key" "worker_ssh" {
 }
 
 locals {
+  config_api_tokens = [for name, t in random_password.api_token : {
+    name       = name
+    token      = t.result
+    expires_at = var.api_tokens[name].expires_at
+  }]
+
   config_toml = templatefile("${path.module}/templates/config.toml.tftpl", {
     hostname              = var.hostname
     acme_directory        = var.acme_directory
     acme_contact_email    = var.acme_contact_email
-    api_tokens            = [for t in random_password.api_token : t.result]
+    api_tokens            = local.config_api_tokens
     upcloud_runtime_token = var.upcloud_runtime_token
     dry_run               = var.dry_run
     zone                  = var.zone

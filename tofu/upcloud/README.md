@@ -64,6 +64,13 @@ module "kube_shim" {
   upcloud_runtime_token    = var.upcloud_runtime_token # a sub-account token, see above
   main_currency            = "CHF"
   budget_daily_rate        = 2.5
+
+  # One bearer token per client, so each can be rotated on its own.
+  # Leave this out to get a single token named "default".
+  api_tokens = {
+    terraform = {}
+    laptop    = {}
+  }
 }
 
 output "kube_shim_public_ipv4" {
@@ -81,8 +88,8 @@ output "kube_shim_api_tokens" {
 ```
 
 Then, in the same root config, point a `kubernetes_provider` (or
-`kubectl`) at the result using `module.kube_shim.api_tokens[0]` as the
-bearer token, and define your real `CronJob`/`Secret` resources
+`kubectl`) at the result using one of the tokens, e.g.
+`module.kube_shim.api_tokens["terraform"]`, as the bearer token, and define your real `CronJob`/`Secret` resources
 against it the same way this project's own `docs/IMPLEMENTATION_PLAN.md`
 testing sections do by hand with `curl`/`kubectl`.
 
@@ -93,7 +100,7 @@ The UpCloud provider marks `user_data` as `RequiresReplace`, so this
 module tells OpenTofu to ignore later changes to it. Instead,
 `terraform_data.push_config` copies `config.toml` and the quadlet unit
 to the host over SSH whenever either one changes, and restarts
-`kube-shim.service`. So changing `image_tag`, `api_token_count`,
+`kube-shim.service`. So changing `image_tag`, `api_tokens`,
 `acme_directory`, budget settings or the runtime token is one
 `tofu apply` that keeps the server, its IP addresses, the SQLite
 database and the ACME cache.
@@ -172,18 +179,22 @@ throwaway test instances.
 
 ## Rotating credentials
 
-Bump `api_token_count` and `tofu apply`. `random_password`'s own
-indexing means a higher count only ever appends, so the existing
-token(s) keep their values, and the new config is pushed in place (see
-"Updating in place"): no new server, no new IP addresses. Then migrate
-your `kubernetes_provider`/`kubectl` config to
-`module.kube_shim.api_tokens[<new index>]` while both tokens work.
+Tokens are keyed by name in `api_tokens`, and each name has its own
+`random_password`, so adding or removing one never changes another.
+To rotate a token, say `terraform`:
 
-Retiring the old token is less tidy: lowering `api_token_count`
-removes the *last* token, not the first, so it can't retire
-`api_tokens[0]` on its own. Use
-`tofu apply -replace='module.kube_shim.random_password.api_token[0]'`
-to give index 0 a fresh value instead.
+1. Add a new name next to it, e.g. `terraform-2027 = {}`, and
+   `tofu apply`. The new config is pushed in place (see "Updating in
+   place"): no new server, no new IP addresses. Both tokens now work.
+2. Move the client to `module.kube_shim.api_tokens["terraform-2027"]`.
+3. Remove `terraform` from `api_tokens` and `tofu apply` again.
+
+Instead of step 3, you can give the old token an end date, e.g.
+`terraform = { expires_at = "2027-01-01T00:00:00Z" }`. kube-shim
+checks `expires_at` on every request, so the token stops working at
+that time without another apply. Remove it from `api_tokens` later to
+tidy up. The module refuses a plan in which every token has already
+expired, since kube-shim won't start without a valid one.
 
 There's no equivalent rotation knob for `worker_ssh`
 (`tls_private_key`) or `upcloud_runtime_token`. Replacing either means

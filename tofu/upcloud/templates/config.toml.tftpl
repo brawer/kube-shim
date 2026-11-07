@@ -10,9 +10,13 @@ acme_contact_email = "${acme_contact_email}"
 %{ endif ~}
 acme_cache_dir = "/data/acme-cache"
 
-%{ for token in api_tokens ~}
+%{ for t in api_tokens ~}
+# ${t.name}
 [[server.api_tokens]]
-token = "${token}"
+token = "${t.token}"
+%{ if t.expires_at != null ~}
+expires_at = "${t.expires_at}"
+%{ endif ~}
 
 %{ endfor ~}
 [database]
