@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.4.1](https://github.com/brawer/kube-shim/compare/v0.4.0...v0.4.1) (2026-11-07)
+
+
+### 🆕 Enhancements
+
+* count finished job runs by result in /metrics ([#123](https://github.com/brawer/kube-shim/issues/123)) ([ef92be1](https://github.com/brawer/kube-shim/commit/ef92be125c8894091036267cbee43bec17a5a74e)), closes [#120](https://github.com/brawer/kube-shim/issues/120)
+
+
+### 🐞 Bug Fixes
+
+* apply Kubernetes' CronJob defaults so OpenTofu plans converge ([#122](https://github.com/brawer/kube-shim/issues/122)) ([33c3155](https://github.com/brawer/kube-shim/commit/33c3155f13a0b30a2165ed6c4d38fd7b904a716d)), closes [#119](https://github.com/brawer/kube-shim/issues/119)
+* include the container's stderr in job logs ([#125](https://github.com/brawer/kube-shim/issues/125)) ([d0fe7f8](https://github.com/brawer/kube-shim/commit/d0fe7f8578eaf9938a21c2dca8bdbf621299205a)), closes [#121](https://github.com/brawer/kube-shim/issues/121)
+* report a finished run's real outcome once it is archived ([#126](https://github.com/brawer/kube-shim/issues/126)) ([52ef378](https://github.com/brawer/kube-shim/commit/52ef378a9fcce7344ea71c5211506f0536b7a980))
+* shut down cleanly on SIGTERM instead of waiting for SIGKILL ([#128](https://github.com/brawer/kube-shim/issues/128)) ([fe85f6b](https://github.com/brawer/kube-shim/commit/fe85f6bc1c89ae7d8967bddd844930563f08abc1)), closes [#118](https://github.com/brawer/kube-shim/issues/118)
+
 ## [0.4.0](https://github.com/brawer/kube-shim/compare/v0.3.4...v0.4.0) (2026-11-07)
 
 
