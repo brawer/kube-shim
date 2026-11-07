@@ -127,6 +127,23 @@ pub fn already_exists(kind: &str, name: &str) -> axum::response::Response {
     )
 }
 
+/// 400 Bad Request, `reason: BadRequest`: the request itself is malformed
+/// in a way no field-level validation covers, e.g. an update whose body
+/// names a different object than its URL (issue #105).
+pub fn bad_request(message: impl Into<String>) -> axum::response::Response {
+    status_error(StatusCode::BAD_REQUEST, "BadRequest", message)
+}
+
+/// 415 Unsupported Media Type, `reason: UnsupportedMediaType`: e.g. a
+/// `PATCH` in a patch format kube-shim doesn't implement (issue #105).
+pub fn unsupported_media_type(message: impl Into<String>) -> axum::response::Response {
+    status_error(
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "UnsupportedMediaType",
+        message,
+    )
+}
+
 /// 422 Unprocessable Entity, `reason: Invalid`: a field's value isn't one
 /// of the values this API supports for it -- the same shape a real cluster
 /// uses for an unsupported enum-style field value (e.g. an unknown

@@ -36,8 +36,9 @@ pub fn server_header_layer() -> SetResponseHeaderLayer<HeaderValue> {
 }
 
 /// `notify`: shared with the reconciliation loop (Phase 6) via
-/// `Extension`, not axum's `State` -- only `create_cronjob` needs it (to
-/// wake the loop immediately on a new `CronJob` instead of waiting up to
+/// `Extension`, not axum's `State` -- only the CronJob create/update
+/// handlers need it (to wake the loop immediately on a new or changed
+/// `CronJob` instead of waiting up to
 /// `reconcile::FALLBACK_INTERVAL`), and `Extension` lets it reach just
 /// that one handler without changing every other handler's `State<...>`
 /// extractor. `worker_ssh` (Phase 10) is the same pattern, for
@@ -124,7 +125,10 @@ fn authenticated_router(
         )
         .route(
             "/apis/batch/v1/namespaces/:namespace/cronjobs/:name",
-            get(api::cronjob::get_cronjob).delete(api::cronjob::delete_cronjob),
+            get(api::cronjob::get_cronjob)
+                .put(api::cronjob::replace_cronjob)
+                .patch(api::cronjob::patch_cronjob)
+                .delete(api::cronjob::delete_cronjob),
         )
         // Standalone Jobs API (Phase 13) -- a job run that exists
         // directly, not only ever spawned indirectly by a CronJob.

@@ -176,7 +176,9 @@ pub async fn discovery_batch_v1() -> impl IntoResponse {
                 "singularName": "cronjob",
                 "namespaced": true,
                 "kind": "CronJob",
-                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+                // "patch" means JSON merge patch only (issue #105). No
+                // "deletecollection"/"watch": nothing implements them.
+                "verbs": ["create", "delete", "get", "list", "patch", "update"]
             },
             {
                 "name": "jobs",
