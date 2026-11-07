@@ -6,6 +6,7 @@
 //! job/pod mapping, which this reuses).
 
 use super::secret::ObjectMeta;
+use crate::reconcile::job::RUN_FAILED_SQL;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -33,21 +34,22 @@ pub struct Pod {
 /// Pod reports. Everything before `ContainerRunning` is still
 /// provisioning (`Pending`, same as a real pod whose containers haven't
 /// started yet); the cleanup tail (`VolumeDetaching` onward) keeps
-/// reporting whatever terminal phase the job already reached, inferred
-/// from `last_error` since `status` itself has moved on to a cleanup
-/// state by then and no longer says `Succeeded`/`Failed` directly.
+/// reporting whatever terminal phase the job already reached. `failed`
+/// is `reconcile::job::RUN_FAILED_SQL` for the row, since `status`
+/// itself has moved on to a cleanup state by then and no longer says
+/// `Succeeded`/`Failed` directly.
 ///
 /// `pub(crate)`: also reused by `api::job::status_for` (Phase 13) to
 /// derive a standalone `Job`'s own `active`/`succeeded`/`failed`
 /// status fields -- one state->outcome inference, two representations,
 /// not a second copy of this same three-way mapping.
-pub(crate) fn phase_for(status: &str, last_error: &Option<String>) -> &'static str {
+pub(crate) fn phase_for(status: &str, failed: bool) -> &'static str {
     match status {
         "ContainerRunning" => "Running",
         "Succeeded" => "Succeeded",
         "Failed" => "Failed",
         "VolumeDetaching" | "VolumeDeleted" | "VMTerminating" | "Archived" => {
-            if last_error.is_some() {
+            if failed {
                 "Failed"
             } else {
                 "Succeeded"
@@ -61,18 +63,20 @@ pub async fn get_pod(
     State(pool): State<SqlitePool>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Pod>, (StatusCode, String)> {
-    let row = sqlx::query("SELECT status, last_error FROM jobs WHERE namespace = ? AND name = ?")
-        .bind(&namespace)
-        .bind(&name)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let row = sqlx::query(&format!(
+        "SELECT status, {RUN_FAILED_SQL} FROM jobs WHERE namespace = ? AND name = ?"
+    ))
+    .bind(&namespace)
+    .bind(&name)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let Some(row) = row else {
         return Err((StatusCode::NOT_FOUND, "Pod not found".to_string()));
     };
     let status: String = row.get(0);
-    let last_error: Option<String> = row.get(1);
+    let failed: bool = row.get(1);
 
     Ok(Json(Pod {
         api_version: "v1".to_string(),
@@ -84,7 +88,7 @@ pub async fn get_pod(
             creation_timestamp: None,
         },
         status: PodStatus {
-            phase: phase_for(&status, &last_error).to_string(),
+            phase: phase_for(&status, failed).to_string(),
         },
     }))
 }
@@ -155,16 +159,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cleanup_tail_after_failure_stays_failed() {
+    async fn test_cleanup_tail_after_forced_failure_stays_failed() {
+        // force_failed records a Failed event; a later cleanup retry
+        // overwrote last_error with something unrelated.
         let pool = crate::db::init_pool(":memory:").await.unwrap();
-        insert_job(
-            &pool,
-            "p1",
-            "VolumeDetaching",
-            Some("DeadlineExceeded: ..."),
-        )
-        .await;
+        insert_job(&pool, "p1", "VolumeDetaching", Some("delete_volume failed")).await;
+        insert_failed_event(&pool, "p1").await;
         assert_eq!(get_phase(&pool, "p1").await, "Failed");
+    }
+
+    #[tokio::test]
+    async fn test_archived_after_nonzero_exit_code_stays_failed() {
+        // The first OSMDiffs run on the live instance (issue #120): exit
+        // code 1, no last_error, then cleanup through to Archived.
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_job(&pool, "p1", "Archived", None).await;
+        set_exit_code(&pool, "p1", 1).await;
+        assert_eq!(get_phase(&pool, "p1").await, "Failed");
+    }
+
+    #[tokio::test]
+    async fn test_archived_after_success_with_earlier_retry_stays_succeeded() {
+        // A retry before completion left last_error set; the run then
+        // exited 0.
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_job(&pool, "p1", "Archived", Some("create_server failed")).await;
+        set_exit_code(&pool, "p1", 0).await;
+        assert_eq!(get_phase(&pool, "p1").await, "Succeeded");
+    }
+
+    async fn set_exit_code(pool: &SqlitePool, name: &str, exit_code: i64) {
+        sqlx::query("UPDATE jobs SET exit_code = ? WHERE name = ?")
+            .bind(exit_code)
+            .bind(name)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn insert_failed_event(pool: &SqlitePool, name: &str) {
+        sqlx::query(
+            "INSERT INTO events (id, job_id, reason, message, timestamp, type) \
+             SELECT 'e1', id, 'Failed', '', 0, 'Warning' FROM jobs WHERE name = ?",
+        )
+        .bind(name)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

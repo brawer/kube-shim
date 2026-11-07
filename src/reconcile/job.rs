@@ -284,6 +284,21 @@ pub(crate) fn active_deadline_seconds(spec: &JsonValue) -> Option<i64> {
     spec.get("activeDeadlineSeconds")?.as_i64()
 }
 
+/// SQL for "this run failed", true once it has entered `Failed`, over a
+/// `jobs` row (the table must be named `jobs`, not aliased). Read
+/// wherever a finished run's outcome is needed after `status` has moved
+/// on to cleanup: the Pod phase and Job status (`api::pods`, `api::job`)
+/// and `kubeshim_job_runs_total` (`metrics_export`).
+///
+/// Both ways into `Failed` record a `Failed` event, which is never
+/// deleted: a nonzero exit code (`advance_all`'s transition) and
+/// `force_failed`. `last_error` is no signal: a retry sets it on runs
+/// that go on to succeed, and a retry during cleanup overwrites the
+/// reason `force_failed` stored. A nonzero `exit_code` also counts, for
+/// rows from before events were recorded.
+pub(crate) const RUN_FAILED_SQL: &str = "(COALESCE(jobs.exit_code, 0) <> 0 OR EXISTS ( \
+     SELECT 1 FROM events WHERE events.job_id = jobs.id AND events.reason = 'Failed'))";
+
 /// Force-fails a job that exceeded its `activeDeadlineSeconds` or got
 /// stuck in one state for too long (Phase 11) -- sets `status = Failed`
 /// directly (bypassing the normal per-state handlers entirely for this

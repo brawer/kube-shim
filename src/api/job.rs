@@ -19,6 +19,7 @@ use super::cost_report::CostReportConfig;
 use super::pods::phase_for;
 use super::secret::ObjectMeta;
 use crate::reconcile::job as reconcile_job;
+use crate::reconcile::job::RUN_FAILED_SQL;
 use crate::{admission, k8s_status, pricing};
 use axum::{
     extract::{Path, State},
@@ -92,8 +93,8 @@ pub struct JobList {
 /// `JobStatus`'s own `active`/`succeeded`/`failed`/`conditions` shape
 /// instead of `Pod`'s single `phase` string -- one inference, two
 /// representations, not a second copy of this same three-way mapping.
-fn status_for(status: &str, last_error: &Option<String>) -> JobStatus {
-    match phase_for(status, last_error) {
+fn status_for(status: &str, failed: bool) -> JobStatus {
+    match phase_for(status, failed) {
         "Succeeded" => JobStatus {
             active: 0,
             succeeded: 1,
@@ -132,7 +133,7 @@ fn row_to_job(row: SqliteRow) -> Job {
     let namespace: String = row.get(2);
     let spec_str: String = row.get(3);
     let status: String = row.get(4);
-    let last_error: Option<String> = row.get(5);
+    let failed: bool = row.get(5);
 
     let spec: JsonValue = serde_json::from_str(&spec_str).unwrap_or(JsonValue::Null);
 
@@ -146,7 +147,7 @@ fn row_to_job(row: SqliteRow) -> Job {
             creation_timestamp: None,
         },
         spec,
-        status: status_for(&status, &last_error),
+        status: status_for(&status, failed),
     }
 }
 
@@ -298,7 +299,7 @@ pub async fn create_job(
             creation_timestamp: Some(super::secret::rfc3339(now)),
         },
         spec: req.spec,
-        status: status_for("Created", &None),
+        status: status_for("Created", false),
     };
 
     (StatusCode::CREATED, Json(job)).into_response()
@@ -312,9 +313,9 @@ pub async fn list_jobs(
     State(pool): State<SqlitePool>,
     Path(namespace): Path<String>,
 ) -> Result<Json<JobList>, (StatusCode, String)> {
-    let rows = sqlx::query(
-        "SELECT id, name, namespace, spec, status, last_error FROM jobs WHERE namespace = ?",
-    )
+    let rows = sqlx::query(&format!(
+        "SELECT id, name, namespace, spec, status, {RUN_FAILED_SQL} FROM jobs WHERE namespace = ?"
+    ))
     .bind(&namespace)
     .fetch_all(&pool)
     .await
@@ -333,10 +334,10 @@ pub async fn get_job(
     State(pool): State<SqlitePool>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Job>, (StatusCode, String)> {
-    let row = sqlx::query(
-        "SELECT id, name, namespace, spec, status, last_error FROM jobs \
-         WHERE namespace = ? AND name = ?",
-    )
+    let row = sqlx::query(&format!(
+        "SELECT id, name, namespace, spec, status, {RUN_FAILED_SQL} FROM jobs \
+         WHERE namespace = ? AND name = ?"
+    ))
     .bind(&namespace)
     .bind(&name)
     .fetch_optional(&pool)
@@ -715,6 +716,30 @@ mod tests {
         assert_eq!(body["status"]["succeeded"], 1);
         assert_eq!(body["status"]["active"], 0);
         assert_eq!(body["status"]["conditions"][0]["type"], "Complete");
+    }
+
+    #[tokio::test]
+    async fn test_archived_job_with_nonzero_exit_code_reports_failed() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_job_with_status(&pool, "failed-one", "Archived").await;
+        sqlx::query("UPDATE jobs SET exit_code = 1 WHERE name = 'failed-one'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let response = router(pool)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/apis/batch/v1/namespaces/default/jobs/failed-one")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(response).await;
+        assert_eq!(body["status"]["failed"], 1);
+        assert_eq!(body["status"]["succeeded"], 0);
+        assert_eq!(body["status"]["conditions"][0]["type"], "Failed");
     }
 
     #[tokio::test]

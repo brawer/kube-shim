@@ -35,7 +35,7 @@
 //! which Prometheus itself sets to the scrape job's name.
 
 use crate::pricing;
-use crate::reconcile::job::is_pre_completion_state;
+use crate::reconcile::job::{is_pre_completion_state, RUN_FAILED_SQL};
 use crate::reconcile::{LoopStats, TickHealth, STATE_SEQUENCE};
 use axum::{
     extract::State,
@@ -223,12 +223,10 @@ struct RunTally {
 /// row, and the count drops by one, which Prometheus reads as a counter
 /// reset.
 ///
-/// A run failed if it ever entered `Failed`: either a nonzero exit code
-/// or a forced failure (`activeDeadlineSeconds`, a stuck state, or
-/// deletion while running). Both paths record a `Failed` event, and
-/// events are never deleted, so this holds even after `last_error` is
-/// overwritten by a retry during cleanup. A nonzero `exit_code` also
-/// counts, for rows older than the events table.
+/// A run failed if it ever entered `Failed` (`RUN_FAILED_SQL`): a
+/// nonzero exit code or a forced failure (`activeDeadlineSeconds`, a
+/// stuck state, or deletion while running). This is the same test the
+/// Pod phase and Job status use.
 ///
 /// `cronjob` is the owning CronJob's name, or empty for a standalone
 /// Job, so the labels stay one series per CronJob, not one per run.
@@ -236,18 +234,15 @@ struct RunTally {
 /// moment it exists, so `increase()` sees even its first failure. A
 /// last-completion timestamp of 0 means no such run yet.
 async fn write_job_runs(out: &mut Exposition, pool: &SqlitePool) -> anyhow::Result<()> {
-    let rows = sqlx::query(
-        "SELECT namespace, COALESCE(cronjob_name, ''), status, \
-                (COALESCE(exit_code, 0) <> 0 OR EXISTS ( \
-                    SELECT 1 FROM events e WHERE e.job_id = jobs.id AND e.reason = 'Failed' \
-                )) AS failed, \
+    let rows = sqlx::query(&format!(
+        "SELECT namespace, COALESCE(cronjob_name, ''), status, {RUN_FAILED_SQL} AS failed, \
                 COUNT(*), \
                 MAX(COALESCE(completed_at, ( \
                     SELECT MIN(e.timestamp) FROM events e \
                     WHERE e.job_id = jobs.id AND e.reason IN ('Succeeded', 'Failed') \
                 ), updated_at)) \
-         FROM jobs GROUP BY 1, 2, 3, 4",
-    )
+         FROM jobs GROUP BY 1, 2, 3, 4"
+    ))
     .fetch_all(pool)
     .await?;
 
