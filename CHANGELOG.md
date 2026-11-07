@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.4.2](https://github.com/brawer/kube-shim/compare/v0.4.1...v0.4.2) (2026-11-07)
+
+
+### 🆕 Enhancements
+
+* support timestamps and other PodLogOptions on pod logs ([#137](https://github.com/brawer/kube-shim/issues/137)) ([222fe2b](https://github.com/brawer/kube-shim/commit/222fe2bebf1be7ad6ba3f54f0b97e4d4155eb6ad))
+* support timestamps, tailLines, sinceSeconds/sinceTime and limitBytes on pod logs ([222fe2b](https://github.com/brawer/kube-shim/commit/222fe2bebf1be7ad6ba3f54f0b97e4d4155eb6ad)), closes [#131](https://github.com/brawer/kube-shim/issues/131)
+
+
+### 🐞 Bug Fixes
+
+* don't wait for a volume device when the job has no volume ([#136](https://github.com/brawer/kube-shim/issues/136)) ([6ba62e1](https://github.com/brawer/kube-shim/commit/6ba62e13b275bd1e81e25b9920ae130af89a0ea3)), closes [#135](https://github.com/brawer/kube-shim/issues/135)
+* give job containers explicit DNS servers and report worker status on failure ([#134](https://github.com/brawer/kube-shim/issues/134)) ([72e0125](https://github.com/brawer/kube-shim/commit/72e01257ade9d3aac2af4985a04c02af531e10d9)), closes [#130](https://github.com/brawer/kube-shim/issues/130)
+* stop timing out running containers after 5 minutes ([#132](https://github.com/brawer/kube-shim/issues/132)) ([fa8f665](https://github.com/brawer/kube-shim/commit/fa8f66515394a82dc2be14ec4c0c731b88b09f43)), closes [#129](https://github.com/brawer/kube-shim/issues/129)
+
 ## [0.4.1](https://github.com/brawer/kube-shim/compare/v0.4.0...v0.4.1) (2026-11-07)
 
 
