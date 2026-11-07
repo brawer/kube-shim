@@ -323,6 +323,9 @@ async fn admit_cronjob(
     {
         return Some(response);
     }
+    if let Some(response) = admission::validate_cronjob_schedule(&object_description, spec) {
+        return Some(response);
+    }
     if let Some(response) = admission::validate_cronjob_schedule_fields(&object_description, spec) {
         return Some(response);
     }

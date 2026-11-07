@@ -181,6 +181,30 @@ pub fn validate_run_options(
     ))
 }
 
+/// Issue #111: rejects a `CronJob` whose `spec.schedule` is missing,
+/// empty or doesn't parse, as Kubernetes does (422 Invalid on
+/// `spec.schedule`). Otherwise the CronJob would be stored and then
+/// skipped, with a log warning, on every reconciliation tick. Uses the
+/// scheduler's own parser, so anything accepted here will run.
+pub fn validate_cronjob_schedule(
+    object_description: &str,
+    cronjob_spec: &JsonValue,
+) -> Option<Response> {
+    let parses =
+        |s: &str| !s.trim().is_empty() && crate::reconcile::schedule::parse_schedule(s).is_ok();
+    let value = match cronjob_spec.get("schedule") {
+        Some(JsonValue::String(s)) if parses(s) => return None,
+        Some(JsonValue::String(s)) => s.clone(),
+        None | Some(JsonValue::Null) => String::new(),
+        Some(other) => other.to_string(),
+    };
+    Some(k8s_status::invalid_field_value(
+        object_description,
+        "spec.schedule",
+        &value,
+    ))
+}
+
 /// Validates the `CronJob`-level scheduling fields (issue #105), the ones
 /// outside `jobTemplate` that `reconcile::schedule` reads:
 ///
@@ -534,6 +558,46 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("privileged"), "{message}");
+    }
+
+    #[test]
+    fn test_cronjob_schedule_valid_accepted() {
+        for schedule in [
+            "0 3 * * 0",
+            "0 2 * * 1-5",
+            "*/5 * * * *",
+            "@weekly",
+            "@daily",
+        ] {
+            let spec = json!({ "schedule": schedule });
+            assert!(
+                validate_cronjob_schedule("CronJob \"x\"", &spec).is_none(),
+                "{schedule}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cronjob_schedule_invalid_rejected() {
+        for spec in [
+            json!({"schedule": "not a cron expression"}),
+            json!({"schedule": ""}),
+            json!({"schedule": "   "}),
+            json!({"schedule": "0 3 * * 8"}),
+            json!({"schedule": "0 3 * *"}),
+            json!({"schedule": 5}),
+            json!({"schedule": null}),
+            json!({}),
+        ] {
+            let response = validate_cronjob_schedule("CronJob \"x\"", &spec)
+                .unwrap_or_else(|| panic!("{spec} must be rejected"));
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY
+            );
+            let message = response_message(response).await;
+            assert!(message.contains("spec.schedule"), "{message}");
+        }
     }
 
     #[test]
