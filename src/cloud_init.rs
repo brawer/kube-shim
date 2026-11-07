@@ -97,6 +97,14 @@ pub fn generate(spec: &JsonValue) -> Result<String, String> {
     } else {
         ""
     };
+    // Tells the worker whether to wait for a volume device at all
+    // (issue #135); `handle_volume_pending` creates one exactly when
+    // this finds it.
+    let volume_expected = if crate::reconcile::job::find_ephemeral_volume(spec).is_some() {
+        "true"
+    } else {
+        ""
+    };
 
     Ok(TEMPLATE
         .replace("__KUBESHIM_IMAGE_B64__", &b64(image))
@@ -113,7 +121,8 @@ pub fn generate(spec: &JsonValue) -> Result<String, String> {
         .replace(
             "__KUBESHIM_SCRATCH_VOLUME_B64__",
             &b64(&options.scratch_volume),
-        ))
+        )
+        .replace("__KUBESHIM_VOLUME_EXPECTED_B64__", &b64(volume_expected)))
 }
 
 /// `spec.template.spec.containers[0]`.
@@ -319,6 +328,7 @@ mod tests {
             "__KUBESHIM_RUN_AS_NON_ROOT_B64__",
             "__KUBESHIM_NO_NEW_PRIVILEGES_B64__",
             "__KUBESHIM_SCRATCH_VOLUME_B64__",
+            "__KUBESHIM_VOLUME_EXPECTED_B64__",
         ] {
             assert!(
                 !script.contains(placeholder),
@@ -335,6 +345,24 @@ mod tests {
             decode_between(&script, "SCRATCH_VOLUME=$(echo "),
             "/scratch:/scratch:idmap"
         );
+        assert_eq!(decode_between(&script, "VOLUME_EXPECTED=$(echo "), "");
+    }
+
+    #[test]
+    fn test_only_jobs_with_a_volume_wait_for_one() {
+        // Issue #135: without a volume, the worker must not poll for a
+        // device that never comes.
+        let without = generate(&container_spec(json!({"image": "x"}))).unwrap();
+        assert_eq!(decode_between(&without, "VOLUME_EXPECTED=$(echo "), "");
+        let with = generate(&json!({"template": {"spec": {
+            "containers": [{"image": "x"}],
+            "volumes": [{"name": "scratch", "ephemeral": {"volumeClaimTemplate": {"spec": {}}}}]
+        }}}))
+        .unwrap();
+        assert_eq!(decode_between(&with, "VOLUME_EXPECTED=$(echo "), "true");
+        assert!(with.contains(
+            "if [ \"$VOLUME_EXPECTED\" = true ]; then\n    echo \"Waiting for volume...\""
+        ));
     }
 
     #[test]
