@@ -30,7 +30,10 @@
 //!   5-minute stuck-state timeout (from `last_transition_time`,
 //!   reusing `RETRY_ESCALATION_THRESHOLD`) for every state short of
 //!   `Succeeded`/`Failed` -- see `is_pre_completion_state`,
-//!   `active_deadline_seconds`, and `force_failed`. Either bound firing
+//!   `active_deadline_seconds`, and `force_failed`. `ContainerRunning` is
+//!   exempt from the 5-minute timeout (issue #129): a started container
+//!   is bounded by `activeDeadlineSeconds` only, and one that never got a
+//!   container ID fails after `CONTAINER_START_TIMEOUT`. Either bound firing
 //!   forces the job straight to `"Failed"`, which rejoins the normal
 //!   `VolumeDetaching`/`VMTerminating` cleanup path rather than needing
 //!   its own cleanup logic.
@@ -160,6 +163,13 @@ pub const TERMINAL_STATE: &str = "Archived";
 /// observability only, not a give-up-and-clean-up mechanism. That's Phase
 /// 11's job; see this module's own top-level docs on staying in scope.
 const RETRY_ESCALATION_THRESHOLD: i64 = 5 * 60;
+
+/// How long a job may sit in `ContainerRunning` before the worker has
+/// written `/tmp/container-id.txt` (issue #129). Covers the image pull
+/// and `podman run` itself, so it is generous enough for multi-GB images.
+/// Once the container has an ID, only `activeDeadlineSeconds` bounds its
+/// runtime, as in Kubernetes.
+const CONTAINER_START_TIMEOUT: i64 = 30 * 60;
 
 use workload::WORKER_BOOT_DISK_GB;
 
@@ -466,8 +476,11 @@ pub async fn advance_all_until(
                 }
             }
 
+            // A running container is bounded by activeDeadlineSeconds
+            // alone (issue #129); `handle_container_running` has its own,
+            // longer timeout for a container that never started.
             let stuck_since = last_transition_time.unwrap_or(created_at);
-            if now - stuck_since > RETRY_ESCALATION_THRESHOLD {
+            if status != "ContainerRunning" && now - stuck_since > RETRY_ESCALATION_THRESHOLD {
                 force_failed(
                     pool,
                     &id,
@@ -540,8 +553,17 @@ pub async fn advance_all_until(
             .await?
             .then_some(next),
             "ContainerRunning" => {
-                handle_container_running(pool, ctx, &id, &namespace, &name, &spec_str, created_at)
-                    .await?
+                handle_container_running(
+                    pool,
+                    ctx,
+                    &id,
+                    &namespace,
+                    &name,
+                    &spec_str,
+                    created_at,
+                    last_transition_time,
+                )
+                .await?
             }
             "VolumeDetaching" => {
                 handle_volume_detaching(pool, ctx, &id, &namespace, &name, last_transition_time)
@@ -1262,6 +1284,12 @@ async fn handle_container_configuring(
 /// state: `"Succeeded"` for exit code 0, `"Failed"` for anything else --
 /// see `next_state`'s own docs for how `"Failed"` rejoins the normal
 /// cleanup path from there.
+///
+/// While there is no exit code yet, a worker that still has no container
+/// ID `CONTAINER_START_TIMEOUT` after entering this state (a hung pull, a
+/// failed `podman run`) is force-failed with `ContainerNeverStarted`.
+/// A container that did start is never timed out here (issue #129).
+#[allow(clippy::too_many_arguments)]
 async fn handle_container_running(
     pool: &SqlitePool,
     ctx: &JobContext,
@@ -1270,6 +1298,7 @@ async fn handle_container_running(
     name: &str,
     spec_str: &str,
     created_at: i64,
+    last_transition_time: Option<i64>,
 ) -> Result<Option<&'static str>> {
     if ctx.dry_run {
         return Ok(Some("Succeeded"));
@@ -1309,6 +1338,24 @@ async fn handle_container_running(
     else {
         // The file doesn't exist yet (or is still empty) -- the script
         // hasn't finished, not a failure.
+        let now = Utc::now().timestamp();
+        let waiting = now - last_transition_time.unwrap_or(created_at);
+        if waiting > CONTAINER_START_TIMEOUT && !has_container_id(ctx, &ip).await {
+            force_failed(
+                pool,
+                job_id,
+                namespace,
+                name,
+                &format!(
+                    "ContainerNeverStarted: the worker started no container within \
+                     {CONTAINER_START_TIMEOUT}s (no /tmp/container-id.txt on {ip})"
+                ),
+                now,
+            )
+            .await?;
+            // Already moved to Failed; nothing more for the caller to do.
+            return Ok(None);
+        }
         tracing::debug!("job {namespace}/{name}: container still running on {ip}");
         return Ok(None);
     };
@@ -1424,6 +1471,26 @@ async fn handle_container_running(
     } else {
         "Failed"
     }))
+}
+
+/// Whether the worker has written a container ID. An SSH error counts
+/// as "yes": only a worker that answers, without an ID, is known to have
+/// started nothing.
+async fn has_container_id(ctx: &JobContext, ip: &str) -> bool {
+    match ssh::exec_once(
+        ip,
+        ctx.worker_ssh_port,
+        &ctx.worker_ssh_private_key,
+        "cat /tmp/container-id.txt",
+    )
+    .await
+    {
+        Ok(output) => {
+            output.exit_status == Some(0)
+                && !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+        }
+        Err(_) => true,
+    }
 }
 
 /// `VolumeDetaching`: detach (if a worker VM exists) then delete the
@@ -3540,6 +3607,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "Failed");
+    }
+
+    /// A `ContainerRunning` job with a worker IP and an
+    /// `activeDeadlineSeconds` spec, for the issue #129 tests.
+    async fn insert_running_job(
+        pool: &SqlitePool,
+        ip: &str,
+        created_at: i64,
+        last_transition_time: i64,
+        active_deadline_seconds: i64,
+    ) {
+        let spec = serde_json::json!({
+            "activeDeadlineSeconds": active_deadline_seconds,
+            "template": {"spec": {"containers": [{"image": "busybox:latest"}]}}
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, worker_vm_id, worker_ssh_ip, created_at, updated_at, last_transition_time, version) \
+             VALUES ('j1', 'job-one', 'default', ?, 'ContainerRunning', 'srv1', ?, ?, ?, ?, 1)",
+        )
+        .bind(spec)
+        .bind(ip)
+        .bind(created_at)
+        .bind(created_at)
+        .bind(last_transition_time)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_running_container_is_not_timed_out_before_its_deadline() {
+        let mut responses = HashMap::new();
+        responses.insert("cat /tmp/container-id.txt", ("abc123", 0));
+        let (host, port) = crate::ssh::tests::mock_ssh_server(responses).await;
+        let mut ctx = mock_ctx(false);
+        ctx.worker_ssh_port = port;
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = Utc::now().timestamp();
+        insert_running_job(&pool, &host, now - 700, now - 600, 3600).await;
+
+        assert_eq!(advance_all(&pool, &ctx).await.unwrap(), 0);
+        let (status, last_error) = job_status_and_error(&pool).await;
+        assert_eq!(status, "ContainerRunning");
+        assert_eq!(last_error, None);
+    }
+
+    #[tokio::test]
+    async fn test_running_container_past_its_deadline_is_failed() {
+        let mut responses = HashMap::new();
+        responses.insert("cat /tmp/container-id.txt", ("abc123", 0));
+        let (host, port) = crate::ssh::tests::mock_ssh_server(responses).await;
+        let mut ctx = mock_ctx(false);
+        ctx.worker_ssh_port = port;
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = Utc::now().timestamp();
+        insert_running_job(&pool, &host, now - 3700, now - 600, 3600).await;
+
+        assert_eq!(advance_all(&pool, &ctx).await.unwrap(), 1);
+        let (status, last_error) = job_status_and_error(&pool).await;
+        assert_eq!(status, "Failed");
+        assert!(last_error.unwrap().contains("DeadlineExceeded"));
+    }
+
+    #[tokio::test]
+    async fn test_container_without_id_fails_after_start_timeout() {
+        // No container-id.txt: the mock's default reply is exit 1.
+        let (host, port) = crate::ssh::tests::mock_ssh_server(HashMap::new()).await;
+        let mut ctx = mock_ctx(false);
+        ctx.worker_ssh_port = port;
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = Utc::now().timestamp();
+        let entered = now - (CONTAINER_START_TIMEOUT + 1);
+        insert_running_job(&pool, &host, entered - 60, entered, 86400).await;
+
+        advance_all(&pool, &ctx).await.unwrap();
+        let (status, last_error) = job_status_and_error(&pool).await;
+        assert_eq!(status, "Failed");
+        assert!(last_error.unwrap().contains("ContainerNeverStarted"));
+    }
+
+    #[tokio::test]
+    async fn test_container_without_id_waits_within_start_timeout() {
+        let (host, port) = crate::ssh::tests::mock_ssh_server(HashMap::new()).await;
+        let mut ctx = mock_ctx(false);
+        ctx.worker_ssh_port = port;
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = Utc::now().timestamp();
+        insert_running_job(&pool, &host, now - 700, now - 600, 86400).await;
+
+        assert_eq!(advance_all(&pool, &ctx).await.unwrap(), 0);
+        assert_eq!(job_status_and_error(&pool).await.0, "ContainerRunning");
     }
 
     #[tokio::test]
