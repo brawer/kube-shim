@@ -96,6 +96,7 @@
 //! even runs -- rather than teaching every polling handler its own
 //! timeout logic individually.
 
+use crate::api::log_filter;
 use crate::providers::{
     CloudProvider, CreateServerRequest, CreateVolumeRequest, FirewallAction, FirewallDirection,
     FirewallFamily, FirewallRule, ProviderError,
@@ -1383,17 +1384,24 @@ async fn handle_container_running(
     //
     // `podman logs` writes what the container wrote to stderr on its own
     // stderr, so the log is `combined`, not just `stdout` (issue #121).
+    // This is the only chance to fetch the logs, so they're fetched with
+    // timestamps, which `api::logs` strips unless asked for (issue #131).
     let mut logs_fetch_error = None;
+    let mut logs_timestamped = false;
     let logs = if !container_id.is_empty() && container_id.chars().all(|c| c.is_ascii_hexdigit()) {
         match ssh::exec_once(
             &ip,
             ctx.worker_ssh_port,
             &ctx.worker_ssh_private_key,
-            &format!("podman logs {container_id}"),
+            &format!("podman logs --timestamps {container_id}"),
         )
         .await
         {
-            Ok(output) => String::from_utf8_lossy(&output.combined).into_owned(),
+            Ok(output) => {
+                logs_timestamped = true;
+                let logs = log_filter::normalize_timestamps(&output.combined);
+                String::from_utf8_lossy(&logs).into_owned()
+            }
             Err(err) => {
                 tracing::warn!(
                     "job {namespace}/{name}: fetching container logs from {ip} failed: {err}"
@@ -1455,7 +1463,15 @@ async fn handle_container_running(
         }
     };
 
-    record_completion(pool, job_id, exit_code, &logs, actual_cost).await?;
+    record_completion(
+        pool,
+        job_id,
+        exit_code,
+        &logs,
+        logs_timestamped,
+        actual_cost,
+    )
+    .await?;
     tracing::info!("job {namespace}/{name}: container finished on {ip}, exit code {exit_code}");
     if exit_code != 0 {
         record_worker_status(pool, ctx, job_id, namespace, name, &ip).await?;
@@ -1811,14 +1827,16 @@ async fn record_completion(
     job_id: &str,
     exit_code: i64,
     logs: &str,
+    logs_timestamped: bool,
     actual_cost: Option<f64>,
 ) -> Result<()> {
     sqlx::query(
-        "UPDATE jobs SET exit_code = ?, cached_logs = ?, actual_cost = ?, completed_at = ? \
-         WHERE id = ?",
+        "UPDATE jobs SET exit_code = ?, cached_logs = ?, cached_logs_timestamped = ?, \
+         actual_cost = ?, completed_at = ? WHERE id = ?",
     )
     .bind(exit_code)
     .bind(logs)
+    .bind(logs_timestamped)
     .bind(actual_cost)
     .bind(Utc::now().timestamp())
     .bind(job_id)
@@ -2941,7 +2959,10 @@ mod tests {
         let mut responses = HashMap::new();
         responses.insert("cat /tmp/exit-code", ("0", 0));
         responses.insert("cat /tmp/container-id.txt", ("abc123", 0));
-        responses.insert("podman logs abc123", ("hello from the container\n", 0));
+        responses.insert(
+            "podman logs --timestamps abc123",
+            ("hello from the container\n", 0),
+        );
         let (host, port) = crate::ssh::tests::mock_ssh_server(responses).await;
         let mut ctx = mock_ctx(false);
         ctx.worker_ssh_port = port;
@@ -2962,6 +2983,38 @@ mod tests {
         assert_eq!(cached_logs.as_deref(), Some("hello from the container\n"));
     }
 
+    #[tokio::test]
+    async fn test_container_running_caches_logs_with_normalized_timestamps() {
+        let mut responses = HashMap::new();
+        responses.insert("cat /tmp/exit-code", ("0", 0));
+        responses.insert("cat /tmp/container-id.txt", ("abc123", 0));
+        responses.insert(
+            "podman logs --timestamps abc123",
+            (
+                "2026-11-07T10:26:27.5012345+00:00 first\n2026-11-07T10:26:28.5+00:00 second\n",
+                0,
+            ),
+        );
+        let (host, port) = crate::ssh::tests::mock_ssh_server(responses).await;
+        let mut ctx = mock_ctx(false);
+        ctx.worker_ssh_port = port;
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_job_with_ssh_ip(&pool, "ContainerRunning", &host).await;
+        advance_all(&pool, &ctx).await.unwrap();
+
+        let (cached_logs, timestamped): (Option<String>, i64) =
+            sqlx::query_as("SELECT cached_logs, cached_logs_timestamped FROM jobs WHERE id = 'j1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            cached_logs.as_deref(),
+            Some("2026-11-07T10:26:27.501234500Z first\n2026-11-07T10:26:28.500000000Z second\n")
+        );
+        assert_eq!(timestamped, 1);
+    }
+
     async fn insert_provider_price(pool: &SqlitePool, price_key: &str, amount: f64, price: f64) {
         sqlx::query(
             "INSERT INTO provider_pricing (zone, price_key, amount, price, currency, fetched_at) \
@@ -2980,7 +3033,7 @@ mod tests {
         let mut responses = HashMap::new();
         responses.insert("cat /tmp/exit-code", ("0", 0));
         responses.insert("cat /tmp/container-id.txt", ("abc123", 0));
-        responses.insert("podman logs abc123", ("hello\n", 0));
+        responses.insert("podman logs --timestamps abc123", ("hello\n", 0));
         let (host, port) = crate::ssh::tests::mock_ssh_server(responses).await;
         let mut ctx = mock_ctx(false);
         ctx.worker_ssh_port = port;
@@ -3025,7 +3078,7 @@ mod tests {
         let mut responses = HashMap::new();
         responses.insert("cat /tmp/exit-code", ("1", 0));
         responses.insert("cat /tmp/container-id.txt", ("abc123", 0));
-        responses.insert("podman logs abc123", ("boom\n", 0));
+        responses.insert("podman logs --timestamps abc123", ("boom\n", 0));
         let (host, port) = crate::ssh::tests::mock_ssh_server(responses).await;
         let mut ctx = mock_ctx(false);
         ctx.worker_ssh_port = port;
@@ -3062,7 +3115,7 @@ mod tests {
         let mut responses = HashMap::new();
         responses.insert("cat /tmp/exit-code", ("1", 0));
         responses.insert("cat /tmp/container-id.txt", ("abc123", 0));
-        responses.insert("podman logs abc123", ("dns error\n", 0));
+        responses.insert("podman logs --timestamps abc123", ("dns error\n", 0));
         responses.insert(
             WORKER_STATUS_COMMAND,
             (
@@ -3091,7 +3144,7 @@ mod tests {
         let mut responses = HashMap::new();
         responses.insert("cat /tmp/exit-code", ("0", 0));
         responses.insert("cat /tmp/container-id.txt", ("abc123", 0));
-        responses.insert("podman logs abc123", ("ok\n", 0));
+        responses.insert("podman logs --timestamps abc123", ("ok\n", 0));
         responses.insert(WORKER_STATUS_COMMAND, ("Starting container...\n", 0));
         let (host, port) = crate::ssh::tests::mock_ssh_server(responses).await;
         let mut ctx = mock_ctx(false);
@@ -3109,7 +3162,7 @@ mod tests {
         let mut responses = HashMap::new();
         responses.insert("cat /tmp/exit-code", ("1", 0));
         responses.insert("cat /tmp/container-id.txt", ("abc123", 0));
-        responses.insert("podman logs abc123", ("boom\n", 0));
+        responses.insert("podman logs --timestamps abc123", ("boom\n", 0));
         responses.insert(WORKER_STATUS_COMMAND, ("", 1));
         let (host, port) = crate::ssh::tests::mock_ssh_server(responses).await;
         let mut ctx = mock_ctx(false);
@@ -3162,7 +3215,7 @@ mod tests {
             (vec![MockOut::Stdout("abc123")], 0),
         );
         responses.insert(
-            "podman logs abc123",
+            "podman logs --timestamps abc123",
             (vec![MockOut::Stdout("out\n"), MockOut::Stderr("err\n")], 0),
         );
         let (host, port) = crate::ssh::tests::mock_ssh_server_with_output(responses).await;
@@ -3194,7 +3247,7 @@ mod tests {
         let mut responses = HashMap::new();
         responses.insert("cat /tmp/exit-code", ("1", 0));
         responses.insert("cat /tmp/container-id.txt", ("abc123", 0));
-        responses.insert("podman logs abc123", ("", 0));
+        responses.insert("podman logs --timestamps abc123", ("", 0));
         let (host, port) = crate::ssh::tests::mock_ssh_server(responses).await;
         let mut ctx = mock_ctx(false);
         ctx.worker_ssh_port = port;
@@ -3223,7 +3276,7 @@ mod tests {
         let mut responses = HashMap::new();
         responses.insert("cat /tmp/exit-code", ("0", 0));
         responses.insert("cat /tmp/container-id.txt", ("abc123", 0));
-        responses.insert("podman logs abc123", ("", 0));
+        responses.insert("podman logs --timestamps abc123", ("", 0));
         let (host, port) = crate::ssh::tests::mock_ssh_server(responses).await;
         let mut ctx = mock_ctx(false);
         ctx.worker_ssh_port = port;

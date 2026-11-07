@@ -13,7 +13,15 @@
 //! erroring. Every other case falls back to `jobs.cached_logs`, written
 //! once by `reconcile::job::handle_container_running` right before the
 //! worker is torn down -- see that module's own docs.
+//!
+//! `timestamps`, `tailLines`, `sinceSeconds`/`sinceTime` and `limitBytes`
+//! work as in Kubernetes (issue #131), on both paths: cached logs are
+//! stored with podman's per-line timestamps, which are stripped unless
+//! asked for, and the live path asks podman for them only when needed.
+//! See `api::log_filter`. `previous=true` and `stream` other than `All`
+//! are rejected rather than ignored.
 
+use crate::api::log_filter::LogFilter;
 use crate::k8s_status;
 use crate::ssh::{self, WorkerSshConfig};
 use axum::body::Body;
@@ -21,20 +29,153 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Extension;
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use sqlx::{Row, SqlitePool};
 use std::sync::Arc;
 
-#[derive(Debug, Deserialize)]
+/// The `PodLogOptions` query parameters kube-shim reads. `container` and
+/// `insecureSkipTLSVerifyBackend` aren't listed: every pod has exactly
+/// one container, and there is no kubelet connection to skip TLS
+/// verification for.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LogQueryParams {
     #[serde(default)]
     pub follow: bool,
+    #[serde(default)]
+    pub timestamps: bool,
+    pub tail_lines: Option<i64>,
+    pub since_seconds: Option<i64>,
+    pub since_time: Option<String>,
+    pub limit_bytes: Option<i64>,
+    #[serde(default)]
+    pub previous: bool,
+    pub stream: Option<String>,
+}
+
+/// `LogQueryParams`, validated the way the API server validates
+/// `PodLogOptions`.
+struct LogOptions {
+    follow: bool,
+    timestamps: bool,
+    tail_lines: Option<usize>,
+    since: Option<DateTime<Utc>>,
+    limit_bytes: Option<usize>,
+}
+
+impl LogOptions {
+    /// The error is the parts of a `Status` response: code, reason and
+    /// message.
+    fn validate(
+        params: &LogQueryParams,
+        name: &str,
+    ) -> Result<Self, (StatusCode, &'static str, String)> {
+        let bad_request = |message: String| (StatusCode::BAD_REQUEST, "BadRequest", message);
+        let unprocessable =
+            |message: String| (StatusCode::UNPROCESSABLE_ENTITY, "Invalid", message);
+        let invalid = |field: &str, value: &dyn std::fmt::Display, rule: &str| {
+            unprocessable(format!(
+                "PodLogOptions \"{name}\" is invalid: {field}: Invalid value: {value}: {rule}"
+            ))
+        };
+        if params.previous {
+            return Err(bad_request(format!(
+                "previous terminated container in pod \"{name}\" not found: kube-shim never \
+                 restarts a container"
+            )));
+        }
+        if let Some(stream) = params.stream.as_deref() {
+            if stream != "All" {
+                return Err(bad_request(format!(
+                    "stream \"{stream}\" is not supported: kube-shim returns stdout and \
+                     stderr merged (stream=All)"
+                )));
+            }
+        }
+        if params.since_seconds.is_some() && params.since_time.is_some() {
+            return Err(unprocessable(format!(
+                "PodLogOptions \"{name}\" is invalid: : Forbidden: at most one of `sinceTime` \
+                 or `sinceSeconds` may be specified"
+            )));
+        }
+        let tail_lines = match params.tail_lines {
+            Some(n) if n < 0 => {
+                return Err(invalid(
+                    "tailLines",
+                    &n,
+                    "must be greater than or equal to 0",
+                ))
+            }
+            n => n.map(|n| n as usize),
+        };
+        let limit_bytes = match params.limit_bytes {
+            Some(n) if n < 1 => return Err(invalid("limitBytes", &n, "must be greater than 0")),
+            n => n.map(|n| n as usize),
+        };
+        let since = match (params.since_seconds, params.since_time.as_deref()) {
+            (Some(n), _) if n < 1 => {
+                return Err(invalid("sinceSeconds", &n, "must be greater than 0"))
+            }
+            (Some(n), _) => Some(Utc::now() - chrono::Duration::seconds(n)),
+            (None, Some(time)) => match DateTime::parse_from_rfc3339(time) {
+                Ok(time) => Some(time.with_timezone(&Utc)),
+                Err(_) => {
+                    return Err(bad_request(format!(
+                        "sinceTime \"{time}\" is not an RFC3339 time"
+                    )))
+                }
+            },
+            (None, None) => None,
+        };
+        Ok(LogOptions {
+            follow: params.follow,
+            timestamps: params.timestamps,
+            tail_lines,
+            since,
+            limit_bytes,
+        })
+    }
+
+    /// The filter for logs that do (or don't) carry podman timestamps.
+    fn filter(&self, input_has_timestamps: bool) -> LogFilter {
+        LogFilter {
+            input_has_timestamps,
+            timestamps: self.timestamps,
+            since: self.since,
+            limit_bytes: self.limit_bytes,
+        }
+    }
+
+    /// Whether the live `podman logs` call needs `--timestamps`: to show
+    /// them, or to filter on them.
+    fn needs_timestamps(&self) -> bool {
+        self.timestamps || self.since.is_some()
+    }
+
+    /// The live `podman logs` command for `container_id`.
+    fn podman_command(&self, container_id: &str) -> String {
+        let mut command = "podman logs".to_string();
+        if self.follow {
+            command.push_str(" -f");
+        }
+        if self.needs_timestamps() {
+            command.push_str(" --timestamps");
+        }
+        if let Some(n) = self.tail_lines {
+            command.push_str(&format!(" --tail {n}"));
+        }
+        command.push(' ');
+        command.push_str(container_id);
+        command
+    }
 }
 
 struct JobRow {
     status: String,
     worker_ssh_ip: Option<String>,
     cached_logs: Option<String>,
+    cached_logs_timestamped: bool,
 }
 
 async fn find_job(
@@ -43,7 +184,8 @@ async fn find_job(
     name: &str,
 ) -> anyhow::Result<Option<JobRow>> {
     let row = sqlx::query(
-        "SELECT status, worker_ssh_ip, cached_logs FROM jobs WHERE namespace = ? AND name = ?",
+        "SELECT status, worker_ssh_ip, cached_logs, cached_logs_timestamped FROM jobs \
+         WHERE namespace = ? AND name = ?",
     )
     .bind(namespace)
     .bind(name)
@@ -54,6 +196,7 @@ async fn find_job(
         status: row.get(0),
         worker_ssh_ip: row.get(1),
         cached_logs: row.get(2),
+        cached_logs_timestamped: row.get::<i64, _>(3) != 0,
     }))
 }
 
@@ -85,6 +228,10 @@ pub async fn get_pod_log(
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<LogQueryParams>,
 ) -> Response {
+    let options = match LogOptions::validate(&params, &name) {
+        Ok(options) => options,
+        Err((status, reason, message)) => return k8s_status::status_error(status, reason, message),
+    };
     let job = match find_job(&pool, &namespace, &name).await {
         Ok(Some(job)) => job,
         Ok(None) => return k8s_status::not_found("Pod", &name),
@@ -105,18 +252,15 @@ pub async fn get_pod_log(
     if live {
         let ip = job.worker_ssh_ip.as_deref().unwrap();
         if let Some(container_id) = live_container_id(ip, &ssh_config).await {
-            let command = if params.follow {
-                format!("podman logs -f {container_id}")
-            } else {
-                format!("podman logs {container_id}")
-            };
+            let command = options.podman_command(&container_id);
+            let filter = options.filter(options.needs_timestamps());
 
-            if params.follow {
+            if options.follow {
                 match ssh::exec_stream(ip, ssh_config.port, &ssh_config.private_key, &command).await
                 {
                     Ok(stream) => {
                         use tokio_stream::StreamExt;
-                        let body_stream = stream.map(Ok::<_, std::io::Error>);
+                        let body_stream = filter.apply_stream(stream).map(Ok::<_, std::io::Error>);
                         return Response::builder()
                             .status(StatusCode::OK)
                             .header("content-type", "text/plain; charset=utf-8")
@@ -136,7 +280,8 @@ pub async fn get_pod_log(
                         return (
                             StatusCode::OK,
                             [("content-type", "text/plain; charset=utf-8")],
-                            output.combined,
+                            // podman already applied --tail.
+                            filter.apply(&output.combined, None),
                         )
                             .into_response();
                     }
@@ -152,10 +297,15 @@ pub async fn get_pod_log(
     }
 
     match job.cached_logs {
+        // Logs cached before issue #131 have no timestamps: returned
+        // without them even for timestamps=true, and not filtered by
+        // since*.
         Some(logs) => (
             StatusCode::OK,
             [("content-type", "text/plain; charset=utf-8")],
-            logs,
+            options
+                .filter(job.cached_logs_timestamped)
+                .apply(logs.as_bytes(), options.tail_lines),
         )
             .into_response(),
         None => k8s_status::status_error(
@@ -211,6 +361,215 @@ mod tests {
             .header("authorization", format!("Bearer {TOKEN}"))
             .body(Body::empty())
             .unwrap()
+    }
+
+    fn log_request_query(name: &str, query: &str) -> Request<Body> {
+        let uri = format!("/api/v1/namespaces/default/pods/{name}/log?{query}");
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    async fn body_of(router: axum::Router, request: Request<Body>) -> (StatusCode, String) {
+        let response = router.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    const TIMESTAMPED: &str = "2026-11-07T10:26:27.501234567Z first\n\
+                               2026-11-07T10:26:28.501234567Z second\n\
+                               2026-11-07T10:26:29.501234567Z third\n";
+
+    /// An archived job whose cached logs are `logs`, with
+    /// `cached_logs_timestamped = timestamped`.
+    async fn archived_job_router(logs: &str, timestamped: bool) -> axum::Router {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, cached_logs, \
+             cached_logs_timestamped, created_at, updated_at, version) \
+             VALUES ('j1', 'done-job', 'default', '{}', 'Archived', ?, ?, 0, 0, 1)",
+        )
+        .bind(logs)
+        .bind(timestamped)
+        .execute(&pool)
+        .await
+        .unwrap();
+        test_router(pool, no_ssh()).await
+    }
+
+    #[tokio::test]
+    async fn test_cached_logs_with_timestamps() {
+        let router = archived_job_router(TIMESTAMPED, true).await;
+        let (status, body) =
+            body_of(router, log_request_query("done-job", "timestamps=true")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, TIMESTAMPED);
+    }
+
+    #[tokio::test]
+    async fn test_cached_logs_without_timestamps_param_are_stripped() {
+        let router = archived_job_router(TIMESTAMPED, true).await;
+        let (status, body) = body_of(router, log_request("done-job", false)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "first\nsecond\nthird\n");
+    }
+
+    #[tokio::test]
+    async fn test_old_cached_logs_are_returned_as_is_for_timestamps_true() {
+        // Cached before issue #131: no timestamps, even when a line looks
+        // like it starts with one.
+        let logs = "2026-01-01T00:00:00Z printed by the job itself\n";
+        let router = archived_job_router(logs, false).await;
+        let (_, body) = body_of(router, log_request_query("done-job", "timestamps=true")).await;
+        assert_eq!(body, logs);
+        let router = archived_job_router(logs, false).await;
+        let (_, body) = body_of(router, log_request("done-job", false)).await;
+        assert_eq!(body, logs);
+    }
+
+    #[tokio::test]
+    async fn test_cached_logs_tail_lines() {
+        let router = archived_job_router(TIMESTAMPED, true).await;
+        let (_, body) = body_of(router, log_request_query("done-job", "tailLines=2")).await;
+        assert_eq!(body, "second\nthird\n");
+    }
+
+    #[tokio::test]
+    async fn test_cached_logs_since_time() {
+        let router = archived_job_router(TIMESTAMPED, true).await;
+        let (_, body) = body_of(
+            router,
+            log_request_query("done-job", "sinceTime=2026-11-07T10:26:28Z&timestamps=true"),
+        )
+        .await;
+        assert_eq!(
+            body,
+            "2026-11-07T10:26:28.501234567Z second\n2026-11-07T10:26:29.501234567Z third\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cached_logs_since_seconds_drops_old_lines() {
+        let router = archived_job_router(TIMESTAMPED, true).await;
+        let (_, body) = body_of(router, log_request_query("done-job", "sinceSeconds=60")).await;
+        assert_eq!(body, "");
+    }
+
+    #[tokio::test]
+    async fn test_cached_logs_limit_bytes() {
+        let router = archived_job_router(TIMESTAMPED, true).await;
+        let (_, body) = body_of(router, log_request_query("done-job", "limitBytes=8")).await;
+        assert_eq!(body, "first\nse");
+    }
+
+    #[tokio::test]
+    async fn test_invalid_and_unsupported_options_are_rejected() {
+        for (query, expected) in [
+            ("tailLines=-1", StatusCode::UNPROCESSABLE_ENTITY),
+            ("limitBytes=0", StatusCode::UNPROCESSABLE_ENTITY),
+            ("sinceSeconds=0", StatusCode::UNPROCESSABLE_ENTITY),
+            (
+                "sinceSeconds=5&sinceTime=2026-11-07T10:26:28Z",
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            ("sinceTime=yesterday", StatusCode::BAD_REQUEST),
+            ("previous=true", StatusCode::BAD_REQUEST),
+            ("stream=Stdout", StatusCode::BAD_REQUEST),
+        ] {
+            let router = archived_job_router(TIMESTAMPED, true).await;
+            let (status, body) = body_of(router, log_request_query("done-job", query)).await;
+            assert_eq!(status, expected, "{query}");
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(json["kind"], "Status", "{query}");
+        }
+        for query in ["previous=false", "stream=All"] {
+            let router = archived_job_router(TIMESTAMPED, true).await;
+            let (status, _) = body_of(router, log_request_query("done-job", query)).await;
+            assert_eq!(status, StatusCode::OK, "{query}");
+        }
+    }
+
+    async fn running_job_router(
+        responses: HashMap<&'static str, (&'static str, u32)>,
+    ) -> axum::Router {
+        let (host, port) = crate::ssh::tests::mock_ssh_server(responses).await;
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, worker_ssh_ip, created_at, updated_at, version) \
+             VALUES ('j1', 'running-job', 'default', '{}', 'ContainerRunning', ?, 0, 0, 1)",
+        )
+        .bind(&host)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let ssh_config = WorkerSshConfig {
+            private_key: crate::ssh::tests::throwaway_private_key_pem(),
+            port,
+        };
+        test_router(pool, ssh_config).await
+    }
+
+    #[tokio::test]
+    async fn test_live_one_shot_with_timestamps_normalizes_them() {
+        let mut responses = HashMap::new();
+        responses.insert("cat /tmp/container-id.txt", ("abc123", 0));
+        responses.insert(
+            "podman logs --timestamps abc123",
+            (
+                "2026-11-07T10:26:27.5+00:00 a\n2026-11-07T10:26:28.5+00:00 b\n",
+                0,
+            ),
+        );
+        let router = running_job_router(responses).await;
+        let (status, body) =
+            body_of(router, log_request_query("running-job", "timestamps=true")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            "2026-11-07T10:26:27.500000000Z a\n2026-11-07T10:26:28.500000000Z b\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_live_follow_with_timestamps_and_tail() {
+        let mut responses = HashMap::new();
+        responses.insert("cat /tmp/container-id.txt", ("abc123", 0));
+        responses.insert(
+            "podman logs -f --timestamps --tail 1 abc123",
+            ("2026-11-07T10:26:28.5+00:00 b\n", 0),
+        );
+        let router = running_job_router(responses).await;
+        let (status, body) = body_of(
+            router,
+            log_request_query("running-job", "follow=true&timestamps=true&tailLines=1"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "2026-11-07T10:26:28.500000000Z b\n");
+    }
+
+    #[tokio::test]
+    async fn test_live_since_fetches_timestamps_to_filter_then_strips_them() {
+        let mut responses = HashMap::new();
+        responses.insert("cat /tmp/container-id.txt", ("abc123", 0));
+        responses.insert(
+            "podman logs --timestamps abc123",
+            (
+                "2026-11-07T10:26:27+00:00 old\n2026-11-07T10:26:29+00:00 new\n",
+                0,
+            ),
+        );
+        let router = running_job_router(responses).await;
+        let (_, body) = body_of(
+            router,
+            log_request_query("running-job", "sinceTime=2026-11-07T10:26:28Z"),
+        )
+        .await;
+        assert_eq!(body, "new\n");
     }
 
     fn no_ssh() -> WorkerSshConfig {

@@ -3,6 +3,7 @@ pub mod cost_report;
 pub mod cronjob;
 pub mod events;
 pub mod job;
+pub mod log_filter;
 pub mod logs;
 pub mod metrics;
 pub mod nodes;

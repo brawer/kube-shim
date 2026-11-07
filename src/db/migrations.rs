@@ -65,6 +65,15 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("worker_metrics", "mapped_bytes", "INTEGER"),
     ("worker_metrics", "cached_bytes", "INTEGER"),
     ("worker_metrics", "anon_bytes", "INTEGER"),
+    // Issue #131: whether `jobs.cached_logs` starts every line with a
+    // timestamp (`podman logs --timestamps`), which `api::logs` strips
+    // unless the request asks for `timestamps=true`. 0 for logs cached
+    // before that change, and for a worker's start-error text.
+    (
+        "jobs",
+        "cached_logs_timestamped",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
 ];
 
 pub async fn run(pool: &SqlitePool) -> Result<()> {
