@@ -328,9 +328,11 @@ fn check_patched_secret(
     }
     match fields.remove("immutable") {
         None | Some(JsonValue::Null) | Some(JsonValue::Bool(false)) => {}
-        Some(other) => return Err(format!(
-            "immutable: Unsupported value: {other} (kube-shim doesn't support immutable Secrets)"
-        )),
+        Some(other) => {
+            return Err(format!(
+                "immutable: Unsupported value: {other} (immutable Secrets aren't supported)"
+            ));
+        }
     }
     let data = fields.remove("data");
     let string_data = fields.remove("stringData");
