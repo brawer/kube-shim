@@ -46,6 +46,13 @@ fn to_six_field(schedule: &str) -> String {
     format!("0 {}", fields.join(" "))
 }
 
+/// Parses a Kubernetes `spec.schedule` the way the scheduler reads it.
+/// Admission (`admission::validate_cronjob_schedule`) calls this too, so
+/// a schedule is accepted exactly when it would actually run.
+pub(crate) fn parse_schedule(schedule: &str) -> Result<Schedule, cron::error::Error> {
+    Schedule::from_str(&to_six_field(schedule))
+}
+
 const DAY_NAMES: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 
 /// Rewrites a POSIX day-of-week field as an explicit list of day names,
@@ -154,12 +161,14 @@ pub async fn schedule_due_jobs(pool: &SqlitePool, ctx: &JobContext) -> Result<us
         let created_at: i64 = row.get(5);
 
         if schedule_str.trim().is_empty() {
-            // Shouldn't happen for any CronJob created since this phase's
-            // fix to create_cronjob, but don't crash on stale/bad data.
+            // Rejected at admission since issue #111; rows stored before
+            // that are skipped rather than crashing the tick.
             continue;
         }
 
-        let schedule = match Schedule::from_str(&to_six_field(&schedule_str)) {
+        // Admission rejects unparseable schedules (issue #111), so this
+        // only hits rows stored before that check existed.
+        let schedule = match parse_schedule(&schedule_str) {
             Ok(schedule) => schedule,
             Err(err) => {
                 tracing::warn!(

@@ -272,3 +272,105 @@ async fn test_patch_cannot_rename() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+/// Issue #111: a schedule the scheduler can't read is rejected on create,
+/// PUT and merge PATCH, rather than stored and silently never run.
+const BAD_SCHEDULES: [&str; 3] = ["not a cron expression", "", "0 3 * * 8"];
+
+fn with_schedule(schedule: &str) -> Value {
+    let mut spec = osmdiffs_spec(true);
+    spec["schedule"] = json!(schedule);
+    spec
+}
+
+#[tokio::test]
+async fn test_create_with_an_unparseable_schedule_is_rejected() {
+    let router = test_router().await;
+    for schedule in BAD_SCHEDULES {
+        let (status, body) = send(
+            &router,
+            request(
+                "POST",
+                "/apis/batch/v1/namespaces/default/cronjobs",
+                "application/json",
+                cronjob_body("osmdiffs-weekly", with_schedule(schedule)),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{schedule:?}");
+        assert_eq!(body["reason"], "Invalid");
+        assert!(body["message"].as_str().unwrap().contains("spec.schedule"));
+    }
+    let (status, _) = send(&router, get(ITEM_URI)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_create_without_a_schedule_is_rejected() {
+    let router = test_router().await;
+    let mut spec = osmdiffs_spec(true);
+    spec.as_object_mut().unwrap().remove("schedule");
+    assert_eq!(
+        create(&router, "osmdiffs-weekly", spec).await,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+}
+
+#[tokio::test]
+async fn test_create_with_valid_schedules_is_accepted() {
+    let router = test_router().await;
+    for (name, schedule) in [("sunday", "0 3 * * 0"), ("weekly", "@weekly")] {
+        assert_eq!(
+            create(&router, name, with_schedule(schedule)).await,
+            StatusCode::CREATED,
+            "{schedule:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_put_with_an_unparseable_schedule_is_rejected() {
+    let router = test_router().await;
+    create(&router, "osmdiffs-weekly", osmdiffs_spec(true)).await;
+    for schedule in BAD_SCHEDULES {
+        let (status, body) = send(
+            &router,
+            request(
+                "PUT",
+                ITEM_URI,
+                "application/json",
+                cronjob_body("osmdiffs-weekly", with_schedule(schedule)),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{schedule:?}");
+        assert!(body["message"].as_str().unwrap().contains("spec.schedule"));
+    }
+    let (_, fetched) = send(&router, get(ITEM_URI)).await;
+    assert_eq!(fetched["spec"], osmdiffs_spec(true));
+}
+
+#[tokio::test]
+async fn test_merge_patch_with_an_unparseable_schedule_is_rejected() {
+    let router = test_router().await;
+    create(&router, "osmdiffs-weekly", osmdiffs_spec(true)).await;
+    for patch in [
+        json!({"spec": {"schedule": "0 3 * * 8"}}),
+        // Merge patch `null` deletes the field.
+        json!({"spec": {"schedule": null}}),
+    ] {
+        let (status, _) = send(
+            &router,
+            request(
+                "PATCH",
+                ITEM_URI,
+                "application/merge-patch+json",
+                patch.to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{patch}");
+    }
+    let (_, fetched) = send(&router, get(ITEM_URI)).await;
+    assert_eq!(fetched["spec"], osmdiffs_spec(true));
+}
