@@ -46,11 +46,66 @@ fn to_six_field(schedule: &str) -> String {
     format!("0 {}", fields.join(" "))
 }
 
+/// A parsed `spec.schedule`: the instants at which any of its parts
+/// fires. Usually there is just one part; see `parse_schedule` for when
+/// there are two.
+pub(crate) struct CronSchedule {
+    parts: Vec<Schedule>,
+}
+
+impl CronSchedule {
+    /// The first scheduled instant strictly after `after`, if any.
+    fn next_after(&self, after: &DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.parts
+            .iter()
+            .filter_map(|part| part.after(after).next())
+            .min()
+    }
+}
+
 /// Parses a Kubernetes `spec.schedule` the way the scheduler reads it.
 /// Admission (`admission::validate_cronjob_schedule`) calls this too, so
 /// a schedule is accepted exactly when it would actually run.
-pub(crate) fn parse_schedule(schedule: &str) -> Result<Schedule, cron::error::Error> {
-    Schedule::from_str(&to_six_field(schedule))
+///
+/// When both day-of-month and day-of-week are restricted, Kubernetes
+/// (and POSIX cron) fire on days matching **either** field: `0 3 13 * 5`
+/// runs on every 13th and on every Friday. The `cron` crate would only
+/// fire on days matching both (Friday the 13th), so such a schedule is
+/// split into two, one with day-of-week set to `*` and one with
+/// day-of-month set to `*`, and fires whenever either does (issue #110).
+pub(crate) fn parse_schedule(schedule: &str) -> Result<CronSchedule, cron::error::Error> {
+    let schedule = schedule.trim();
+    let fields: Vec<&str> = schedule.split_whitespace().collect();
+    let parts = match fields[..] {
+        [minute, hour, day_of_month, month, day_of_week]
+            if !schedule.starts_with('@')
+                && is_restricted(day_of_month)
+                && is_restricted(day_of_week) =>
+        {
+            vec![
+                format!("{minute} {hour} {day_of_month} {month} *"),
+                format!("{minute} {hour} * {month} {day_of_week}"),
+            ]
+        }
+        _ => vec![schedule.to_string()],
+    };
+    let parts = parts
+        .iter()
+        .map(|part| Schedule::from_str(&to_six_field(part)))
+        .collect::<Result<_, _>>()?;
+    Ok(CronSchedule { parts })
+}
+
+/// Whether a day-of-month or day-of-week field restricts the days a
+/// schedule fires on, as Kubernetes' cron library (robfig/cron) decides
+/// it: a field is unrestricted if any of its comma-separated items is
+/// `*` or `?`, alone or with a step of 1. So `*/2` counts as restricted,
+/// as it does in Kubernetes.
+fn is_restricted(field: &str) -> bool {
+    !field.split(',').any(|item| {
+        let (base, step) = item.split_once('/').unwrap_or((item, "1"));
+        (base == "*" || base == "?") && step == "1"
+    })
 }
 
 const DAY_NAMES: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
@@ -218,7 +273,7 @@ pub async fn schedule_due_jobs(pool: &SqlitePool, ctx: &JobContext) -> Result<us
 /// many there were, so this never walks through a long backlog of
 /// missed instants (e.g. after months of `suspend: true`).
 fn is_due(
-    schedule: &Schedule,
+    schedule: &CronSchedule,
     last_scheduled: DateTime<Utc>,
     now: DateTime<Utc>,
     starting_deadline: Option<i64>,
@@ -232,8 +287,7 @@ fn is_due(
         None => last_scheduled,
     };
     schedule
-        .after(&window_start)
-        .next()
+        .next_after(&window_start)
         .is_some_and(|next| next <= now)
 }
 
@@ -652,10 +706,8 @@ mod tests {
             .unwrap()
             .into(); // a Sunday
         let first_days = |schedule: &str| -> Vec<String> {
-            Schedule::from_str(&to_six_field(schedule))
-                .unwrap_or_else(|e| panic!("{schedule}: {e}"))
-                .after(&after)
-                .take(2)
+            upcoming(schedule, after, 2)
+                .iter()
                 .map(|t| t.format("%a %H:%M").to_string())
                 .collect()
         };
@@ -666,6 +718,82 @@ mod tests {
         assert_eq!(first_days("0 3 * * 6"), ["Sat 03:00", "Sat 03:00"]);
         assert_eq!(first_days("@weekly"), ["Sun 00:00", "Sun 00:00"]);
         assert_eq!(first_days("*/15 * * * *"), ["Sun 00:15", "Sun 00:30"]);
+    }
+
+    /// The first `count` instants of `schedule` after `after`.
+    fn upcoming(schedule: &str, after: DateTime<Utc>, count: usize) -> Vec<DateTime<Utc>> {
+        let schedule = parse_schedule(schedule).unwrap_or_else(|e| panic!("{schedule}: {e}"));
+        std::iter::successors(schedule.next_after(&after), |t| schedule.next_after(t))
+            .take(count)
+            .collect()
+    }
+
+    #[test]
+    fn test_day_of_month_or_day_of_week() {
+        // Issue #110: every 13th and every Friday, not only Friday the 13th.
+        let after = at("2026-11-01T00:00:00Z");
+        let days = |schedule: &str| -> Vec<String> {
+            upcoming(schedule, after, 7)
+                .iter()
+                .map(|t| t.format("%a %d %H:%M").to_string())
+                .collect()
+        };
+        assert_eq!(
+            days("0 3 13 * 5"),
+            [
+                "Fri 06 03:00",
+                "Fri 13 03:00",
+                "Fri 20 03:00",
+                "Fri 27 03:00",
+                "Fri 04 03:00",
+                "Fri 11 03:00",
+                "Sun 13 03:00"
+            ]
+        );
+        // `1,15` or Monday, in December only.
+        assert_eq!(
+            days("0 0 1,15 12 MON")[..5],
+            [
+                "Tue 01 00:00",
+                "Mon 07 00:00",
+                "Mon 14 00:00",
+                "Tue 15 00:00",
+                "Mon 21 00:00"
+            ]
+        );
+        // A step other than 1 restricts the field, as in Kubernetes.
+        assert_eq!(
+            days("0 0 */10 * 0")[..5],
+            [
+                "Sun 08 00:00",
+                "Wed 11 00:00",
+                "Sun 15 00:00",
+                "Sat 21 00:00",
+                "Sun 22 00:00"
+            ]
+        );
+        // With either field unrestricted, the other alone decides.
+        assert_eq!(days("0 3 13 * *")[..2], ["Fri 13 03:00", "Sun 13 03:00"]);
+        assert_eq!(days("0 3 * * 5")[..2], ["Fri 06 03:00", "Fri 13 03:00"]);
+        assert_eq!(days("0 3 13 * ?")[..1], ["Fri 13 03:00"]);
+        assert_eq!(days("0 3 */1 * 5")[..2], ["Fri 06 03:00", "Fri 13 03:00"]);
+    }
+
+    #[test]
+    fn test_is_restricted() {
+        for field in ["*", "?", "*/1", "1,*"] {
+            assert!(!is_restricted(field), "{field}");
+        }
+        for field in ["1", "1-5", "*/2", "MON", "1/1"] {
+            assert!(is_restricted(field), "{field}");
+        }
+    }
+
+    #[test]
+    fn test_split_schedule_still_rejects_bad_fields() {
+        assert!(parse_schedule("0 3 32 * 5").is_err());
+        assert!(parse_schedule("0 3 13 * 8").is_err());
+        assert!(parse_schedule("0 25 13 * 5").is_err());
     }
 
     async fn job_count(pool: &SqlitePool, cronjob_name: &str) -> i64 {
@@ -680,8 +808,8 @@ mod tests {
         DateTime::parse_from_rfc3339(rfc3339).unwrap().into()
     }
 
-    fn weekly_sunday_3am() -> Schedule {
-        Schedule::from_str(&to_six_field("0 3 * * 0")).unwrap()
+    fn weekly_sunday_3am() -> CronSchedule {
+        parse_schedule("0 3 * * 0").unwrap()
     }
 
     #[test]
