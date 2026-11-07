@@ -31,7 +31,7 @@ EXIT_CODE_FILE=/tmp/exit-code
 # shim reports it as the job's logs when there's no container to ask.
 START_ERROR_FILE=/tmp/start-error.txt
 
-echo "Waiting for volume..." > "$STATUS_FILE"
+echo "Booted" > "$STATUS_FILE"
 
 IMAGE=$(echo '__KUBESHIM_IMAGE_B64__' | base64 -d)
 CPU_LIMIT=$(echo '__KUBESHIM_CPU_LIMIT_B64__' | base64 -d)
@@ -47,6 +47,9 @@ READ_ONLY_ROOT=$(echo '__KUBESHIM_READ_ONLY_ROOT_B64__' | base64 -d)
 NO_NEW_PRIVILEGES=$(echo '__KUBESHIM_NO_NEW_PRIVILEGES_B64__' | base64 -d)
 RUN_AS_NON_ROOT=$(echo '__KUBESHIM_RUN_AS_NON_ROOT_B64__' | base64 -d)
 SCRATCH_VOLUME=$(echo '__KUBESHIM_SCRATCH_VOLUME_B64__' | base64 -d)
+# "true" when the job requested an ephemeral volume, empty otherwise
+# (issue #135): only then is a device worth waiting for.
+VOLUME_EXPECTED=$(echo '__KUBESHIM_VOLUME_EXPECTED_B64__' | base64 -d)
 
 # The job's ephemeral volume, if it requested one, is attached by the shim
 # via a separate UpCloud API call made AFTER this VM is already running
@@ -57,16 +60,22 @@ SCRATCH_VOLUME=$(echo '__KUBESHIM_SCRATCH_VOLUME_B64__' | base64 -d)
 # there. Device naming depends on which bus UpCloud presents extra
 # storage on for this template -- check both of the real possibilities
 # rather than hardcoding one and guessing wrong.
+# A job without a volume skips the wait entirely; otherwise it would
+# sit here for the full five minutes, billed, for a disk that never
+# comes (issue #135).
 DEVICE=""
-for _ in $(seq 1 60); do
-    for candidate in /dev/vdb /dev/sdb; do
-        if [ -b "$candidate" ]; then
-            DEVICE="$candidate"
-            break 2
-        fi
+if [ "$VOLUME_EXPECTED" = true ]; then
+    echo "Waiting for volume..." >> "$STATUS_FILE"
+    for _ in $(seq 1 60); do
+        for candidate in /dev/vdb /dev/sdb; do
+            if [ -b "$candidate" ]; then
+                DEVICE="$candidate"
+                break 2
+            fi
+        done
+        sleep 5
     done
-    sleep 5
-done
+fi
 
 mkdir -p /scratch
 if [ -n "$DEVICE" ]; then
@@ -74,8 +83,10 @@ if [ -n "$DEVICE" ]; then
     echo "Mounting volume..." >> "$STATUS_FILE"
     mkfs.ext4 -F "$DEVICE" >> "$STATUS_FILE" 2>&1
     mount "$DEVICE" /scratch
+elif [ "$VOLUME_EXPECTED" = true ]; then
+    echo "Volume attach timed out; /scratch is on the boot disk" >> "$STATUS_FILE"
 else
-    echo "No volume attached (job requested none, or attach timed out); /scratch is on the boot disk" >> "$STATUS_FILE"
+    echo "No volume requested; /scratch is on the boot disk" >> "$STATUS_FILE"
 fi
 
 # Kubernetes' fsGroup semantics: the volume's root belongs to that group,
