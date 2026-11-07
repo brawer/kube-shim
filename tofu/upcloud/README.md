@@ -116,6 +116,11 @@ What this needs:
   give it that, but this hasn't been checked on a live host yet (see
   "Verified vs. not").
 
+On a brand-new host, this push is also what installs `config.toml` and
+first starts `kube-shim.service`. cloud-init leaves `config.toml` out on
+purpose (see "Secrets and `user_data`" below), so kube-shim only comes
+up once the push lands, a few minutes into the same `tofu apply`.
+
 How a push runs (`templates/push-config.sh.tftpl`): wait for
 first-boot cloud-init, pull the image (a bad tag fails the apply
 before anything on the host changes), swap in `config.toml` and the
@@ -214,22 +219,40 @@ rest (and don't commit `*.tfstate` -- see this repo's own
 `.gitignore`), the same seriousness this project already applies to
 `config.toml`/`secrets/` never reaching git history.
 
+## Secrets and `user_data`
+
+Anyone with API access to the UpCloud account can read a server's
+`user_data`, and it stays there for the server's whole lifetime. So the
+module keeps `config.toml`, with the bearer tokens, the runtime token and
+the worker SSH private key, out of `user_data` and installs it over SSH
+instead (see "Updating in place").
+
+Hosts created with v0.3.x of this module or earlier still carry the
+`config.toml` they were first created with in their `user_data`, since
+changes to it are ignored. Upgrading the module doesn't change that, and
+needs no extra step to keep working. To close the exposure, rotate the
+credentials that were in it once (see "Rotating credentials"): every API
+token from back then, `worker_ssh`, and `upcloud_runtime_token`.
+Rebuilding the host (`-replace=...upcloud_server.kube_shim`) also clears
+it, but the old values were readable until then, so rotating is still
+the safer fix.
+
 ## Verified vs. not
 
 Every step in `templates/cloud-init.sh.tftpl` up through writing
-`config.toml` and the quadlet unit is lifted directly from
+the quadlet unit is lifted directly from
 `bootstrap/provision.sh`'s own already-hands-on-verified sequence (see
 that script's comments). The one step this module adds on top --
-non-interactively starting `kube-shim.service` via `machinectl shell`
-right after `loginctl enable-linger`, instead of a human doing it
-manually a few seconds/minutes later -- has **not** been verified
-against a real, live `tofu apply` yet. If a first real apply stalls
+non-interactively enabling `podman-auto-update.timer` via `machinectl
+shell` right after `loginctl enable-linger` -- has **not** been
+verified against a real, live `tofu apply` yet. If a first real apply stalls
 anywhere, this is the first thing to check (`journalctl -u
 cloud-init-local` / `/var/log/kube-shim-cloud-init.log` on the host).
 
 The in-place push (`terraform_data.push_config` and
-`templates/push-config.sh.tftpl`) hasn't run against a live host yet
-either. It was checked with `tofu validate`, by rendering the script and
+`templates/push-config.sh.tftpl`), which on a new host also writes the
+first `config.toml` and starts kube-shim, hasn't run against a live
+host yet either. It was checked with `tofu validate`, by rendering the script and
 running `bash -n` on it, and by checking the image-tag substitution
 against the checked-in unit file. Its assumptions most worth checking on
 the first real apply: passwordless `sudo` for `admin`, and
