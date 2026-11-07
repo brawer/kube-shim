@@ -136,7 +136,7 @@ pub async fn get_pod_log(
                         return (
                             StatusCode::OK,
                             [("content-type", "text/plain; charset=utf-8")],
-                            output.stdout,
+                            output.combined,
                         )
                             .into_response();
                     }
@@ -337,6 +337,62 @@ mod tests {
         // rather than erroring; src/ssh.rs's own tests already cover the
         // actual chunk-by-chunk forwarding behavior in isolation.
         let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    }
+
+    async fn running_job_router_with_logs(follow_command: &'static str) -> axum::Router {
+        use crate::ssh::tests::MockOut;
+        let mut responses = HashMap::new();
+        responses.insert(
+            "cat /tmp/container-id.txt",
+            (vec![MockOut::Stdout("abc123")], 0),
+        );
+        responses.insert(
+            follow_command,
+            (vec![MockOut::Stdout("out\n"), MockOut::Stderr("err\n")], 0),
+        );
+        let (host, port) = crate::ssh::tests::mock_ssh_server_with_output(responses).await;
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, worker_ssh_ip, created_at, updated_at, version) \
+             VALUES ('j1', 'running-job', 'default', '{}', 'ContainerRunning', ?, 0, 0, 1)",
+        )
+        .bind(&host)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let ssh_config = WorkerSshConfig {
+            private_key: crate::ssh::tests::throwaway_private_key_pem(),
+            port,
+        };
+        test_router(pool, ssh_config).await
+    }
+
+    #[tokio::test]
+    async fn test_live_one_shot_fetch_includes_stderr() {
+        let router = running_job_router_with_logs("podman logs abc123").await;
+
+        let response = router
+            .oneshot(log_request("running-job", false))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body, "out\nerr\n");
+    }
+
+    #[tokio::test]
+    async fn test_live_follow_includes_stderr() {
+        let router = running_job_router_with_logs("podman logs -f abc123").await;
+
+        let response = router
+            .oneshot(log_request("running-job", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body, "out\nerr\n");
     }
 
     #[tokio::test]
