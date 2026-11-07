@@ -6,6 +6,7 @@
 
 use crate::app::server_header_layer;
 use crate::config::ServerConfig;
+use crate::shutdown::Shutdown;
 use anyhow::{bail, Context, Result};
 use axum::Router;
 use rustls_acme::axum::AxumAcceptor;
@@ -42,9 +43,12 @@ const COLD_START_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// any further wiring in `main.rs`; the challenge responder is otherwise
 /// self-contained.
 ///
+/// The challenge responder drains its connections and stops once
+/// `shutdown` is requested (issue #118).
+///
 /// Must only be called when `cfg.hostname` is `Some`; the self-signed
 /// fallback in `tls.rs` is what handles the `None` case.
-pub async fn setup(cfg: &ServerConfig) -> Result<AxumAcceptor> {
+pub async fn setup(cfg: &ServerConfig, shutdown: Shutdown) -> Result<AxumAcceptor> {
     let hostname = cfg
         .hostname
         .as_ref()
@@ -83,7 +87,7 @@ pub async fn setup(cfg: &ServerConfig) -> Result<AxumAcceptor> {
     let challenge_addr: SocketAddr = format!("{}:{}", cfg.host, cfg.acme_challenge_port)
         .parse()
         .context("Invalid server host/acme_challenge_port")?;
-    spawn_challenge_responder(challenge_addr, challenge_router);
+    spawn_challenge_responder(challenge_addr, challenge_router, shutdown);
 
     tokio::time::timeout(COLD_START_TIMEOUT, wait_for_first_certificate(&mut state))
         .await
@@ -101,15 +105,18 @@ pub async fn setup(cfg: &ServerConfig) -> Result<AxumAcceptor> {
     Ok(acceptor)
 }
 
-/// Runs the HTTP-01 challenge responder for as long as the process lives.
+/// Runs the HTTP-01 challenge responder until `shutdown` is requested.
 /// A bind/serve failure here is logged, not fatal on its own -- if it
 /// really does mean the challenge port is unreachable, `setup()`'s own
 /// cold-start timeout above will surface that as a clear, attributable
 /// error instead of a silently hanging process.
-fn spawn_challenge_responder(addr: SocketAddr, router: Router) {
+fn spawn_challenge_responder(addr: SocketAddr, router: Router, shutdown: Shutdown) {
+    let handle = axum_server::Handle::new();
+    crate::shutdown::graceful_on_shutdown(handle.clone(), shutdown);
     tokio::spawn(async move {
         tracing::info!("ACME HTTP-01 challenge responder listening on http://{addr}");
         if let Err(err) = axum_server::bind(addr)
+            .handle(handle)
             .serve(router.into_make_service())
             .await
         {

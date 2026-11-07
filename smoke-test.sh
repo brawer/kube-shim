@@ -205,6 +205,31 @@ else
     check "public status page never leaks the worker SSH key or a bearer token" "fail"
 fi
 
+# Issue #118: SIGTERM must stop the server promptly with exit status 0.
+# In the container kube-shim is PID 1, where a signal without a handler
+# is ignored and podman falls back to SIGKILL after 10 s.
+kill -TERM "$SERVER_PID"
+STOPPED=0
+for _ in $(seq 1 50); do
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        STOPPED=1
+        break
+    fi
+    sleep 0.1
+done
+if [[ "$STOPPED" -eq 1 ]]; then
+    wait "$SERVER_PID"
+    exit_status=$?
+    SERVER_PID=""
+    if [[ "$exit_status" -eq 0 ]] && grep -q "shutdown complete" "$WORK_DIR/server.log"; then
+        check "SIGTERM shuts the server down within 5 s with exit status 0" "ok"
+    else
+        check "SIGTERM shuts the server down within 5 s with exit status 0 (got: $exit_status)" "fail"
+    fi
+else
+    check "SIGTERM shuts the server down within 5 s with exit status 0 (still running)" "fail"
+fi
+
 echo ""
 if [[ "$FAILURES" -eq 0 ]]; then
     echo "=== All checks passed ==="

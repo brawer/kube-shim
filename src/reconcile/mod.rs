@@ -15,6 +15,7 @@ pub mod startup;
 pub use job::JobContext;
 pub(crate) use job::STATE_SEQUENCE;
 
+use crate::shutdown::Shutdown;
 use crate::ssh;
 use anyhow::Result;
 use chrono::Utc;
@@ -178,7 +179,8 @@ impl LoopStats {
     }
 }
 
-/// Runs forever, driving the reconciliation loop: one pass immediately,
+/// Runs until `shutdown` is requested, driving the reconciliation loop:
+/// one pass immediately,
 /// then one every time either the fallback interval elapses or `notify`
 /// fires, whichever comes first. Callers wake it immediately by calling
 /// `notify.notify_one()` after any change the shim already knows about
@@ -194,31 +196,55 @@ impl LoopStats {
 /// through to both `job::advance_all()` (via the job tick) and
 /// `orphan_scan::scan_and_clean()` (via its own loop) -- see their own
 /// docs (Phase 7/8).
+///
+/// On shutdown (issue #118) no loop is cut off in the middle of a pass
+/// that changes cloud resources: the job loop finishes the step it is on
+/// and leaves the remaining jobs for the next start, and the orphan scan
+/// finishes its current pass. The metrics poll and pricing sync only read
+/// from outside, so they are dropped mid-pass. Returns once every loop
+/// has stopped.
 pub async fn run(
     pool: SqlitePool,
     notify: Arc<Notify>,
     ctx: JobContext,
     tick_health: Arc<TickHealth>,
+    shutdown: Shutdown,
 ) {
-    tokio::spawn(run_orphan_scan_loop(
+    let orphan_scan = tokio::spawn(run_orphan_scan_loop(
         pool.clone(),
         ctx.clone(),
         ORPHAN_SCAN_INTERVAL,
         tick_health.clone(),
+        shutdown.clone(),
     ));
-    tokio::spawn(run_metrics_poll_loop(
+    let metrics_poll = tokio::spawn(run_metrics_poll_loop(
         pool.clone(),
         ctx.clone(),
         METRICS_POLL_INTERVAL,
         tick_health.clone(),
+        shutdown.clone(),
     ));
-    tokio::spawn(run_pricing_sync_loop(
+    let pricing_sync = tokio::spawn(run_pricing_sync_loop(
         pool.clone(),
         ctx.clone(),
         PRICING_SYNC_INTERVAL,
         tick_health.clone(),
+        shutdown.clone(),
     ));
-    run_with_interval(pool, notify, FALLBACK_INTERVAL, ctx, tick_health).await
+    run_with_interval(pool, notify, FALLBACK_INTERVAL, ctx, tick_health, shutdown).await;
+
+    // The job loop has stopped; wait for the others to reach their own
+    // safe points too, so `main` knows nothing is mid-operation.
+    for (name, handle) in [
+        ("orphan scan", orphan_scan),
+        ("metrics poll", metrics_poll),
+        ("pricing sync", pricing_sync),
+    ] {
+        if let Err(err) = handle.await {
+            tracing::error!("{name} loop ended abnormally: {err}");
+        }
+    }
+    tracing::info!("reconciliation loops stopped");
 }
 
 /// One pass immediately (matching the job loop's own eager-first-tick
@@ -231,11 +257,16 @@ async fn run_orphan_scan_loop(
     ctx: JobContext,
     interval_duration: Duration,
     tick_health: Arc<TickHealth>,
+    shutdown: Shutdown,
 ) {
     let mut interval = tokio::time::interval(interval_duration);
 
     loop {
-        interval.tick().await;
+        tokio::select! {
+            biased;
+            _ = shutdown.requested() => return,
+            _ = interval.tick() => {}
+        }
 
         let start = Instant::now();
         let result = orphan_scan::scan_and_clean(&pool, &ctx).await;
@@ -261,6 +292,7 @@ async fn run_metrics_poll_loop(
     ctx: JobContext,
     interval_duration: Duration,
     tick_health: Arc<TickHealth>,
+    shutdown: Shutdown,
 ) {
     let ssh_config = ssh::WorkerSshConfig {
         private_key: ctx.worker_ssh_private_key.clone(),
@@ -269,10 +301,21 @@ async fn run_metrics_poll_loop(
     let mut interval = tokio::time::interval(interval_duration);
 
     loop {
-        interval.tick().await;
+        tokio::select! {
+            biased;
+            _ = shutdown.requested() => return,
+            _ = interval.tick() => {}
+        }
 
         let start = Instant::now();
-        let result = metrics_collector::poll_once(&pool, &ssh_config).await;
+        // Only reads from workers and records samples, so unlike the
+        // other loops it may be cut off mid-pass: a lost sample is
+        // harmless, and SSH timeouts could otherwise hold up shutdown.
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.requested() => return,
+            result = metrics_collector::poll_once(&pool, &ssh_config) => result,
+        };
         tick_health
             .metrics_poll
             .record(result.is_ok(), start.elapsed());
@@ -291,14 +334,26 @@ async fn run_pricing_sync_loop(
     ctx: JobContext,
     interval_duration: Duration,
     tick_health: Arc<TickHealth>,
+    shutdown: Shutdown,
 ) {
     let mut interval = tokio::time::interval(interval_duration);
 
     loop {
-        interval.tick().await;
+        tokio::select! {
+            biased;
+            _ = shutdown.requested() => return,
+            _ = interval.tick() => {}
+        }
 
         let start = Instant::now();
-        let result = pricing::sync_pricing_and_rates(&pool, &ctx).await;
+        // Only reads from UpCloud and the ECB, and writes each table in
+        // one transaction, so it may be cut off mid-pass: the next start
+        // syncs again right away.
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.requested() => return,
+            result = pricing::sync_pricing_and_rates(&pool, &ctx) => result,
+        };
         tick_health
             .pricing_sync
             .record(result.is_ok(), start.elapsed());
@@ -314,17 +369,20 @@ async fn run_with_interval(
     interval_duration: Duration,
     ctx: JobContext,
     tick_health: Arc<TickHealth>,
+    shutdown: Shutdown,
 ) {
     let mut interval = tokio::time::interval(interval_duration);
 
     loop {
         tokio::select! {
+            biased;
+            _ = shutdown.requested() => return,
             _ = interval.tick() => {}
             _ = notify.notified() => {}
         }
 
         let start = Instant::now();
-        let result = tick(&pool, &ctx).await;
+        let result = tick_until(&pool, &ctx, &shutdown).await;
         // Recorded regardless of success/failure -- a tick that
         // returned an Err still proves the loop itself is alive and
         // responsive, which is what /readyz (Phase 15) actually needs
@@ -341,8 +399,14 @@ async fn run_with_interval(
 /// scanning is *not* part of this pass -- it runs on its own slower
 /// cadence, see `run_orphan_scan_loop`/`ORPHAN_SCAN_INTERVAL`.
 pub async fn tick(pool: &SqlitePool, ctx: &JobContext) -> Result<()> {
+    tick_until(pool, ctx, &Shutdown::never()).await
+}
+
+/// Like [`tick`], but stops advancing jobs once `shutdown` is requested,
+/// after the job it is working on (see `job::advance_all_until`).
+async fn tick_until(pool: &SqlitePool, ctx: &JobContext, shutdown: &Shutdown) -> Result<()> {
     let scheduled = schedule::schedule_due_jobs(pool, ctx).await?;
-    let advanced = job::advance_all(pool, ctx).await?;
+    let advanced = job::advance_all_until(pool, ctx, shutdown).await?;
     if scheduled > 0 || advanced > 0 {
         tracing::debug!(
             "reconciliation tick: scheduled {scheduled} new job(s), advanced {advanced}"
@@ -398,6 +462,7 @@ mod tests {
                 Duration::from_secs(30),
                 mock_ctx(),
                 Arc::new(TickHealth::new()),
+                Shutdown::never(),
             )
             .await;
         });
@@ -421,6 +486,43 @@ mod tests {
             start.elapsed() < Duration::from_secs(5),
             "job was not advanced within 5s of notify_one()"
         );
+    }
+
+    /// Issue #118: an idle loop returns as soon as shutdown is requested,
+    /// rather than waiting out its interval or running forever.
+    #[tokio::test]
+    async fn test_loops_return_promptly_on_shutdown() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let (trigger, shutdown) = crate::shutdown::channel();
+        let job_loop = tokio::spawn(run_with_interval(
+            pool.clone(),
+            Arc::new(Notify::new()),
+            Duration::from_secs(3600),
+            mock_ctx(),
+            Arc::new(TickHealth::new()),
+            shutdown.clone(),
+        ));
+        let orphan_loop = tokio::spawn(run_orphan_scan_loop(
+            pool,
+            mock_ctx(),
+            Duration::from_secs(3600),
+            Arc::new(TickHealth::new()),
+            shutdown,
+        ));
+        // Let both eager first passes run, so the loops are idle.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let start = Instant::now();
+        trigger.trigger();
+        tokio::time::timeout(Duration::from_secs(1), job_loop)
+            .await
+            .expect("job loop did not stop within 1s of shutdown")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), orphan_loop)
+            .await
+            .expect("orphan scan loop did not stop within 1s of shutdown")
+            .unwrap();
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 
     async fn wait_for_status_change(pool: &SqlitePool, previous: &str, timeout: Duration) {
@@ -507,6 +609,7 @@ mod tests {
             ctx,
             Duration::from_millis(20),
             Arc::new(TickHealth::new()),
+            Shutdown::never(),
         ));
 
         tokio::time::sleep(Duration::from_millis(150)).await;

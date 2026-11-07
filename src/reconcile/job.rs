@@ -97,6 +97,7 @@ use crate::providers::{
     CloudProvider, CreateServerRequest, CreateVolumeRequest, FirewallAction, FirewallDirection,
     FirewallFamily, FirewallRule, ProviderError,
 };
+use crate::shutdown::Shutdown;
 use crate::{cloud_init, container_env, pricing, ssh, volumes, workload};
 use anyhow::Result;
 use chrono::Utc;
@@ -393,6 +394,20 @@ pub(crate) async fn record_event(
 /// status to move to (`None` meaning "stay put"), not just whether to
 /// advance. Returns how many jobs were advanced (for logging/testing).
 pub async fn advance_all(pool: &SqlitePool, ctx: &JobContext) -> Result<usize> {
+    advance_all_until(pool, ctx, &Shutdown::never()).await
+}
+
+/// Like [`advance_all`], but stops early once `shutdown` is requested
+/// (issue #118). The check sits between jobs, never inside a job's step:
+/// a step that has already called the cloud provider always gets to
+/// record the result before the loop exits, so a restart can't leave a
+/// created VM or volume that no row knows about. Jobs not reached yet
+/// are simply advanced after the next start.
+pub async fn advance_all_until(
+    pool: &SqlitePool,
+    ctx: &JobContext,
+    shutdown: &Shutdown,
+) -> Result<usize> {
     let rows = sqlx::query(
         "SELECT id, name, namespace, status, spec, last_transition_time, created_at FROM jobs WHERE status != ?",
     )
@@ -403,6 +418,10 @@ pub async fn advance_all(pool: &SqlitePool, ctx: &JobContext) -> Result<usize> {
     let now = Utc::now().timestamp();
     let mut advanced = 0;
     for row in rows {
+        if shutdown.is_requested() {
+            tracing::info!("shutdown requested; leaving the remaining jobs for the next start");
+            break;
+        }
         let id: String = row.get(0);
         let name: String = row.get(1);
         let namespace: String = row.get(2);
@@ -1966,6 +1985,83 @@ mod tests {
         .unwrap();
         assert_eq!(provider_volume_id, "vol-real-1");
         assert_eq!(storage_class_name, "kube-shim-fast");
+    }
+
+    /// Issue #118: a shutdown requested while a job's step is waiting on
+    /// the cloud provider lets that step finish and record its volume,
+    /// then stops before touching the next job.
+    #[tokio::test]
+    async fn test_shutdown_mid_tick_finishes_current_job_then_stops() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (trigger, shutdown) = crate::shutdown::channel();
+        let trigger = Arc::new(trigger);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_trigger = trigger.clone();
+        let handler_calls = calls.clone();
+        let app = axum::Router::new().route(
+            "/1.3/storage",
+            axum::routing::post(move || {
+                let trigger = handler_trigger.clone();
+                let calls = handler_calls.clone();
+                async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    // SIGTERM arrives while UpCloud is still answering.
+                    trigger.trigger();
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    axum::Json(serde_json::json!({
+                        "storage": {"uuid": format!("vol-{n}"), "size": 1, "tier": "maxiops", "title": "t", "zone": "de-fra1"}
+                    }))
+                }
+            }),
+        );
+        let provider = crate::providers::upcloud::tests::mock_server(app).await;
+        let mut ctx = mock_ctx(false);
+        ctx.provider = Arc::new(provider);
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let now = Utc::now().timestamp();
+        for id in ["j1", "j2"] {
+            sqlx::query(
+                "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
+                 VALUES (?, ?, 'default', ?, 'VolumePending', ?, ?, 1)",
+            )
+            .bind(id)
+            .bind(format!("job-{id}"))
+            .bind(ephemeral_volume_spec())
+            .bind(now)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let advanced = advance_all_until(&pool, &ctx, &shutdown).await.unwrap();
+        assert_eq!(advanced, 1, "only the job already in flight should advance");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no new cloud call after shutdown"
+        );
+
+        let statuses: Vec<String> = sqlx::query_scalar("SELECT status FROM jobs ORDER BY status")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(statuses, vec!["VolumeCreating", "VolumePending"]);
+
+        // The volume UpCloud created is recorded against the job that
+        // asked for it, so nothing is left for the orphan scan to find.
+        let recorded: Vec<(String, String)> = sqlx::query_as(
+            "SELECT jv.provider_volume_id, j.status FROM job_volumes jv JOIN jobs j ON j.id = jv.job_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            recorded,
+            vec![("vol-1".to_string(), "VolumeCreating".to_string())]
+        );
     }
 
     #[tokio::test]
