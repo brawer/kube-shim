@@ -1,8 +1,9 @@
 # Provisions a single kube-shim instance on UpCloud: the host itself
-# (fully bootstrapped via cloud-init -- podman, the unprivileged-port
-# sysctl, the dedicated service user, the quadlet unit, config.toml,
-# and the running service, with no manual follow-up needed beyond
-# pointing DNS at the result), plus the credentials it needs, minted
+# (bootstrapped via cloud-init -- podman, the unprivileged-port sysctl,
+# the dedicated service user and the quadlet unit -- then given its
+# config.toml and started over SSH by terraform_data.push_config, in the
+# same apply, with no manual follow-up needed beyond pointing DNS at the
+# result), plus the credentials it needs, minted
 # and tracked as real OpenTofu-managed state instead of hand-edited
 # file contents over SSH:
 #   - named bearer token(s) for the authenticated API (server.api_tokens)
@@ -131,8 +132,13 @@ resource "upcloud_server" "kube_shim" {
   # to config.toml or the quadlet unit reach an existing host through
   # terraform_data.push_config below instead, over SSH, without
   # replacing it. See README.md's "Updating in place".
+  #
+  # config.toml is deliberately not part of user_data: anyone with API
+  # access to the UpCloud account can read a server's user_data, for the
+  # server's whole lifetime, and config.toml holds the API bearer tokens,
+  # the runtime token and the worker SSH private key. push_config
+  # installs it over SSH instead, including on a brand-new host.
   user_data = templatefile("${path.module}/templates/cloud-init.sh.tftpl", {
-    config_toml_content = local.config_toml
     # base64, not embedded raw: avoids any escaping concerns across the
     # outer heredoc in cloud-init.sh.tftpl.
     quadlet_unit_content_base64 = base64encode(local.quadlet_unit)
@@ -250,10 +256,12 @@ resource "upcloud_firewall_rules" "kube_shim" {
 }
 
 # Pushes config.toml and the quadlet unit to the host over SSH and
-# restarts kube-shim.service, whenever either one changes (and once for
-# a brand-new host, which is a no-op apart from the restart). This is
-# what lets config and image-tag changes land in place even though
-# user_data can't change without replacing the server. See
+# restarts kube-shim.service, whenever either one changes, and once for
+# a brand-new host. On a new host this push is what installs config.toml
+# and first starts kube-shim.service, since cloud-init leaves both out to
+# keep secrets out of user_data. It also lets config and image-tag
+# changes land in place even though user_data can't change without
+# replacing the server. See
 # templates/push-config.sh.tftpl for what runs on the host.
 resource "terraform_data" "push_config" {
   # Hashes, not the contents: config.toml holds secrets, and state only

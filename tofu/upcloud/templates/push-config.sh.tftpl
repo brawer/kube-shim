@@ -1,7 +1,10 @@
 #!/bin/bash
 # Installs the config.toml and quadlet unit that terraform_data.push_config
-# staged in /tmp/kube-shim-push, then restarts kube-shim.service. Runs as
+# staged in /tmp/kube-shim-push, then (re)starts kube-shim.service. Runs as
 # the image's admin user (sudo), on both brand-new and long-running hosts.
+# On a brand-new host this is what installs config.toml in the first place
+# and starts the service: cloud-init doesn't, so that the secrets in
+# config.toml never land in the server's user_data.
 set -euo pipefail
 
 STAGE=/tmp/kube-shim-push
@@ -35,11 +38,18 @@ as_service_user podman pull --quiet "$IMAGE" >/dev/null
 
 # config.toml is owned by the container's UID 1000 as mapped into the
 # service user's subuid range (see cloud-init.sh.tftpl), so take owner
-# and mode from the file being replaced. mv keeps the swap atomic.
+# and mode from the file being replaced. A brand-new host has none yet
+# (cloud-init leaves it out, so its secrets stay out of user_data), so
+# take the owner from the data directory, which cloud-init chowns the
+# same way, and keep mode 600. mv keeps the swap atomic.
 echo "Installing config.toml..."
 sudo install -m 600 "$STAGE/config.toml" "$DATA_DIR/config.toml.new"
-sudo chown --reference="$DATA_DIR/config.toml" "$DATA_DIR/config.toml.new"
-sudo chmod --reference="$DATA_DIR/config.toml" "$DATA_DIR/config.toml.new"
+if sudo test -e "$DATA_DIR/config.toml"; then
+    sudo chown --reference="$DATA_DIR/config.toml" "$DATA_DIR/config.toml.new"
+    sudo chmod --reference="$DATA_DIR/config.toml" "$DATA_DIR/config.toml.new"
+else
+    sudo chown --reference="$DATA_DIR" "$DATA_DIR/config.toml.new"
+fi
 sudo mv "$DATA_DIR/config.toml.new" "$DATA_DIR/config.toml"
 
 echo "Installing quadlet unit..."
