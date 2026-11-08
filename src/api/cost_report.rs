@@ -396,7 +396,12 @@ pub async fn get_cost_report(
         .timestamp();
 
     let rows = sqlx::query(
-        "SELECT name, namespace, spec, created_at, completed_at, worker_plan FROM jobs \
+        "SELECT name, namespace, spec, created_at, completed_at, worker_plan FROM ( \
+           SELECT name, namespace, spec, created_at, completed_at, worker_plan, actual_cost \
+           FROM jobs \
+           UNION ALL \
+           SELECT name, namespace, spec, created_at, completed_at, worker_plan, actual_cost \
+           FROM pruned_jobs) \
          WHERE actual_cost IS NOT NULL AND created_at >= ? AND created_at < ? \
          ORDER BY created_at",
     )
@@ -688,5 +693,35 @@ mod tests {
         let response = get_report(pool, "?from=2026-09-01&to=2026-09-30").await;
         let body = body_text(response).await;
         assert_eq!(body.lines().count(), 1); // header only
+    }
+
+    #[tokio::test]
+    async fn test_removed_job_stays_in_the_report() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
+        insert_price(&pool, "server_plan_DEV-1xCPU-1GB-10GB", 1.0, 0.4464).await;
+        let created = chrono::NaiveDate::from_ymd_opt(2026, 9, 15)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        let spec = r#"{"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "1", "memory": "1Gi"}}}]}}}"#;
+        insert_completed_job(&pool, "job-one", spec, created, created + 3600, 0.004464).await;
+        let id: String = sqlx::query_scalar("SELECT id FROM jobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        crate::reconcile::history::prune_job(&pool, &id, created + 7200)
+            .await
+            .unwrap();
+
+        let response = get_report(pool, "?from=2026-09-01&to=2026-09-30").await;
+        let body = body_text(response).await;
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2); // header + 1 charge row
+        let fields: Vec<&str> = lines[1].split(',').collect();
+        let col = |name: &str| fields[COLUMNS.iter().position(|c| *c == name).unwrap()];
+        assert_eq!(col("BilledCost"), "0.004464");
     }
 }

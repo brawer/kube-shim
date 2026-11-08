@@ -18,6 +18,7 @@
 use super::cost_report::CostReportConfig;
 use super::pods::phase_for;
 use super::secret::ObjectMeta;
+use crate::reconcile::history;
 use crate::reconcile::job as reconcile_job;
 use crate::reconcile::job::RUN_FAILED_SQL;
 use crate::{admission, k8s_status, pricing};
@@ -356,7 +357,9 @@ pub async fn get_job(
 /// abandoned. An already-finished Job (Succeeded/Failed/cleanup
 /// tail/Archived) has nothing real left to protect by keeping the row
 /// around, so it's deleted outright immediately, same as
-/// `api::cronjob::delete_cronjob`'s own immediate-removal behavior.
+/// `api::cronjob::delete_cronjob`'s own immediate-removal behavior --
+/// through `reconcile::history::prune_job`, so its cost stays in the
+/// cost report.
 pub async fn delete_job(
     State(pool): State<SqlitePool>,
     Path((namespace, name)): Path<(String, String)>,
@@ -386,9 +389,7 @@ pub async fn delete_job(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     } else {
-        sqlx::query("DELETE FROM jobs WHERE id = ?")
-            .bind(&id)
-            .execute(&pool)
+        history::prune_job(&pool, &id, Utc::now().timestamp())
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }

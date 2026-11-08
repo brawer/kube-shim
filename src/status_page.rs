@@ -131,10 +131,12 @@ async fn recent_events(pool: &SqlitePool) -> anyhow::Result<Vec<RecentEvent>> {
 }
 
 async fn accumulated_cost(pool: &SqlitePool) -> anyhow::Result<f64> {
-    let total: Option<f64> =
-        sqlx::query_scalar("SELECT SUM(actual_cost) FROM jobs WHERE actual_cost IS NOT NULL")
-            .fetch_one(pool)
-            .await?;
+    let total: Option<f64> = sqlx::query_scalar(
+        "SELECT SUM(actual_cost) FROM ( \
+               SELECT actual_cost FROM jobs UNION ALL SELECT actual_cost FROM pruned_jobs)",
+    )
+    .fetch_one(pool)
+    .await?;
     Ok(total.unwrap_or(0.0))
 }
 
