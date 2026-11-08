@@ -29,12 +29,6 @@ variable "zone" {
   default     = "de-fra1"
 }
 
-variable "plan" {
-  description = "UpCloud server plan for the kube-shim host itself (not the worker VMs it provisions on demand, which are sized per-job). The shim process itself is lightweight -- an HTTP server plus a SQLite database -- so the smallest real plan is enough; override only if you expect to track a very large number of concurrent jobs."
-  type        = string
-  default     = "1xCPU-1GB"
-}
-
 variable "operator_ssh_public_keys" {
   description = "SSH public keys allowed to log in to the host itself as the image's default admin user, for your own operational access (debugging, manual intervention). Separate from worker_ssh key material below, which this module generates itself for the shim's own use against the worker VMs it creates."
   type        = list(string)

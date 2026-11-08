@@ -133,8 +133,9 @@ provisioners by default.
 
 What still needs a new server: anything cloud-init itself sets up
 (packages, sysctls, the service user), the zone, the plan, and the
-disk. Changes to those in `cloud-init.sh.tftpl` only reach hosts
-created after them. To rebuild on purpose:
+disk (see "Plan and boot disk").
+Changes to those in `cloud-init.sh.tftpl` only reach hosts created
+after them. To rebuild on purpose:
 
 ```sh
 tofu apply -replace=module.kube_shim.upcloud_server.kube_shim
@@ -145,6 +146,61 @@ That gives the host new public IP addresses (point DNS at the new
 (SQLite database, ACME cache), so do it while no worker VMs are
 running, or they may be orphaned (see the Phase 16 manual orphan
 cleanup).
+
+## Plan and boot disk
+
+The host runs on UpCloud's `STARTER-1xCPU-1GB` plan (1 vCPU, 1 GB)
+with exactly the 10 GB `standard` disk the plan includes, so UpCloud
+bills the disk as part of the plan (`part_of_plan: "yes"` in
+`GET /1.3/server/{uuid}`). In `de-fra1` that's 0.4464 cents/h, about
+EUR 3.26/month at 730 h (November 2026; check the price for your zone).
+Neither the plan nor the disk is configurable: kube-shim needs little
+(on the old plan, kube-shim.brawer.ch used 3.6 GB of disk and about
+420 MB of memory), and a bigger disk or another tier would be billed
+on top of the plan.
+
+Up to v0.4.3 the module used the legacy `1xCPU-1GB` plan with a 25 GB
+`maxiops` disk, at about EUR 8.26/month. UpCloud no longer sells that
+plan (`current_offering: "no"` in `GET /1.3/plan`). If you ever change
+the plan here, check that the new one has `current_offering: "yes"`.
+
+### Moving a host created with v0.4.3 or earlier
+
+Upgrading the module replaces such a host: a template disk can't
+shrink, and its tier can't change in place. That means new IP
+addresses, and the old disk is deleted with the old server. OpenTofu
+destroys the old server before it creates the new one, so copy the
+data off first:
+
+1. Let running Jobs finish, so no worker VMs are left behind (they
+   would be orphaned, see the Phase 16 manual orphan cleanup). Suspend
+   your CronJobs, or move at a time none are due.
+2. Stop kube-shim and copy its data directory (the SQLite database and
+   the ACME cache) to your machine:
+
+   ```sh
+   ssh admin@OLD_IP sudo systemctl --user --machine=kube-shim@ stop kube-shim.service
+   ssh admin@OLD_IP sudo tar -C /home/kube-shim -czpf - kube-shim-data > kube-shim-data.tgz
+   ```
+
+3. Bump the module's `source` and `tofu apply`. Check that the plan
+   replaces only `upcloud_server.kube_shim` and the resources that
+   depend on it.
+4. Point DNS at the new `public_ipv4`/`public_ipv6` outputs (see
+   "First apply: DNS").
+5. Put the data back and restart:
+
+   ```sh
+   ssh admin@NEW_IP sudo systemctl --user --machine=kube-shim@ stop kube-shim.service
+   ssh admin@NEW_IP sudo tar -C /home/kube-shim --numeric-owner -xzpf - < kube-shim-data.tgz
+   ssh admin@NEW_IP sudo systemctl --user --machine=kube-shim@ start kube-shim.service
+   ```
+
+   Then check `https://YOUR_HOSTNAME/livez`, and resume your CronJobs.
+
+Skip steps 2 and 5 if you don't need the old data. kube-shim then
+starts with an empty database: re-apply your CronJobs and Secrets, and
+it fetches a new certificate once DNS points at the new host.
 
 ## Pinning the image
 
@@ -238,6 +294,11 @@ it, but the old values were readable until then, so rotating is still
 the safer fix.
 
 ## Verified vs. not
+
+The `STARTER-1xCPU-1GB` host ("Plan and boot disk") hasn't been
+applied against a live account yet: on the first real apply, check
+that its disk shows `part_of_plan: "yes"`. The data copy in "Moving a
+host created with v0.4.3 or earlier" hasn't been run either.
 
 Every step in `templates/cloud-init.sh.tftpl` up through writing
 the quadlet unit is lifted directly from

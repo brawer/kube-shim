@@ -93,13 +93,20 @@ resource "upcloud_server" "kube_shim" {
   hostname = "${var.resource_prefix}.local"
   title    = "${var.resource_prefix}-host"
   zone     = var.zone
-  plan     = var.plan
+  # STARTER-1xCPU-1GB (1 vCPU, 1 GB, ~EUR 3.26/month) is always enough
+  # for the shim: an HTTP server plus a SQLite database. See README.md's
+  # "Plan and boot disk".
+  plan     = "STARTER-1xCPU-1GB"
   metadata = true
   firewall = true
 
+  # Exactly the 10 GB standard-tier disk the plan includes, so UpCloud
+  # bills it as part of the plan (part_of_plan: "yes"). A bigger disk,
+  # or another tier, would be billed on top.
   template {
     storage = "Ubuntu Server 24.04 LTS (Noble Numbat)"
-    size    = 25
+    size    = 10
+    tier    = "standard"
   }
 
   # Dual-stack: two separate "public" interfaces, not one interface
