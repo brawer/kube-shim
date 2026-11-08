@@ -16,6 +16,10 @@
 //! need is first copied to `pruned_jobs`, so billing records stay
 //! complete and a CronJob whose every run was removed doesn't think it
 //! has never run.
+//!
+//! After removing anything, the pass gives the freed pages back to the
+//! file system (`db::release_free_pages`), so the database file shrinks
+//! instead of staying at its largest size.
 
 use crate::reconcile::job::{is_pre_completion_state, RUN_FAILED_SQL, TERMINAL_STATE};
 use anyhow::Result;
@@ -40,6 +44,7 @@ pub async fn prune_finished_jobs(pool: &SqlitePool, now: i64) -> Result<usize> {
     }
     if !ids.is_empty() {
         tracing::info!("removed {} finished job(s) from history", ids.len());
+        crate::db::release_free_pages(pool).await?;
     }
     Ok(ids.len())
 }
