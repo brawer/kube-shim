@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.0](https://github.com/brawer/kube-shim/compare/v0.4.3...v0.5.0) (2026-11-08)
+
+
+### ⚠ BREAKING CHANGES
+
+* **tofu:** a host created with the old default is replaced on the next apply unless the calling config sets plan = "1xCPU-1GB". See the module README's "Plan and boot disk" for keeping or moving a host.
+
+### 🆕 Enhancements
+
+* remove finished jobs per ttlSecondsAfterFinished and CronJob history limits ([#146](https://github.com/brawer/kube-shim/issues/146)) ([bfb9b67](https://github.com/brawer/kube-shim/commit/bfb9b67d4682a4c06d8d348a427f9e50cb91ab6b))
+* shrink the database file after removing old jobs ([#147](https://github.com/brawer/kube-shim/issues/147)) ([a10a5eb](https://github.com/brawer/kube-shim/commit/a10a5eb96cba83c523ef1cca90b37cea0d5a70bd))
+* **tofu:** run the host on STARTER-1xCPU-1GB with its included 10 GB disk ([#144](https://github.com/brawer/kube-shim/issues/144)) ([97560ff](https://github.com/brawer/kube-shim/commit/97560ff8d65cd6d6f741685bc97a035dbff5fdcf))
+
 ## [0.4.3](https://github.com/brawer/kube-shim/compare/v0.4.2...v0.4.3) (2026-11-07)
 
 
