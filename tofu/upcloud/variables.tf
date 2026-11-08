@@ -29,25 +29,6 @@ variable "zone" {
   default     = "de-fra1"
 }
 
-variable "plan" {
-  description = <<-EOT
-    UpCloud server plan for the kube-shim host itself (not the worker
-    VMs it provisions on demand, which are sized per job). The shim is
-    an HTTP server plus a SQLite database, so STARTER-1xCPU-1GB (the
-    default, about EUR 3.26/month, with a 10 GB disk) is always enough.
-    The only other choice is "1xCPU-1GB", a legacy plan UpCloud no
-    longer sells, at about EUR 8.26/month: keep it only for a host
-    created with it (see README.md's "Plan and boot disk").
-  EOT
-  type        = string
-  default     = "STARTER-1xCPU-1GB"
-
-  validation {
-    condition     = contains(["STARTER-1xCPU-1GB", "1xCPU-1GB"], var.plan)
-    error_message = "plan must be \"STARTER-1xCPU-1GB\", or \"1xCPU-1GB\" for a host created with it."
-  }
-}
-
 variable "operator_ssh_public_keys" {
   description = "SSH public keys allowed to log in to the host itself as the image's default admin user, for your own operational access (debugging, manual intervention). Separate from worker_ssh key material below, which this module generates itself for the shim's own use against the worker VMs it creates."
   type        = list(string)

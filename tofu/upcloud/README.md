@@ -133,7 +133,7 @@ provisioners by default.
 
 What still needs a new server: anything cloud-init itself sets up
 (packages, sysctls, the service user), the zone, the plan, and the
-disk (see "Plan and boot disk" for moving a host to the cheaper plan).
+disk (see "Plan and boot disk").
 Changes to those in `cloud-init.sh.tftpl` only reach hosts created
 after them. To rebuild on purpose:
 
@@ -149,49 +149,28 @@ cleanup).
 
 ## Plan and boot disk
 
-The host's boot disk is exactly the storage its plan includes, so
-UpCloud bills it as part of the plan (`part_of_plan: "yes"` in
-`GET /1.3/server/{uuid}`).
+The host runs on UpCloud's `STARTER-1xCPU-1GB` plan (1 vCPU, 1 GB)
+with exactly the 10 GB `standard` disk the plan includes, so UpCloud
+bills the disk as part of the plan (`part_of_plan: "yes"` in
+`GET /1.3/server/{uuid}`). In `de-fra1` that's 0.4464 cents/h, about
+EUR 3.26/month at 730 h (November 2026; check the price for your zone).
+Neither the plan nor the disk is configurable: kube-shim needs little
+(on the old plan, kube-shim.brawer.ch used 3.6 GB of disk and about
+420 MB of memory), and a bigger disk or another tier would be billed
+on top of the plan.
 
-| `plan`              | Boot disk        | Host cost (`de-fra1`, 730 h)               |
-| ------------------- | ---------------- | ------------------------------------------ |
-| `STARTER-1xCPU-1GB` | 10 GB `standard` | 0.4464 cents/h, ~EUR 3.26/month (default)  |
-| `1xCPU-1GB`         | 25 GB `maxiops`  | 1.1309 cents/h, ~EUR 8.26/month            |
+Up to v0.4.3 the module used the legacy `1xCPU-1GB` plan with a 25 GB
+`maxiops` disk, at about EUR 8.26/month. UpCloud no longer sells that
+plan (`current_offering: "no"` in `GET /1.3/plan`). If you ever change
+the plan here, check that the new one has `current_offering: "yes"`.
 
-Prices are as of November 2026 (issue #143); check them for your
-zone. These are the only two plans the module accepts.
-`STARTER-1xCPU-1GB` is always enough for kube-shim. `1xCPU-1GB` is a
-legacy plan: UpCloud no longer sells it (`current_offering: "no"` in
-`GET /1.3/plan`), and it was this module's default up to v0.4.3. Keep
-it only for a host that already runs on it.
+### Moving a host created with v0.4.3 or earlier
 
-kube-shim itself needs little: on `1xCPU-1GB`, kube-shim.brawer.ch uses
-3.6 GB of its disk (the OS, about 140 MB of container images, and under
-1 MB of kube-shim data) and about 420 MB of memory.
-
-### Keeping an existing host on `1xCPU-1GB`
-
-A host created with v0.4.3 or earlier runs on `1xCPU-1GB` with a 25 GB
-`maxiops` disk. To upgrade the module without touching it, set
-
-```hcl
-module "kube_shim" {
-  # ...
-  plan = "1xCPU-1GB"
-}
-```
-
-before you bump `source`. `tofu plan` should then show no change to
-`upcloud_server.kube_shim`. If it says the server "must be replaced",
-stop and don't apply.
-
-### Moving an existing host to `STARTER-1xCPU-1GB`
-
-Moving from `1xCPU-1GB` to `STARTER-1xCPU-1GB` replaces the server: a
-template disk can't shrink, and its tier can't change in place. That
-means new IP addresses, and the old disk is deleted with the old
-server. OpenTofu destroys the old server before it creates the new one,
-so copy the data off first:
+Upgrading the module replaces such a host: a template disk can't
+shrink, and its tier can't change in place. That means new IP
+addresses, and the old disk is deleted with the old server. OpenTofu
+destroys the old server before it creates the new one, so copy the
+data off first:
 
 1. Let running Jobs finish, so no worker VMs are left behind (they
    would be orphaned, see the Phase 16 manual orphan cleanup). Suspend
@@ -204,7 +183,7 @@ so copy the data off first:
    ssh admin@OLD_IP sudo tar -C /home/kube-shim -czpf - kube-shim-data > kube-shim-data.tgz
    ```
 
-3. Remove `plan = "1xCPU-1GB"` and `tofu apply`. Check that the plan
+3. Bump the module's `source` and `tofu apply`. Check that the plan
    replaces only `upcloud_server.kube_shim` and the resources that
    depend on it.
 4. Point DNS at the new `public_ipv4`/`public_ipv6` outputs (see
@@ -316,12 +295,10 @@ the safer fix.
 
 ## Verified vs. not
 
-The plan-matched boot disk ("Plan and boot disk") hasn't been applied
-against a live account yet: on the first real apply, check that the
-disk shows `part_of_plan: "yes"`, and that an existing `1xCPU-1GB`
-host with `plan = "1xCPU-1GB"` plans no change to the server. The
-data copy in "Moving an existing host to another plan" hasn't been
-run either.
+The `STARTER-1xCPU-1GB` host ("Plan and boot disk") hasn't been
+applied against a live account yet: on the first real apply, check
+that its disk shows `part_of_plan: "yes"`. The data copy in "Moving a
+host created with v0.4.3 or earlier" hasn't been run either.
 
 Every step in `templates/cloud-init.sh.tftpl` up through writing
 the quadlet unit is lifted directly from
