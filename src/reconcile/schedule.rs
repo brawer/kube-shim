@@ -318,6 +318,11 @@ async fn has_active_run(pool: &SqlitePool, cronjob_name: &str, namespace: &str) 
 /// created_at)` -- one fewer thing to keep in sync for zero benefit
 /// today.
 ///
+/// Runs removed by `reconcile::history` still count, through
+/// `pruned_jobs`: otherwise a CronJob with `successfulJobsHistoryLimit:
+/// 0`, or whose runs set `ttlSecondsAfterFinished`, would look as if it
+/// had never run and be scheduled again right away.
+///
 /// It also turns out to give `create_job_run`'s budget-skip (Phase
 /// 14b) a free, correct retry for nothing: a due instant whose run
 /// gets skipped (insufficient budget) never creates a row, so this
@@ -332,12 +337,18 @@ async fn last_scheduled_time(
     namespace: &str,
     cronjob_created_at: i64,
 ) -> Result<DateTime<Utc>> {
-    let row: (Option<i64>,) =
-        sqlx::query_as("SELECT MAX(created_at) FROM jobs WHERE cronjob_name = ? AND namespace = ?")
-            .bind(cronjob_name)
-            .bind(namespace)
-            .fetch_one(pool)
-            .await?;
+    let row: (Option<i64>,) = sqlx::query_as(
+        "SELECT MAX(created_at) FROM ( \
+               SELECT created_at FROM jobs WHERE cronjob_name = ? AND namespace = ? \
+               UNION ALL \
+               SELECT created_at FROM pruned_jobs WHERE cronjob_name = ? AND namespace = ?)",
+    )
+    .bind(cronjob_name)
+    .bind(namespace)
+    .bind(cronjob_name)
+    .bind(namespace)
+    .fetch_one(pool)
+    .await?;
 
     let timestamp = row.0.unwrap_or(cronjob_created_at);
     Ok(DateTime::from_timestamp(timestamp, 0).unwrap_or_else(Utc::now))
@@ -635,6 +646,27 @@ mod tests {
         // the job just created.
         let second = schedule_due_jobs(&pool, &mock_ctx()).await.unwrap();
         assert_eq!(second, 0);
+    }
+
+    #[tokio::test]
+    async fn test_removed_run_still_counts_as_scheduled() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let created_at = Utc::now().timestamp() - 120;
+        insert_cronjob(&pool, "every-minute", "* * * * *", created_at).await;
+        assert_eq!(schedule_due_jobs(&pool, &mock_ctx()).await.unwrap(), 1);
+
+        // successfulJobsHistoryLimit: 0 or ttlSecondsAfterFinished: 0
+        // removes the run as soon as it is archived; the CronJob must not
+        // then look as if it had never run.
+        let id: String = sqlx::query_scalar("SELECT id FROM jobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        crate::reconcile::history::prune_job(&pool, &id, Utc::now().timestamp())
+            .await
+            .unwrap();
+
+        assert_eq!(schedule_due_jobs(&pool, &mock_ctx()).await.unwrap(), 0);
     }
 
     #[tokio::test]

@@ -164,6 +164,25 @@ CREATE TABLE IF NOT EXISTS budget_state (
     budget_rollover_cap_days INTEGER NOT NULL
 );
 
+-- Jobs removed from `jobs` by `ttlSecondsAfterFinished`, a CronJob's
+-- history limits or `kubectl delete job` (reconcile::history). Keeps
+-- only what billing and scheduling still need after the row, its logs
+-- and its events are gone: the cost report and the status page's total
+-- cost read from here too, and a CronJob's last schedule time still
+-- counts runs that were removed. Never deleted.
+CREATE TABLE IF NOT EXISTS pruned_jobs (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    namespace TEXT NOT NULL,
+    cronjob_name TEXT,
+    spec BLOB NOT NULL,  -- JSON blob
+    created_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    worker_plan TEXT,
+    actual_cost REAL,
+    pruned_at INTEGER NOT NULL
+);
+
 -- Indices for common queries
 CREATE INDEX IF NOT EXISTS idx_secrets_namespace ON secrets(namespace);
 CREATE INDEX IF NOT EXISTS idx_cronjobs_namespace ON cronjobs(namespace);
@@ -173,3 +192,5 @@ CREATE INDEX IF NOT EXISTS idx_jobs_cronjob ON jobs(cronjob_name);
 CREATE INDEX IF NOT EXISTS idx_events_job ON events(job_id);
 CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_job_volumes_job ON job_volumes(job_id);
+CREATE INDEX IF NOT EXISTS idx_pruned_jobs_cronjob ON pruned_jobs(cronjob_name);
+CREATE INDEX IF NOT EXISTS idx_pruned_jobs_created_at ON pruned_jobs(created_at);

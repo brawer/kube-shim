@@ -5,6 +5,7 @@
 //! startup recovery, per-job version bookkeeping) is the real thing later
 //! phases build directly on top of, not a throwaway prototype.
 
+pub mod history;
 pub mod job;
 pub mod metrics_collector;
 pub mod orphan_scan;
@@ -395,7 +396,9 @@ async fn run_with_interval(
 }
 
 /// One reconciliation pass: check every `CronJob`'s schedule for a due
-/// run, then advance every non-terminal job by one state. Orphan
+/// run, advance every non-terminal job by one state, then remove
+/// archived jobs that `ttlSecondsAfterFinished` or their CronJob's
+/// history limits no longer keep (`history`). Orphan
 /// scanning is *not* part of this pass -- it runs on its own slower
 /// cadence, see `run_orphan_scan_loop`/`ORPHAN_SCAN_INTERVAL`.
 pub async fn tick(pool: &SqlitePool, ctx: &JobContext) -> Result<()> {
@@ -407,9 +410,11 @@ pub async fn tick(pool: &SqlitePool, ctx: &JobContext) -> Result<()> {
 async fn tick_until(pool: &SqlitePool, ctx: &JobContext, shutdown: &Shutdown) -> Result<()> {
     let scheduled = schedule::schedule_due_jobs(pool, ctx).await?;
     let advanced = job::advance_all_until(pool, ctx, shutdown).await?;
-    if scheduled > 0 || advanced > 0 {
+    let pruned = history::prune_finished_jobs(pool, Utc::now().timestamp()).await?;
+    if scheduled > 0 || advanced > 0 || pruned > 0 {
         tracing::debug!(
-            "reconciliation tick: scheduled {scheduled} new job(s), advanced {advanced}"
+            "reconciliation tick: scheduled {scheduled} new job(s), advanced {advanced}, \
+             removed {pruned} from history"
         );
     }
 
