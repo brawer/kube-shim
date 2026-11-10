@@ -20,8 +20,15 @@
 //! choice (job name/namespace/status/elapsed time/VM size, recent
 //! event reasons/messages, cost figures), not "whatever happened to be
 //! convenient to query."
+//!
+//! From a CronJob's spec only `schedule`, `suspend` and the container
+//! image are read, and of the image only its version (tag or digest) is
+//! shown, never the registry or repository path -- see `image_version`.
 
+use crate::metrics_export::is_finished_state;
 use crate::pricing;
+use crate::reconcile::job::{is_pre_completion_state, RUN_FAILED_SQL};
+use crate::reconcile::schedule::parse_schedule;
 use crate::reconcile::TickHealth;
 use axum::{
     extract::State,
@@ -29,9 +36,10 @@ use axum::{
     response::{Html, IntoResponse, Response},
     Extension, Json,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::json;
 use sqlx::{Row, SqlitePool};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Minimal HTML escaping -- job names/namespaces/event messages are
@@ -59,6 +67,56 @@ fn format_elapsed(seconds: i64) -> String {
     }
 }
 
+/// SQL for the image of the container at `path` in the `spec` JSON
+/// column, or NULL when the spec isn't valid JSON or the image isn't a
+/// string. Only the image is extracted, never the rest of the spec.
+fn image_sql(path: &str) -> String {
+    format!(
+        "CASE WHEN json_valid(spec) AND json_type(spec, '{path}') = 'text' \
+         THEN json_extract(spec, '{path}') END"
+    )
+}
+
+/// A Job spec's container image; the shim runs `containers[0]` only
+/// (`cloud_init`).
+const JOB_IMAGE_PATH: &str = "$.template.spec.containers[0].image";
+/// The image a CronJob's next run will get.
+const CRONJOB_IMAGE_PATH: &str = "$.jobTemplate.spec.template.spec.containers[0].image";
+
+/// The version part of an image reference: its tag, its digest
+/// (shortened to 12 hex digits), or both. An image without either runs
+/// as `latest`, so that's what is shown. The registry and repository
+/// are left out on purpose: they can name private infrastructure, and
+/// this page has no authentication.
+fn image_version(image: &str) -> String {
+    let (name, digest) = match image.split_once('@') {
+        Some((name, digest)) => (name, Some(digest)),
+        None => (image, None),
+    };
+    // A `:` before the last `/` is a registry port, not a tag.
+    let last_part = name.rsplit('/').next().unwrap_or(name);
+    let tag = last_part.split_once(':').map(|(_, tag)| tag);
+    let digest = digest.map(|digest| match digest.split_once(':') {
+        Some((algorithm, hex)) => {
+            format!("{algorithm}:{}", hex.chars().take(12).collect::<String>())
+        }
+        None => digest.to_string(),
+    });
+    match (tag, digest) {
+        (Some(tag), Some(digest)) => format!("{tag}@{digest}"),
+        (Some(tag), None) => tag.to_string(),
+        (None, Some(digest)) => digest,
+        (None, None) => "latest".to_string(),
+    }
+}
+
+fn render_version(image: Option<&str>) -> String {
+    match image {
+        Some(image) => format!("<code>{}</code>", esc(&image_version(image))),
+        None => "n/a".to_string(),
+    }
+}
+
 struct RunningJob {
     name: String,
     namespace: String,
@@ -68,13 +126,15 @@ struct RunningJob {
     /// The plan the job's worker VM was created with (issue #85);
     /// `None` until the VM exists.
     plan_name: Option<String>,
+    image: Option<String>,
 }
 
 async fn running_jobs(pool: &SqlitePool) -> anyhow::Result<Vec<RunningJob>> {
-    let rows = sqlx::query(
-        "SELECT name, namespace, cronjob_name, status, created_at, worker_plan \
+    let rows = sqlx::query(&format!(
+        "SELECT name, namespace, cronjob_name, status, created_at, worker_plan, {} \
          FROM jobs WHERE status != 'Archived' ORDER BY created_at DESC",
-    )
+        image_sql(JOB_IMAGE_PATH)
+    ))
     .fetch_all(pool)
     .await?;
 
@@ -87,6 +147,7 @@ async fn running_jobs(pool: &SqlitePool) -> anyhow::Result<Vec<RunningJob>> {
             let status: String = row.get(3);
             let created_at: i64 = row.get(4);
             let plan_name: Option<String> = row.get(5);
+            let image: Option<String> = row.get(6);
             RunningJob {
                 name,
                 namespace,
@@ -94,9 +155,225 @@ async fn running_jobs(pool: &SqlitePool) -> anyhow::Result<Vec<RunningJob>> {
                 status,
                 created_at,
                 plan_name,
+                image,
             }
         })
         .collect())
+}
+
+/// One row of the CronJobs table (issue #127).
+struct CronJobSummary {
+    name: String,
+    namespace: String,
+    schedule: String,
+    suspended: bool,
+    /// The image the next run will get.
+    image: Option<String>,
+    /// The most recent finished run, `None` if it never ran.
+    last_run: Option<LastRun>,
+    /// Runs in progress, newest first.
+    active_runs: Vec<ActiveRun>,
+}
+
+struct LastRun {
+    finished_at: i64,
+    /// `None` when the run was removed from history (`pruned_jobs`),
+    /// which keeps its cost but not its outcome.
+    failed: Option<bool>,
+    /// In `main_currency`; `None` if pricing wasn't synced yet.
+    cost: Option<f64>,
+    /// The image the run ran with, from its own copy of the spec.
+    image: Option<String>,
+}
+
+struct ActiveRun {
+    name: String,
+    image: Option<String>,
+}
+
+async fn cronjob_summaries(pool: &SqlitePool) -> anyhow::Result<Vec<CronJobSummary>> {
+    let cronjobs = sqlx::query(&format!(
+        "SELECT name, namespace, schedule, \
+                COALESCE(CASE WHEN json_valid(spec) THEN json_type(spec, '$.suspend') = 'true' END, 0), \
+                {} \
+         FROM cronjobs ORDER BY namespace, name",
+        image_sql(CRONJOB_IMAGE_PATH)
+    ))
+    .fetch_all(pool)
+    .await?;
+
+    // Every run still in `jobs`, newest first. A run's finish time falls
+    // back the same way `metrics_export::write_job_runs` does for rows
+    // from before `completed_at` was recorded.
+    let runs = sqlx::query(&format!(
+        "SELECT cronjob_name, namespace, name, status, {RUN_FAILED_SQL}, \
+                COALESCE(completed_at, ( \
+                    SELECT MIN(e.timestamp) FROM events e \
+                    WHERE e.job_id = jobs.id AND e.reason IN ('Succeeded', 'Failed') \
+                ), updated_at), \
+                actual_cost, {} \
+         FROM jobs WHERE cronjob_name IS NOT NULL ORDER BY created_at DESC, id DESC",
+        image_sql(JOB_IMAGE_PATH)
+    ))
+    .fetch_all(pool)
+    .await?;
+
+    // The newest removed run of each CronJob. SQLite takes the bare
+    // columns from the row that has the MAX.
+    let pruned = sqlx::query(&format!(
+        "SELECT cronjob_name, namespace, MAX(COALESCE(completed_at, created_at)), \
+                actual_cost, {} \
+         FROM pruned_jobs WHERE cronjob_name IS NOT NULL GROUP BY cronjob_name, namespace",
+        image_sql(JOB_IMAGE_PATH)
+    ))
+    .fetch_all(pool)
+    .await?;
+
+    let mut last_runs: HashMap<(String, String), LastRun> = HashMap::new();
+    let mut active_runs: HashMap<(String, String), Vec<ActiveRun>> = HashMap::new();
+    for row in runs {
+        let key: (String, String) = (row.get(1), row.get(0));
+        let status: String = row.get(3);
+        if is_pre_completion_state(&status) {
+            active_runs.entry(key).or_default().push(ActiveRun {
+                name: row.get(2),
+                image: row.get(7),
+            });
+        } else if is_finished_state(&status) {
+            let run = LastRun {
+                finished_at: row.get(5),
+                failed: Some(row.get(4)),
+                cost: row.get(6),
+                image: row.get(7),
+            };
+            keep_newer(&mut last_runs, key, run);
+        }
+    }
+    for row in pruned {
+        let key: (String, String) = (row.get(1), row.get(0));
+        let run = LastRun {
+            finished_at: row.get(2),
+            failed: None,
+            cost: row.get(3),
+            image: row.get(4),
+        };
+        keep_newer(&mut last_runs, key, run);
+    }
+
+    Ok(cronjobs
+        .into_iter()
+        .map(|row| {
+            let name: String = row.get(0);
+            let namespace: String = row.get(1);
+            let key = (namespace.clone(), name.clone());
+            CronJobSummary {
+                schedule: row.get(2),
+                suspended: row.get(3),
+                image: row.get(4),
+                last_run: last_runs.remove(&key),
+                active_runs: active_runs.remove(&key).unwrap_or_default(),
+                name,
+                namespace,
+            }
+        })
+        .collect())
+}
+
+/// Keeps whichever run finished later; on a tie, the one already there,
+/// so a run still in `jobs` (whose outcome is known) wins over a
+/// removed one.
+fn keep_newer(
+    last_runs: &mut HashMap<(String, String), LastRun>,
+    key: (String, String),
+    run: LastRun,
+) {
+    match last_runs.get(&key) {
+        Some(existing) if existing.finished_at >= run.finished_at => {}
+        _ => {
+            last_runs.insert(key, run);
+        }
+    }
+}
+
+fn render_cronjob_rows(
+    cronjobs: &[CronJobSummary],
+    currency: Option<&str>,
+    now: DateTime<Utc>,
+) -> String {
+    if cronjobs.is_empty() {
+        return "<tr><td colspan=\"4\"><em>none</em></td></tr>".to_string();
+    }
+    cronjobs
+        .iter()
+        .map(|cj| {
+            let mut schedule = format!("<code>{}</code>", esc(&cj.schedule));
+            if cj.suspended {
+                schedule.push_str(" (suspended)");
+            }
+
+            let last_run = match &cj.last_run {
+                None => "never".to_string(),
+                Some(run) => {
+                    let result = match run.failed {
+                        Some(true) => "<strong>failed</strong>",
+                        Some(false) => "succeeded",
+                        None => "result not kept",
+                    };
+                    let cost = match (run.cost, currency) {
+                        (Some(cost), Some(currency)) => format!("{cost:.4} {}", esc(currency)),
+                        (Some(cost), None) => format!("{cost:.4}"),
+                        (None, _) => "n/a".to_string(),
+                    };
+                    format!(
+                        "{} ago, {result}, {cost}<br>version {}",
+                        format_elapsed(now.timestamp() - run.finished_at),
+                        render_version(run.image.as_deref()),
+                    )
+                }
+            };
+
+            let next = if !cj.active_runs.is_empty() {
+                cj.active_runs
+                    .iter()
+                    .map(|run| {
+                        format!(
+                            "running: {}<br>version {}",
+                            esc(&run.name),
+                            render_version(run.image.as_deref())
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("<br>")
+            } else if cj.suspended {
+                "suspended".to_string()
+            } else {
+                // Schedules are evaluated in UTC (`timeZone` isn't
+                // supported), so the time is shown in UTC too.
+                match parse_schedule(&cj.schedule)
+                    .ok()
+                    .and_then(|schedule| schedule.next_after(&now))
+                {
+                    Some(next) => format!(
+                        "{} (in {})<br>version {}",
+                        next.format("%Y-%m-%d %H:%M UTC"),
+                        format_elapsed((next - now).num_seconds()),
+                        render_version(cj.image.as_deref()),
+                    ),
+                    None => "n/a".to_string(),
+                }
+            };
+
+            let css_class = match &cj.last_run {
+                Some(LastRun { failed: Some(true), .. }) => " class=\"warning\"",
+                _ => "",
+            };
+            format!(
+                "<tr{css_class}><td>{}/{}</td><td>{schedule}</td><td>{last_run}</td><td>{next}</td></tr>",
+                esc(&cj.namespace),
+                esc(&cj.name),
+            )
+        })
+        .collect()
 }
 
 struct RecentEvent {
@@ -142,14 +419,21 @@ async fn accumulated_cost(pool: &SqlitePool) -> anyhow::Result<f64> {
 
 fn render_html(
     jobs: &[RunningJob],
+    cronjobs: &[CronJobSummary],
     events: &[RecentEvent],
     budget: Option<(f64, pricing::BudgetSettings)>,
     accumulated: f64,
 ) -> String {
-    let now = Utc::now().timestamp();
+    let now_time = Utc::now();
+    let now = now_time.timestamp();
+
+    let currency = budget
+        .as_ref()
+        .map(|(_, settings)| settings.main_currency.as_str());
+    let cronjob_rows = render_cronjob_rows(cronjobs, currency, now_time);
 
     let jobs_rows = if jobs.is_empty() {
-        "<tr><td colspan=\"5\"><em>none</em></td></tr>".to_string()
+        "<tr><td colspan=\"6\"><em>none</em></td></tr>".to_string()
     } else {
         jobs.iter()
             .map(|j| {
@@ -158,13 +442,14 @@ fn render_html(
                     None => "standalone".to_string(),
                 };
                 format!(
-                    "<tr><td>{}/{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    "<tr><td>{}/{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                     esc(&j.namespace),
                     esc(&j.name),
                     kind,
                     esc(&j.status),
                     format_elapsed(now - j.created_at),
                     j.plan_name.as_deref().unwrap_or("n/a"),
+                    render_version(j.image.as_deref()),
                 )
             })
             .collect::<String>()
@@ -231,8 +516,14 @@ fn render_html(
 
 <h2>Running jobs</h2>
 <table>
-<tr><th>Job</th><th>Type</th><th>Status</th><th>Elapsed</th><th>VM size</th></tr>
+<tr><th>Job</th><th>Type</th><th>Status</th><th>Elapsed</th><th>VM size</th><th>Version</th></tr>
 {jobs_rows}
+</table>
+
+<h2>CronJobs</h2>
+<table>
+<tr><th>CronJob</th><th>Schedule</th><th>Last run</th><th>Next</th></tr>
+{cronjob_rows}
 </table>
 
 <h2>Recent events</h2>
@@ -254,6 +545,10 @@ pub async fn render(State(pool): State<SqlitePool>) -> Response {
         Ok(jobs) => jobs,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
+    let cronjobs = match cronjob_summaries(&pool).await {
+        Ok(cronjobs) => cronjobs,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
     let events = match recent_events(&pool).await {
         Ok(events) => events,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -264,7 +559,7 @@ pub async fn render(State(pool): State<SqlitePool>) -> Response {
     };
     let budget = pricing::settle_accrual(&pool).await.unwrap_or(None);
 
-    Html(render_html(&jobs, &events, budget, accumulated)).into_response()
+    Html(render_html(&jobs, &cronjobs, &events, budget, accumulated)).into_response()
 }
 
 /// Liveness: the process itself is up and the async runtime is
@@ -306,6 +601,7 @@ mod tests {
     use super::*;
     use crate::reconcile::job::record_event;
     use axum::{routing::get, Router};
+    use serde_json::json;
     use tower::ServiceExt;
 
     fn router(pool: SqlitePool, tick_health: Arc<TickHealth>) -> Router {
@@ -482,6 +778,283 @@ mod tests {
         let body = body_text(response).await;
         assert!(body.contains("BudgetSkip"));
         assert!(body.contains("<tr class=\"warning\">"));
+    }
+
+    async fn get_page(pool: SqlitePool) -> String {
+        let response = router(pool, Arc::new(TickHealth::new()))
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        body_text(response).await
+    }
+
+    fn job_spec(image: &str) -> String {
+        json!({"template": {"spec": {"containers": [{"image": image}]}}}).to_string()
+    }
+
+    async fn insert_cronjob(
+        pool: &SqlitePool,
+        name: &str,
+        schedule: &str,
+        suspend: bool,
+        image: &str,
+    ) {
+        let spec = json!({
+            "schedule": schedule,
+            "suspend": suspend,
+            "jobTemplate": {"spec": {"template": {"spec": {"containers": [{"image": image}]}}}},
+        });
+        sqlx::query(
+            "INSERT INTO cronjobs (id, name, namespace, spec, schedule, created_at, updated_at, version) \
+             VALUES (?, ?, 'default', ?, ?, 0, 0, 1)",
+        )
+        .bind(format!("cj-{name}"))
+        .bind(name)
+        .bind(spec.to_string())
+        .bind(schedule)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_run(
+        pool: &SqlitePool,
+        id: &str,
+        cronjob: &str,
+        status: &str,
+        exit_code: Option<i64>,
+        completed_at: Option<i64>,
+        cost: Option<f64>,
+        image: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, cronjob_name, spec, status, exit_code, \
+                               completed_at, actual_cost, created_at, updated_at, version) \
+             VALUES (?, ?, 'default', ?, ?, ?, ?, ?, ?, 0, 0, 1)",
+        )
+        .bind(id)
+        .bind(format!("{cronjob}-{id}"))
+        .bind(cronjob)
+        .bind(job_spec(image))
+        .bind(status)
+        .bind(exit_code)
+        .bind(completed_at)
+        .bind(cost)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn test_image_version() {
+        assert_eq!(image_version("ghcr.io/acme/tool:1.2.3"), "1.2.3");
+        assert_eq!(image_version("registry.example:5000/acme/tool"), "latest");
+        assert_eq!(image_version("registry.example:5000/tool:v2"), "v2");
+        assert_eq!(image_version("alpine"), "latest");
+        assert_eq!(
+            image_version("tool@sha256:0123456789abcdef0123456789abcdef"),
+            "sha256:0123456789ab"
+        );
+        assert_eq!(
+            image_version("ghcr.io/acme/tool:1.2.3@sha256:0123456789abcdef"),
+            "1.2.3@sha256:0123456789ab"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cronjob_never_run_shows_next_time_and_version() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_cronjob(
+            &pool,
+            "nightly",
+            "0 3 * * *",
+            false,
+            "ghcr.io/acme/tool:2.0.0",
+        )
+        .await;
+
+        let body = get_page(pool).await;
+        let expected_next = parse_schedule("0 3 * * *")
+            .unwrap()
+            .next_after(&Utc::now())
+            .unwrap()
+            .format("%Y-%m-%d %H:%M UTC")
+            .to_string();
+        assert!(body.contains("default/nightly"));
+        assert!(body.contains("<code>0 3 * * *</code>"));
+        assert!(body.contains("<td>never</td>"));
+        assert!(body.contains(&expected_next));
+        assert!(body.contains("version <code>2.0.0</code>"));
+        // Only the version, never the registry/repository.
+        assert!(!body.contains("ghcr.io"));
+    }
+
+    #[tokio::test]
+    async fn test_cronjob_last_run_shows_result_cost_and_version_it_ran() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_cronjob(&pool, "nightly", "0 3 * * *", false, "acme/tool:3.0.0").await;
+        let now = Utc::now().timestamp();
+        insert_run(
+            &pool,
+            "old",
+            "nightly",
+            "Archived",
+            Some(1),
+            Some(now - 7200),
+            Some(0.5),
+            "acme/tool:1.0.0",
+        )
+        .await;
+        insert_run(
+            &pool,
+            "new",
+            "nightly",
+            "Archived",
+            Some(0),
+            Some(now - 90),
+            Some(0.0123),
+            "acme/tool:2.0.0",
+        )
+        .await;
+
+        let body = get_page(pool).await;
+        assert!(body.contains("1m30s ago, succeeded, 0.0123<br>version <code>2.0.0</code>"));
+        assert!(!body.contains("<code>1.0.0</code>"));
+        // The next run gets the CronJob's current image.
+        assert!(body.contains("version <code>3.0.0</code>"));
+    }
+
+    #[tokio::test]
+    async fn test_cronjob_failed_last_run_is_highlighted_and_missing_cost_is_na() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_cronjob(&pool, "nightly", "0 3 * * *", false, "acme/tool:1").await;
+        let now = Utc::now().timestamp();
+        insert_run(
+            &pool,
+            "j1",
+            "nightly",
+            "VMTerminating",
+            Some(2),
+            Some(now - 30),
+            None,
+            "acme/tool:1",
+        )
+        .await;
+
+        let body = get_page(pool).await;
+        assert!(body.contains("30s ago, <strong>failed</strong>, n/a"));
+        assert!(body.contains("<tr class=\"warning\"><td>default/nightly</td>"));
+    }
+
+    #[tokio::test]
+    async fn test_cronjob_failed_event_counts_as_failed() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_cronjob(&pool, "nightly", "0 3 * * *", false, "acme/tool:1").await;
+        let now = Utc::now().timestamp();
+        insert_run(
+            &pool,
+            "j1",
+            "nightly",
+            "Archived",
+            None,
+            Some(now - 30),
+            None,
+            "acme/tool:1",
+        )
+        .await;
+        record_event(&pool, Some("j1"), "Failed", "deadline exceeded", "Warning")
+            .await
+            .unwrap();
+
+        let body = get_page(pool).await;
+        assert!(body.contains("<strong>failed</strong>"));
+    }
+
+    #[tokio::test]
+    async fn test_cronjob_with_run_in_progress_shows_that_run_and_its_version() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_cronjob(&pool, "nightly", "0 3 * * *", false, "acme/tool:5").await;
+        insert_run(
+            &pool,
+            "j1",
+            "nightly",
+            "ContainerRunning",
+            None,
+            None,
+            None,
+            "acme/tool:4",
+        )
+        .await;
+
+        let body = get_page(pool).await;
+        assert!(body.contains("running: nightly-j1<br>version <code>4</code>"));
+        assert!(body.contains("<td>never</td>"));
+    }
+
+    #[tokio::test]
+    async fn test_suspended_cronjob() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_cronjob(&pool, "paused", "0 3 * * *", true, "acme/tool:1").await;
+
+        let body = get_page(pool).await;
+        assert!(body.contains("<code>0 3 * * *</code> (suspended)"));
+        assert!(body.contains("<td>suspended</td>"));
+    }
+
+    #[tokio::test]
+    async fn test_cronjob_last_run_removed_from_history_still_shown() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_cronjob(&pool, "nightly", "0 3 * * *", false, "acme/tool:2").await;
+        let now = Utc::now().timestamp();
+        insert_run(
+            &pool,
+            "kept",
+            "nightly",
+            "Archived",
+            Some(0),
+            Some(now - 7200),
+            Some(0.1),
+            "acme/tool:1",
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO pruned_jobs (id, name, namespace, cronjob_name, spec, created_at, \
+                                      completed_at, actual_cost, pruned_at) \
+             VALUES ('gone', 'nightly-gone', 'default', 'nightly', ?, 0, ?, 0.25, ?)",
+        )
+        .bind(job_spec("acme/tool:2"))
+        .bind(now - 60)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let body = get_page(pool).await;
+        assert!(body.contains("1m00s ago, result not kept, 0.2500<br>version <code>2</code>"));
+    }
+
+    #[tokio::test]
+    async fn test_running_jobs_show_version() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
+             VALUES ('j1', 'job-one', 'default', ?, 'Created', 0, 0, 1)",
+        )
+        .bind(job_spec("private.registry.example/team/tool:9.9"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let body = get_page(pool).await;
+        assert!(body.contains("<td><code>9.9</code></td>"));
+        assert!(!body.contains("private.registry.example"));
     }
 
     #[tokio::test]
