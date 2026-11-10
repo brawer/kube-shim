@@ -177,8 +177,8 @@ struct CronJobSummary {
 
 struct LastRun {
     finished_at: i64,
-    /// `None` when the run was removed from history (`pruned_jobs`),
-    /// which keeps its cost but not its outcome.
+    /// `None` only for a run removed from history (`pruned_jobs`)
+    /// before that table recorded the outcome.
     failed: Option<bool>,
     /// In `main_currency`; `None` if pricing wasn't synced yet.
     cost: Option<f64>,
@@ -222,7 +222,7 @@ async fn cronjob_summaries(pool: &SqlitePool) -> anyhow::Result<Vec<CronJobSumma
     // columns from the row that has the MAX.
     let pruned = sqlx::query(&format!(
         "SELECT cronjob_name, namespace, MAX(COALESCE(completed_at, created_at)), \
-                actual_cost, {} \
+                actual_cost, {}, failed \
          FROM pruned_jobs WHERE cronjob_name IS NOT NULL GROUP BY cronjob_name, namespace",
         image_sql(JOB_IMAGE_PATH)
     ))
@@ -253,7 +253,7 @@ async fn cronjob_summaries(pool: &SqlitePool) -> anyhow::Result<Vec<CronJobSumma
         let key: (String, String) = (row.get(1), row.get(0));
         let run = LastRun {
             finished_at: row.get(2),
-            failed: None,
+            failed: row.get(5),
             cost: row.get(3),
             image: row.get(4),
         };
@@ -280,7 +280,7 @@ async fn cronjob_summaries(pool: &SqlitePool) -> anyhow::Result<Vec<CronJobSumma
 }
 
 /// Keeps whichever run finished later; on a tie, the one already there,
-/// so a run still in `jobs` (whose outcome is known) wins over a
+/// so a run still in `jobs` wins over a
 /// removed one.
 fn keep_newer(
     last_runs: &mut HashMap<(String, String), LastRun>,
@@ -1009,7 +1009,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cronjob_last_run_removed_from_history_still_shown() {
+    async fn test_cronjob_last_run_removed_from_history_shows_its_result() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_cronjob(&pool, "nightly", "0 3 * * *", false, "acme/tool:2").await;
+        let now = Utc::now().timestamp();
+        insert_run(
+            &pool,
+            "j1",
+            "nightly",
+            "Archived",
+            Some(1),
+            Some(now - 60),
+            Some(0.25),
+            "acme/tool:2",
+        )
+        .await;
+        crate::reconcile::history::prune_job(&pool, "j1", now)
+            .await
+            .unwrap();
+
+        let body = get_page(pool).await;
+        assert!(
+            body.contains("1m00s ago, <strong>failed</strong>, 0.2500<br>version <code>2</code>")
+        );
+    }
+
+    /// Runs removed before `pruned_jobs.failed` existed have no result.
+    #[tokio::test]
+    async fn test_cronjob_last_run_removed_before_results_were_kept() {
         let pool = crate::db::init_pool(":memory:").await.unwrap();
         insert_cronjob(&pool, "nightly", "0 3 * * *", false, "acme/tool:2").await;
         let now = Utc::now().timestamp();

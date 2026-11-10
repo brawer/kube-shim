@@ -74,6 +74,11 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
         "cached_logs_timestamped",
         "INTEGER NOT NULL DEFAULT 0",
     ),
+    // Whether a removed run failed (`reconcile::job::RUN_FAILED_SQL`,
+    // evaluated while its events still exist), so the status page can
+    // still show a CronJob's last result after its row is gone. NULL
+    // for runs removed before this column existed.
+    ("pruned_jobs", "failed", "INTEGER"),
 ];
 
 pub async fn run(pool: &SqlitePool) -> Result<()> {
