@@ -207,10 +207,11 @@ async fn push_server_charges(
         let boot_price_key = format!("storage_{boot_tier}");
         if let Some((amount, price, _)) = cached_price(pool, zone, &boot_price_key).await? {
             let unit_price = (price / amount) / 100.0 * f64::from(workload::WORKER_BOOT_DISK_GB);
+            let sku_id = format!("{boot_tier}-{}GB-boot", workload::WORKER_BOOT_DISK_GB);
             charges.push(ChargeBreakdown {
                 kind: ChargeKind::BootDisk,
-                sku_id: format!("{boot_tier}-{}GB-boot", workload::WORKER_BOOT_DISK_GB),
-                sku_price_id: boot_price_key,
+                sku_price_id: storage_sku_price_id(&sku_id),
+                sku_id,
                 pricing_category: "Standard",
                 quantity: duration_hours,
                 unit: "Hours",
@@ -234,6 +235,14 @@ async fn push_server_charges(
         }
     }
     Ok(Some(provider_currency))
+}
+
+/// FOCUS `SkuPriceId` for a disk charge. One per `SkuId`, as FOCUS
+/// requires (`focus-validator`'s `CAU-SkuPriceId-C-008-M`): the boot
+/// disk and every volume size are distinct SKUs, though all are priced
+/// from the same per-GB `storage_<tier>` rate.
+fn storage_sku_price_id(sku_id: &str) -> String {
+    format!("storage_{sku_id}")
 }
 
 /// The ephemeral volume's charge for `duration_hours`, if the job has
@@ -271,10 +280,11 @@ async fn push_volume_charge(
                 // RAM as separate line items.
                 let per_gb_hour = (storage_price / storage_amount) / 100.0;
                 let unit_price = per_gb_hour * size_gb as f64;
+                let sku_id = format!("{}-{size_gb}GB", tier.upcloud_tier());
                 charges.push(ChargeBreakdown {
                     kind: ChargeKind::Volume,
-                    sku_id: format!("{}-{size_gb}GB", tier.upcloud_tier()),
-                    sku_price_id: storage_price_key,
+                    sku_price_id: storage_sku_price_id(&sku_id),
+                    sku_id,
                     pricing_category: "Standard",
                     quantity: duration_hours,
                     unit: "Hours",
@@ -1256,7 +1266,7 @@ mod tests {
         assert_eq!(charges[0].sku_id, "DEV-1xCPU-1GB-10GB");
         assert!((charges[0].total - 0.004464).abs() < 1e-9);
         assert_eq!(charges[1].sku_id, "standard-10GB");
-        assert_eq!(charges[1].sku_price_id, "storage_standard");
+        assert_eq!(charges[1].sku_price_id, "storage_standard-10GB");
         // 10GB * 0.0118 cents/GB/hour / 100 = 0.00118 per hour, for 1 hour.
         assert!((charges[1].total - 0.00118).abs() < 1e-9);
 
