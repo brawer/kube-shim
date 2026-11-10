@@ -73,6 +73,34 @@ struct ServerObject {
     state: String,
     #[serde(default)]
     ip_addresses: Option<IpAddresses>,
+    #[serde(default)]
+    storage_devices: Option<AttachedStorageDevices>,
+}
+
+#[derive(Deserialize)]
+struct AttachedStorageDevices {
+    #[serde(default)]
+    storage_device: Vec<AttachedStorageDevice>,
+}
+
+#[derive(Deserialize)]
+struct AttachedStorageDevice {
+    storage: String,
+    /// `"1"` for the disk the server boots from.
+    #[serde(default)]
+    boot_disk: Option<String>,
+}
+
+/// The UUID of the disk the server boots from: the one marked
+/// `boot_disk`, else the first one -- a worker VM is created with only
+/// its boot disk.
+fn extract_boot_disk_id(storage_devices: &Option<AttachedStorageDevices>) -> Option<String> {
+    let devices = &storage_devices.as_ref()?.storage_device;
+    devices
+        .iter()
+        .find(|d| d.boot_disk.as_deref() == Some("1"))
+        .or_else(|| devices.first())
+        .map(|d| d.storage.clone())
 }
 
 #[derive(Deserialize)]
@@ -107,12 +135,14 @@ fn extract_public_ips(ip_addresses: &Option<IpAddresses>) -> (Option<String>, Op
 
 fn to_server(object: ServerObject) -> Server {
     let (public_ipv4, public_ipv6) = extract_public_ips(&object.ip_addresses);
+    let boot_disk_id = extract_boot_disk_id(&object.storage_devices);
     Server {
         id: object.uuid,
         title: object.title,
         state: object.state,
         public_ipv4,
         public_ipv6,
+        boot_disk_id,
     }
 }
 
@@ -263,6 +293,7 @@ pub(super) async fn list_servers(
             state: s.state,
             public_ipv4: None,
             public_ipv6: None,
+            boot_disk_id: None,
         })
         .collect())
 }
@@ -302,6 +333,10 @@ mod tests {
                             {"access": "utility", "family": "IPv4", "address": "10.4.0.1"},
                             {"access": "public", "family": "IPv4", "address": "94.237.90.144"},
                             {"access": "public", "family": "IPv6", "address": "2a04::1"}
+                        ]},
+                        "storage_devices": {"storage_device": [
+                            {"storage": "01ab-boot", "storage_title": "kube-shim-worker-test-os",
+                             "boot_disk": "1", "type": "disk"}
                         ]}
                     }
                 }))
@@ -315,6 +350,7 @@ mod tests {
         assert_eq!(server.state, "maintenance");
         assert_eq!(server.public_ipv4.as_deref(), Some("94.237.90.144"));
         assert_eq!(server.public_ipv6.as_deref(), Some("2a04::1"));
+        assert_eq!(server.boot_disk_id.as_deref(), Some("01ab-boot"));
     }
 
     #[tokio::test]

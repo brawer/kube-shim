@@ -184,6 +184,28 @@ CREATE TABLE IF NOT EXISTS pruned_jobs (
     pruned_at INTEGER NOT NULL
 );
 
+-- Every billable cloud resource a job run created (issue #148): its
+-- worker VM ('server') and its ephemeral volume ('volume'), with the
+-- provider's own ID and title, and when it was created and deleted --
+-- when the provider's billing for it started and stopped. The boot
+-- disk and the public IPv4 address are created and deleted with the
+-- server, so they're columns on its row rather than rows of their own.
+-- `api::cost_report` takes ResourceId/ResourceName and the charge
+-- period from here, and `reconcile::job` computes `jobs.actual_cost` from
+-- it once the last resource is gone. Never deleted, like
+-- `pruned_jobs`, so a removed job keeps its cost report rows.
+CREATE TABLE IF NOT EXISTS job_resources (
+    job_id TEXT NOT NULL,
+    kind TEXT NOT NULL,  -- 'server' or 'volume'
+    provider_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    deleted_at INTEGER,
+    boot_disk_id TEXT,   -- 'server' only
+    public_ipv4 TEXT,    -- 'server' only
+    PRIMARY KEY (job_id, kind)
+);
+
 -- Indices for common queries
 CREATE INDEX IF NOT EXISTS idx_secrets_namespace ON secrets(namespace);
 CREATE INDEX IF NOT EXISTS idx_cronjobs_namespace ON cronjobs(namespace);

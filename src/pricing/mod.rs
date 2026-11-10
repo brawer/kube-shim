@@ -51,6 +51,10 @@ async fn cached_price(
 /// currency (`providers::PriceEntry`'s own docs) -- never `EUR`
 /// assumed.
 pub struct ChargeBreakdown {
+    /// Which billable resource this charge is for (issue #148), so the
+    /// cost report can name it (`ResourceId`/`ResourceName`/
+    /// `ResourceType`) and use its own lifetime as the charge period.
+    pub kind: ChargeKind,
     pub sku_id: String,
     pub sku_price_id: String,
     /// `"Standard"` always, for kube-shim's own fixed on-demand
@@ -67,6 +71,27 @@ pub struct ChargeBreakdown {
     pub unit: &'static str,
     pub unit_price: f64,
     pub total: f64,
+}
+
+/// The billable resource a `ChargeBreakdown` is for. The boot disk and
+/// the IPv4 address belong to the worker VM: they're created and
+/// deleted with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChargeKind {
+    Server,
+    BootDisk,
+    Ipv4,
+    Volume,
+}
+
+/// How long each of a job's billable resources existed, in hours.
+/// `None` leaves that resource's charges out: a job force-failed
+/// before its VM was created still pays for the volume it already had
+/// (issue #148), and vice versa.
+#[derive(Debug, Clone, Copy)]
+struct ChargeHours {
+    server: Option<f64>,
+    volume: Option<f64>,
 }
 
 /// A job's VM charge, plus one each for its boot disk and IPv4 address
@@ -91,8 +116,41 @@ async fn charge_breakdown_for_duration(
     zone: &str,
     spec: &JsonValue,
     recorded_plan: Option<&str>,
-    duration_hours: f64,
+    hours: ChargeHours,
 ) -> Result<Option<(Vec<ChargeBreakdown>, String)>> {
+    let mut charges = Vec::new();
+    let mut provider_currency: Option<String> = None;
+    if let Some(server_hours) = hours.server {
+        let Some(currency) =
+            push_server_charges(pool, zone, spec, recorded_plan, server_hours, &mut charges)
+                .await?
+        else {
+            return Ok(None);
+        };
+        provider_currency = Some(currency);
+    }
+    if let Some(volume_hours) = hours.volume {
+        if let Some(currency) =
+            push_volume_charge(pool, zone, spec, volume_hours, &mut charges).await?
+        {
+            provider_currency.get_or_insert(currency);
+        }
+    }
+    Ok(provider_currency.map(|currency| (charges, currency)))
+}
+
+/// The worker VM's charge, plus its boot disk's and IPv4 address's if
+/// the plan doesn't bundle them, for `duration_hours`. Returns the
+/// provider's billing currency, or `None` if the plan or its price
+/// isn't known yet.
+async fn push_server_charges(
+    pool: &SqlitePool,
+    zone: &str,
+    spec: &JsonValue,
+    recorded_plan: Option<&str>,
+    duration_hours: f64,
+    charges: &mut Vec<ChargeBreakdown>,
+) -> Result<Option<String>> {
     // A job whose VM already exists is charged for the plan it really
     // got (`jobs.worker_plan`, issue #85). Otherwise the same cheapest-
     // fit choice `handle_vm_pending` makes -- the estimate must size
@@ -130,7 +188,8 @@ async fn charge_breakdown_for_duration(
         return Ok(None);
     };
     let vm_unit_price = (vm_price / vm_amount) / 100.0;
-    let mut charges = vec![ChargeBreakdown {
+    charges.push(ChargeBreakdown {
+        kind: ChargeKind::Server,
         sku_id: plan_name,
         sku_price_id: vm_price_key,
         pricing_category: "Standard",
@@ -138,7 +197,7 @@ async fn charge_breakdown_for_duration(
         unit: "Hours",
         unit_price: vm_unit_price,
         total: vm_unit_price * duration_hours,
-    }];
+    });
 
     // Plans that don't bundle the boot disk and public IPv4 (Cloud
     // Native style, `workload::plan_bundles_disk_and_ip`) bill both
@@ -149,6 +208,7 @@ async fn charge_breakdown_for_duration(
         if let Some((amount, price, _)) = cached_price(pool, zone, &boot_price_key).await? {
             let unit_price = (price / amount) / 100.0 * f64::from(workload::WORKER_BOOT_DISK_GB);
             charges.push(ChargeBreakdown {
+                kind: ChargeKind::BootDisk,
                 sku_id: format!("{boot_tier}-{}GB-boot", workload::WORKER_BOOT_DISK_GB),
                 sku_price_id: boot_price_key,
                 pricing_category: "Standard",
@@ -162,6 +222,7 @@ async fn charge_breakdown_for_duration(
         if let Some((amount, price, _)) = cached_price(pool, zone, &ip_price_key).await? {
             let unit_price = (price / amount) / 100.0;
             charges.push(ChargeBreakdown {
+                kind: ChargeKind::Ipv4,
                 sku_id: "ipv4-address".to_string(),
                 sku_price_id: ip_price_key,
                 pricing_category: "Standard",
@@ -172,7 +233,19 @@ async fn charge_breakdown_for_duration(
             });
         }
     }
+    Ok(Some(provider_currency))
+}
 
+/// The ephemeral volume's charge for `duration_hours`, if the job has
+/// one. Returns the provider's billing currency, or `None` if there's
+/// no volume or its price isn't synced yet.
+async fn push_volume_charge(
+    pool: &SqlitePool,
+    zone: &str,
+    spec: &JsonValue,
+    duration_hours: f64,
+    charges: &mut Vec<ChargeBreakdown>,
+) -> Result<Option<String>> {
     if let Some(volume) = find_ephemeral_volume(spec) {
         if let Some(size_gb) = volume
             .pointer("/resources/requests/storage")
@@ -188,7 +261,7 @@ async fn charge_breakdown_for_duration(
             // out -- the VM charge still stands on its own rather
             // than failing the whole calculation over a secondary
             // cost.
-            if let Some((storage_amount, storage_price, _)) =
+            if let Some((storage_amount, storage_price, currency)) =
                 cached_price(pool, zone, &storage_price_key).await?
             {
                 // The unit price of using *this specific volume's
@@ -199,6 +272,7 @@ async fn charge_breakdown_for_duration(
                 let per_gb_hour = (storage_price / storage_amount) / 100.0;
                 let unit_price = per_gb_hour * size_gb as f64;
                 charges.push(ChargeBreakdown {
+                    kind: ChargeKind::Volume,
                     sku_id: format!("{}-{size_gb}GB", tier.upcloud_tier()),
                     sku_price_id: storage_price_key,
                     pricing_category: "Standard",
@@ -207,11 +281,11 @@ async fn charge_breakdown_for_duration(
                     unit_price,
                     total: unit_price * duration_hours,
                 });
+                return Ok(Some(currency));
             }
         }
     }
-
-    Ok(Some((charges, provider_currency)))
+    Ok(None)
 }
 
 /// A job's worst-case charges before it starts, from its own
@@ -229,23 +303,33 @@ pub async fn estimate_job_charges(
     active_deadline_seconds: i64,
 ) -> Result<Option<(Vec<ChargeBreakdown>, String)>> {
     let duration_hours = active_deadline_seconds.max(0) as f64 / SECONDS_PER_HOUR;
-    charge_breakdown_for_duration(pool, zone, spec, None, duration_hours).await
+    let hours = ChargeHours {
+        server: Some(duration_hours),
+        volume: Some(duration_hours),
+    };
+    charge_breakdown_for_duration(pool, zone, spec, None, hours).await
 }
 
-/// A job's real charges once it's actually finished, from its real
-/// elapsed wall-clock duration -- not the conservative
-/// `activeDeadlineSeconds` estimate `estimate_job_charges` uses. Used
-/// directly by `api::cost_report`; `calculate_actual_cost` below just
-/// sums these for the single aggregate `jobs.actual_cost`.
+/// A job's real charges once it's actually finished, from how long its
+/// worker VM and its volume really existed -- not the conservative
+/// `activeDeadlineSeconds` estimate `estimate_job_charges` uses. `None`
+/// for a resource the job never had leaves its charges out (issue
+/// #148). Used directly by `api::cost_report`; `calculate_actual_cost`
+/// below just sums these for the single aggregate `jobs.actual_cost`.
 pub async fn actual_job_charges(
     pool: &SqlitePool,
     zone: &str,
     spec: &JsonValue,
     worker_plan: Option<&str>,
-    duration_seconds: i64,
+    server_seconds: Option<i64>,
+    volume_seconds: Option<i64>,
 ) -> Result<Option<(Vec<ChargeBreakdown>, String)>> {
-    let duration_hours = duration_seconds.max(0) as f64 / SECONDS_PER_HOUR;
-    charge_breakdown_for_duration(pool, zone, spec, worker_plan, duration_hours).await
+    let to_hours = |seconds: i64| seconds.max(0) as f64 / SECONDS_PER_HOUR;
+    let hours = ChargeHours {
+        server: server_seconds.map(to_hours),
+        volume: volume_seconds.map(to_hours),
+    };
+    charge_breakdown_for_duration(pool, zone, spec, worker_plan, hours).await
 }
 
 /// A job's worst-case *total* cost before it starts, converted to
@@ -276,11 +360,19 @@ pub async fn calculate_actual_cost(
     zone: &str,
     spec: &JsonValue,
     worker_plan: Option<&str>,
-    duration_seconds: i64,
+    server_seconds: Option<i64>,
+    volume_seconds: Option<i64>,
     main_currency: &str,
 ) -> Result<Option<f64>> {
-    let Some((charges, provider_currency)) =
-        actual_job_charges(pool, zone, spec, worker_plan, duration_seconds).await?
+    let Some((charges, provider_currency)) = actual_job_charges(
+        pool,
+        zone,
+        spec,
+        worker_plan,
+        server_seconds,
+        volume_seconds,
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -909,10 +1001,18 @@ mod tests {
         .await;
 
         // Real run was only 30 minutes (1800s), half of the 1-hour cost.
-        let cost = calculate_actual_cost(&pool, "de-fra1", &vm_only_spec(), None, 1800, "EUR")
-            .await
-            .unwrap()
-            .unwrap();
+        let cost = calculate_actual_cost(
+            &pool,
+            "de-fra1",
+            &vm_only_spec(),
+            None,
+            Some(1800),
+            None,
+            "EUR",
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!((cost - 0.002232).abs() < 1e-9);
     }
 
@@ -1065,7 +1165,8 @@ mod tests {
             "de-fra1",
             &vm_only_spec(),
             Some("DEV-1xCPU-2GB"),
-            3600,
+            Some(3600),
+            None,
         )
         .await
         .unwrap()
@@ -1073,6 +1174,58 @@ mod tests {
         assert_eq!(charges.len(), 1);
         assert_eq!(charges[0].sku_id, "DEV-1xCPU-2GB");
         assert!((charges[0].total - 0.008).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn test_actual_charges_cover_only_the_resources_that_existed() {
+        // Issue #148: a job that failed after creating its volume but
+        // before its VM existed pays for the volume alone, and each
+        // resource for its own lifetime.
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
+        insert_price(
+            &pool,
+            "de-fra1",
+            "server_plan_DEV-1xCPU-1GB-10GB",
+            1.0,
+            0.4464,
+            "EUR",
+        )
+        .await;
+        insert_price(&pool, "de-fra1", "storage_standard", 1.0, 0.0118, "EUR").await;
+
+        let (charges, currency) = actual_job_charges(
+            &pool,
+            "de-fra1",
+            &vm_and_volume_spec(),
+            None,
+            None,
+            Some(7200),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(currency, "EUR");
+        assert_eq!(charges.len(), 1);
+        assert_eq!(charges[0].kind, ChargeKind::Volume);
+        assert_eq!(charges[0].quantity, 2.0);
+
+        let (charges, _) = actual_job_charges(
+            &pool,
+            "de-fra1",
+            &vm_and_volume_spec(),
+            None,
+            Some(3600),
+            Some(1800),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let kinds: Vec<(ChargeKind, f64)> = charges.iter().map(|c| (c.kind, c.quantity)).collect();
+        assert_eq!(
+            kinds,
+            vec![(ChargeKind::Server, 1.0), (ChargeKind::Volume, 0.5)]
+        );
     }
 
     #[tokio::test]

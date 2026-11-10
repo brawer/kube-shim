@@ -41,7 +41,9 @@
 //! against real generated output, not assumed from a schema reading.
 
 use crate::currency;
-use crate::pricing::{self, ChargeBreakdown};
+use crate::job_resources::{self, JobResource};
+use crate::naming;
+use crate::pricing::{self, ChargeBreakdown, ChargeKind};
 use axum::{
     extract::{Query, State},
     http::{header, StatusCode},
@@ -86,7 +88,7 @@ pub struct CostReportConfig {
 /// `v1.4`-rule-loading bug upstream).
 ///
 /// Columns kube-shim genuinely has no data for (no sub-accounts, no
-/// resource tags, no commitment discounts, no contracts, no capacity
+/// commitment discounts, no contracts, no capacity
 /// reservations, no multi-currency-aware SKU metering) are always
 /// null -- `charge_row` below marks each one explicitly, rather than
 /// leaving a silent gap between this list and what's actually
@@ -162,10 +164,162 @@ const COLUMNS: &[&str] = &[
 struct CompletedJob {
     name: String,
     namespace: String,
+    cronjob_name: Option<String>,
     spec: JsonValue,
     created_at: i64,
     completed_at: i64,
     worker_plan: Option<String>,
+    /// From `jobs`; `None` once the job is removed from history.
+    worker_vm_id: Option<String>,
+    worker_vm_name: Option<String>,
+    /// The job's billable resources (issue #148); empty for a job
+    /// provisioned before `job_resources` existed.
+    resources: Vec<JobResource>,
+}
+
+/// The resource one charge is for, and the period it was billed:
+/// FOCUS's `ResourceId`/`ResourceName`/`ResourceType` and
+/// `ChargePeriodStart`/`ChargePeriodEnd`.
+struct ChargedResource {
+    id: String,
+    name: String,
+    resource_type: &'static str,
+    period_start: i64,
+    period_end: i64,
+}
+
+impl CompletedJob {
+    fn resource(&self, kind: &str) -> Option<&JobResource> {
+        self.resources.iter().find(|r| r.kind == kind)
+    }
+
+    /// The worker VM's provider ID, title and lifetime. For a job from
+    /// before `job_resources` existed: the ID and title `jobs` still
+    /// has (else the title the VM was created with, also as its ID),
+    /// and the job's own lifetime, as before issue #148.
+    fn server(&self, config: &CostReportConfig) -> (String, String, i64, i64) {
+        if let Some(r) = self.resource(job_resources::SERVER) {
+            return (
+                r.provider_id.clone(),
+                r.name.clone(),
+                r.created_at,
+                r.deleted_at.unwrap_or(r.created_at),
+            );
+        }
+        let name = self.worker_vm_name.clone().unwrap_or_else(|| {
+            naming::worker_title(&config.resource_prefix, &self.namespace, &self.name)
+        });
+        let id = self.worker_vm_id.clone().unwrap_or_else(|| name.clone());
+        (id, name, self.created_at, self.completed_at)
+    }
+
+    fn charged_resource(&self, config: &CostReportConfig, kind: ChargeKind) -> ChargedResource {
+        if kind == ChargeKind::Volume {
+            let (id, name, start, end) = match self.resource(job_resources::VOLUME) {
+                Some(r) => (
+                    r.provider_id.clone(),
+                    r.name.clone(),
+                    r.created_at,
+                    r.deleted_at.unwrap_or(r.created_at),
+                ),
+                None => {
+                    let name =
+                        naming::volume_title(&config.resource_prefix, &self.namespace, &self.name);
+                    (name.clone(), name, self.created_at, self.completed_at)
+                }
+            };
+            return ChargedResource {
+                id,
+                name,
+                resource_type: "Block Storage",
+                period_start: start,
+                period_end: end,
+            };
+        }
+
+        // The boot disk and IPv4 address live and die with the VM.
+        let (server_id, server_name, start, end) = self.server(config);
+        let server_row = self.resource(job_resources::SERVER);
+        let (id, name, resource_type) = match kind {
+            ChargeKind::BootDisk => (
+                server_row
+                    .and_then(|r| r.boot_disk_id.clone())
+                    .unwrap_or_else(|| server_id.clone()),
+                // The title `create_server` gives the boot disk.
+                format!("{server_name}-os"),
+                "Block Storage",
+            ),
+            ChargeKind::Ipv4 => match server_row.and_then(|r| r.public_ipv4.clone()) {
+                Some(ip) => (ip.clone(), ip, "IP Address"),
+                None => (server_id, format!("{server_name} IPv4"), "IP Address"),
+            },
+            _ => (server_id, server_name, "Virtual Machine"),
+        };
+        ChargedResource {
+            id,
+            name,
+            resource_type,
+            period_start: start,
+            period_end: end,
+        }
+    }
+
+    /// FOCUS `Tags`: a JSON object, so the report can be grouped per
+    /// run or per CronJob. The CronJob is empty for a one-off Job, like
+    /// `/metrics`' own `cronjob` label.
+    fn tags(&self) -> String {
+        serde_json::json!({
+            "kube-shim/namespace": self.namespace,
+            "kube-shim/job": self.name,
+            "kube-shim/cronjob": self.cronjob_name.clone().unwrap_or_default(),
+        })
+        .to_string()
+    }
+}
+
+/// The FOCUS service columns for one kind of charge:
+/// `(ServiceCategory, ServiceSubcategory, ServiceName suffix, SkuMeter,
+/// ChargeDescription suffix)`. Category and subcategory are values from
+/// the spec's own "Allowed Values" tables.
+fn service_columns(
+    kind: ChargeKind,
+) -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+) {
+    match kind {
+        ChargeKind::Server => (
+            "Compute",
+            "Virtual Machines",
+            "Server",
+            "Compute Usage",
+            "worker VM",
+        ),
+        ChargeKind::BootDisk => (
+            "Storage",
+            "Block Storage",
+            "Storage",
+            "Block Volume Usage",
+            "worker boot disk",
+        ),
+        ChargeKind::Ipv4 => (
+            "Networking",
+            "Network Infrastructure",
+            "Networking",
+            "IP Address Usage",
+            "worker IPv4 address",
+        ),
+        ChargeKind::Volume => (
+            "Storage",
+            "Block Storage",
+            "Storage",
+            "Block Volume Usage",
+            "ephemeral volume",
+        ),
+    }
 }
 
 fn parse_date_param(
@@ -277,18 +431,11 @@ async fn charge_row(
         return Ok(None);
     };
 
-    let is_volume = charge.sku_price_id.starts_with("storage_");
-    let (billing_period_start, billing_period_end) = billing_period_for(job.created_at);
-    let charge_description = format!(
-        "{}/{} {}",
-        job.namespace,
-        job.name,
-        if is_volume {
-            "ephemeral volume"
-        } else {
-            "worker VM"
-        }
-    );
+    let resource = job.charged_resource(config, charge.kind);
+    let (service_category, service_subcategory, service_name, sku_meter, description) =
+        service_columns(charge.kind);
+    let (billing_period_start, billing_period_end) = billing_period_for(resource.period_start);
+    let charge_description = format!("{}/{} {description}", job.namespace, job.name);
     let billed_cost = format_decimal(charge.total);
     let unit_price = format_decimal(charge.unit_price);
     let quantity = format_decimal(charge.quantity);
@@ -307,8 +454,8 @@ async fn charge_row(
     // ran, i.e. it only recurs while the job is using the resource.
     fields.insert("ChargeFrequency", "Usage-Based".to_string());
     fields.insert("ChargeDescription", charge_description);
-    fields.insert("ChargePeriodStart", rfc3339(job.created_at));
-    fields.insert("ChargePeriodEnd", rfc3339(job.completed_at));
+    fields.insert("ChargePeriodStart", rfc3339(resource.period_start));
+    fields.insert("ChargePeriodEnd", rfc3339(resource.period_end));
     fields.insert("ConsumedQuantity", quantity.clone());
     fields.insert("ConsumedUnit", charge.unit.to_string());
     fields.insert("ContractedCost", billed_cost.clone());
@@ -334,42 +481,20 @@ async fn charge_row(
     );
     fields.insert("PricingQuantity", quantity);
     fields.insert("PricingUnit", charge.unit.to_string());
-    // Real FOCUS enum values (verified against the spec's own "Allowed
-    // Values" table for both ServiceCategory and ServiceSubcategory) --
-    // a volume charge is genuinely "Storage"/"Block Storage", not
-    // "Compute"/"Virtual Machines" like its job's VM charge.
-    fields.insert(
-        "ServiceCategory",
-        if is_volume { "Storage" } else { "Compute" }.to_string(),
-    );
+    fields.insert("ResourceId", resource.id);
+    fields.insert("ResourceName", resource.name);
+    fields.insert("ResourceType", resource.resource_type.to_string());
+    fields.insert("ServiceCategory", service_category.to_string());
     fields.insert(
         "ServiceName",
-        format!(
-            "{} {}",
-            config.provider_name,
-            if is_volume { "Storage" } else { "Server" }
-        ),
+        format!("{} {service_name}", config.provider_name),
     );
     fields.insert("ServiceProviderName", config.provider_name.clone());
-    fields.insert(
-        "ServiceSubcategory",
-        if is_volume {
-            "Block Storage"
-        } else {
-            "Virtual Machines"
-        }
-        .to_string(),
-    );
+    fields.insert("ServiceSubcategory", service_subcategory.to_string());
     fields.insert("SkuId", charge.sku_id.clone());
-    fields.insert(
-        "SkuMeter",
-        if is_volume {
-            "Block Volume Usage".to_string()
-        } else {
-            "Compute Usage".to_string()
-        },
-    );
+    fields.insert("SkuMeter", sku_meter.to_string());
     fields.insert("SkuPriceId", charge.sku_price_id.clone());
+    fields.insert("Tags", job.tags());
 
     Ok(Some(
         COLUMNS
@@ -395,14 +520,22 @@ pub async fn get_cost_report(
         .and_utc()
         .timestamp();
 
+    // Every job that created a billable resource has an `actual_cost`
+    // once it's archived (issue #148); a deleted resource of a job still
+    // being cleaned up is already billed, so it's listed too.
     let rows = sqlx::query(
-        "SELECT name, namespace, spec, created_at, completed_at, worker_plan FROM ( \
-           SELECT name, namespace, spec, created_at, completed_at, worker_plan, actual_cost \
+        "SELECT id, name, namespace, cronjob_name, spec, created_at, completed_at, worker_plan, \
+                worker_vm_id, worker_vm_name FROM ( \
+           SELECT id, name, namespace, cronjob_name, spec, created_at, completed_at, worker_plan, \
+                  worker_vm_id, worker_vm_name, actual_cost \
            FROM jobs \
            UNION ALL \
-           SELECT name, namespace, spec, created_at, completed_at, worker_plan, actual_cost \
+           SELECT id, name, namespace, cronjob_name, spec, created_at, completed_at, worker_plan, \
+                  NULL, NULL, actual_cost \
            FROM pruned_jobs) \
-         WHERE actual_cost IS NOT NULL AND created_at >= ? AND created_at < ? \
+         WHERE (actual_cost IS NOT NULL \
+                OR id IN (SELECT job_id FROM job_resources WHERE deleted_at IS NOT NULL)) \
+           AND created_at >= ? AND created_at < ? \
          ORDER BY created_at",
     )
     .bind(from_ts)
@@ -411,32 +544,46 @@ pub async fn get_cost_report(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let jobs: Vec<CompletedJob> = rows
-        .into_iter()
-        .map(|r| {
-            let spec_str: String = r.get(2);
-            CompletedJob {
-                name: r.get(0),
-                namespace: r.get(1),
-                spec: serde_json::from_str(&spec_str).unwrap_or(JsonValue::Null),
-                created_at: r.get(3),
-                completed_at: r.get::<Option<i64>, _>(4).unwrap_or_else(|| r.get(3)),
-                worker_plan: r.get(5),
-            }
-        })
-        .collect();
+    let mut jobs: Vec<CompletedJob> = Vec::with_capacity(rows.len());
+    for r in rows {
+        let id: String = r.get(0);
+        let spec_str: String = r.get(4);
+        let resources = job_resources::for_job(&pool, &id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        jobs.push(CompletedJob {
+            name: r.get(1),
+            namespace: r.get(2),
+            cronjob_name: r.get(3),
+            spec: serde_json::from_str(&spec_str).unwrap_or(JsonValue::Null),
+            created_at: r.get(5),
+            completed_at: r.get::<Option<i64>, _>(6).unwrap_or_else(|| r.get(5)),
+            worker_plan: r.get(7),
+            worker_vm_id: r.get(8),
+            worker_vm_name: r.get(9),
+            resources,
+        });
+    }
 
     let mut csv = COLUMNS.join(",");
     csv.push('\n');
 
     for completed_job in &jobs {
-        let duration_seconds = completed_job.completed_at - completed_job.created_at;
+        // Each resource is charged for as long as it existed. A job from
+        // before `job_resources` existed is charged for its own lifetime.
+        let (server_seconds, volume_seconds) = if completed_job.resources.is_empty() {
+            let duration_seconds = completed_job.completed_at - completed_job.created_at;
+            (Some(duration_seconds), Some(duration_seconds))
+        } else {
+            job_resources::lifetimes(&completed_job.resources)
+        };
         let Some((charges, provider_currency)) = pricing::actual_job_charges(
             &pool,
             &config.zone,
             &completed_job.spec,
             completed_job.worker_plan.as_deref(),
-            duration_seconds,
+            server_seconds,
+            volume_seconds,
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -674,6 +821,196 @@ mod tests {
             .collect();
         assert_eq!(categories, vec!["Compute", "Storage"]);
         assert_eq!(subcategories, vec!["Virtual Machines", "Block Storage"]);
+    }
+
+    /// Splits one CSV line, honoring `csv_field`'s quoting.
+    fn parse_csv_line(line: &str) -> Vec<String> {
+        let mut fields = vec![String::new()];
+        let mut quoted = false;
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' if quoted && chars.peek() == Some(&'"') => {
+                    chars.next();
+                    fields.last_mut().unwrap().push('"');
+                }
+                '"' => quoted = !quoted,
+                ',' if !quoted => fields.push(String::new()),
+                _ => fields.last_mut().unwrap().push(c),
+            }
+        }
+        fields
+    }
+
+    #[tokio::test]
+    async fn test_force_failed_job_reports_every_resource_it_created() {
+        // Issue #148: a job force-failed after its VM (on a plan that
+        // doesn't bundle disk and IP) and its volume were created. Each
+        // row names its resource and is charged for that resource's own
+        // lifetime, not the job's.
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::store_plans(
+            &pool,
+            &[crate::providers::PlanInfo {
+                name: "CLOUDNATIVE-1xCPU-2GB".to_string(),
+                cpu_cores: 1,
+                memory_mb: 2048,
+                storage_gb: 0,
+                storage_tier: None,
+                gpu_count: 0,
+                current_offering: true,
+            }],
+            &Default::default(),
+            0,
+        )
+        .await
+        .unwrap();
+        insert_price(&pool, "server_plan_CLOUDNATIVE-1xCPU-2GB", 1.0, 0.5).await;
+        insert_price(&pool, "storage_standard", 1.0, 0.0118).await;
+        insert_price(&pool, "ipv4_address", 1.0, 0.4812).await;
+        let created = chrono::NaiveDate::from_ymd_opt(2026, 11, 7)
+            .unwrap()
+            .and_hms_opt(10, 55, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        let spec = r#"{"template": {"spec": {
+            "containers": [{"resources": {"requests": {"cpu": "1", "memory": "2Gi"}}}],
+            "volumes": [{"ephemeral": {"volumeClaimTemplate": {"spec": {
+                "resources": {"requests": {"storage": "10Gi"}},
+                "storageClassName": "kube-shim-standard"
+            }}}}]
+        }}}"#;
+        // Force-failed: no completed_at, no exit code.
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, cronjob_name, spec, status, created_at, \
+             updated_at, worker_plan, actual_cost, version) \
+             VALUES ('j1', 'dns-debug-1', 'default', 'dns-debug', ?, 'Archived', ?, ?, \
+             'CLOUDNATIVE-1xCPU-2GB', 0.01, 1)",
+        )
+        .bind(spec)
+        .bind(created)
+        .bind(created + 3600)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let worker = "kube-shim-test-worker-default-dns-debug-1";
+        job_resources::record_created(
+            &pool,
+            "j1",
+            job_resources::VOLUME,
+            "vol-uuid",
+            "v",
+            created + 10,
+        )
+        .await
+        .unwrap();
+        job_resources::record_created(
+            &pool,
+            "j1",
+            job_resources::SERVER,
+            "srv-uuid",
+            worker,
+            created + 30,
+        )
+        .await
+        .unwrap();
+        job_resources::set_boot_disk_id(&pool, "j1", "disk-uuid")
+            .await
+            .unwrap();
+        job_resources::set_public_ipv4(&pool, "j1", "192.0.2.7")
+            .await
+            .unwrap();
+        job_resources::record_deleted(&pool, "j1", job_resources::VOLUME, created + 1810)
+            .await
+            .unwrap();
+        job_resources::record_deleted(&pool, "j1", job_resources::SERVER, created + 3630)
+            .await
+            .unwrap();
+
+        let response = get_report(pool, "?from=2026-11-06&to=2026-11-09").await;
+        let body = body_text(response).await;
+        let rows: Vec<Vec<String>> = body.lines().skip(1).map(parse_csv_line).collect();
+        assert_eq!(rows.len(), 4); // VM, boot disk, IPv4, volume
+        let col = |row: &Vec<String>, name: &str| {
+            row[COLUMNS.iter().position(|c| *c == name).unwrap()].clone()
+        };
+        for row in &rows {
+            assert_eq!(row.len(), COLUMNS.len());
+            assert!(col(row, "BilledCost").parse::<f64>().unwrap() > 0.0);
+            let tags: JsonValue = serde_json::from_str(&col(row, "Tags")).unwrap();
+            assert_eq!(
+                tags,
+                serde_json::json!({
+                    "kube-shim/namespace": "default",
+                    "kube-shim/job": "dns-debug-1",
+                    "kube-shim/cronjob": "dns-debug",
+                })
+            );
+        }
+        let resources: Vec<(String, String, String)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    col(r, "ResourceId"),
+                    col(r, "ResourceName"),
+                    col(r, "ResourceType"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            resources,
+            vec![
+                ("srv-uuid".into(), worker.into(), "Virtual Machine".into()),
+                (
+                    "disk-uuid".into(),
+                    format!("{worker}-os"),
+                    "Block Storage".into()
+                ),
+                ("192.0.2.7".into(), "192.0.2.7".into(), "IP Address".into()),
+                ("vol-uuid".into(), "v".into(), "Block Storage".into()),
+            ]
+        );
+        // The VM's rows run from its creation to its deletion (1 hour),
+        // the volume's from its own (half an hour).
+        assert_eq!(col(&rows[0], "ChargePeriodStart"), rfc3339(created + 30));
+        assert_eq!(col(&rows[0], "ChargePeriodEnd"), rfc3339(created + 3630));
+        assert_eq!(col(&rows[0], "ConsumedQuantity"), "1.000000");
+        assert_eq!(col(&rows[3], "ChargePeriodStart"), rfc3339(created + 10));
+        assert_eq!(col(&rows[3], "ConsumedQuantity"), "0.500000");
+        assert_eq!(col(&rows[2], "ServiceCategory"), "Networking");
+        assert_eq!(col(&rows[1], "ServiceCategory"), "Storage");
+    }
+
+    #[tokio::test]
+    async fn test_job_from_before_resources_were_recorded_still_names_its_vm() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
+        insert_price(&pool, "server_plan_DEV-1xCPU-1GB-10GB", 1.0, 0.4464).await;
+        let created = chrono::NaiveDate::from_ymd_opt(2026, 9, 15)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        let spec = r#"{"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "1", "memory": "1Gi"}}}]}}}"#;
+        insert_completed_job(&pool, "job-one", spec, created, created + 3600, 0.004464).await;
+        sqlx::query("UPDATE jobs SET worker_vm_id = 'srv-old', worker_vm_name = 'w-old'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let response = get_report(pool, "?from=2026-09-01&to=2026-09-30").await;
+        let body = body_text(response).await;
+        let rows: Vec<Vec<String>> = body.lines().skip(1).map(parse_csv_line).collect();
+        assert_eq!(rows.len(), 1);
+        let col = |name: &str| rows[0][COLUMNS.iter().position(|c| *c == name).unwrap()].clone();
+        assert_eq!(col("ResourceId"), "srv-old");
+        assert_eq!(col("ResourceName"), "w-old");
+        assert_eq!(col("ResourceType"), "Virtual Machine");
+        assert_eq!(col("ChargePeriodStart"), rfc3339(created));
+        let tags: JsonValue = serde_json::from_str(&col("Tags")).unwrap();
+        assert_eq!(tags["kube-shim/cronjob"], "");
     }
 
     #[tokio::test]
