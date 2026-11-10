@@ -169,7 +169,8 @@ CREATE TABLE IF NOT EXISTS budget_state (
 -- only what billing and scheduling still need after the row, its logs
 -- and its events are gone: the cost report and the status page's total
 -- cost read from here too, and a CronJob's last schedule time still
--- counts runs that were removed. Never deleted.
+-- counts runs that were removed. Never deleted. `failed` is added by
+-- db::migrations.
 CREATE TABLE IF NOT EXISTS pruned_jobs (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,

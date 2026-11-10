@@ -136,18 +136,20 @@ fn history_limit(spec: &JsonValue, field: &str, default: i64) -> i64 {
 }
 
 /// Removes one job's row, its events, metrics and volume records, after
-/// copying what billing and scheduling need to `pruned_jobs`. Also used
+/// copying what billing, scheduling and the status page need to
+/// `pruned_jobs`, including whether the run failed. Also used
 /// by `kubectl delete job` on a finished job, so a deleted job's cost
 /// stays in the cost report.
 pub(crate) async fn prune_job(pool: &SqlitePool, job_id: &str, now: i64) -> Result<()> {
     let mut tx = pool.begin().await?;
-    sqlx::query(
+    // `failed` is read here, before the events it depends on are deleted.
+    sqlx::query(&format!(
         "INSERT OR REPLACE INTO pruned_jobs \
          (id, name, namespace, cronjob_name, spec, created_at, completed_at, worker_plan, \
-          actual_cost, pruned_at) \
+          actual_cost, failed, pruned_at) \
          SELECT id, name, namespace, cronjob_name, spec, created_at, completed_at, worker_plan, \
-          actual_cost, ? FROM jobs WHERE id = ?",
-    )
+          actual_cost, {RUN_FAILED_SQL}, ? FROM jobs WHERE id = ?"
+    ))
     .bind(now)
     .bind(job_id)
     .execute(&mut *tx)
@@ -447,6 +449,41 @@ mod tests {
                 pruned_at
             ),
             ("j1", "cj", 101, 0.01, 500)
+        );
+    }
+
+    /// The outcome is copied before the events it depends on are gone:
+    /// a `Failed` event and a nonzero exit code both count as failed.
+    #[tokio::test]
+    async fn test_prune_job_keeps_whether_the_run_failed() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_job(&pool, "ok", Some("cj"), "Archived", 0, 100, json!({})).await;
+        insert_job(&pool, "exit", Some("cj"), "Archived", 3, 200, json!({})).await;
+        insert_job(&pool, "event", Some("cj"), "Archived", 0, 300, json!({})).await;
+        sqlx::query(
+            "INSERT INTO events (id, job_id, reason, message, timestamp) \
+             VALUES ('e1', 'event', 'Failed', 'deadline exceeded', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for id in ["ok", "exit", "event"] {
+            prune_job(&pool, id, 500).await.unwrap();
+        }
+
+        let failed: Vec<(String, bool)> =
+            sqlx::query_as("SELECT id, failed FROM pruned_jobs ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            failed,
+            vec![
+                ("event".to_string(), true),
+                ("exit".to_string(), true),
+                ("ok".to_string(), false),
+            ]
         );
     }
 }
