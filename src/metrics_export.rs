@@ -198,8 +198,9 @@ async fn write_jobs_by_state(out: &mut Exposition, pool: &SqlitePool) -> anyhow:
 
 /// True once a run has a final outcome: `Succeeded`, `Failed`, or any
 /// cleanup state after them up to `Archived`. An unknown status is not
-/// counted, since its outcome can't be told.
-fn is_finished_state(status: &str) -> bool {
+/// counted, since its outcome can't be told. `pub(crate)`: the status
+/// page picks a CronJob's last finished run with it.
+pub(crate) fn is_finished_state(status: &str) -> bool {
     status == "Failed" || (STATE_SEQUENCE.contains(&status) && !is_pre_completion_state(status))
 }
 

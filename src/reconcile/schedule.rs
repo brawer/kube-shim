@@ -55,7 +55,8 @@ pub(crate) struct CronSchedule {
 
 impl CronSchedule {
     /// The first scheduled instant strictly after `after`, if any.
-    fn next_after(&self, after: &DateTime<Utc>) -> Option<DateTime<Utc>> {
+    /// `pub(crate)`: the status page shows it as a CronJob's next run.
+    pub(crate) fn next_after(&self, after: &DateTime<Utc>) -> Option<DateTime<Utc>> {
         self.parts
             .iter()
             .filter_map(|part| part.after(after).next())
