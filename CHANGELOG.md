@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.5.1](https://github.com/brawer/kube-shim/compare/v0.5.0...v0.5.1) (2026-11-10)
+
+
+### 🆕 Enhancements
+
+* keep whether a run failed when it is removed from history ([#151](https://github.com/brawer/kube-shim/issues/151)) ([9a2988e](https://github.com/brawer/kube-shim/commit/9a2988ec708ca4329d5793738e3fd613418bdad1))
+* list CronJobs with last and next run on the status page ([#149](https://github.com/brawer/kube-shim/issues/149)) ([0d85692](https://github.com/brawer/kube-shim/commit/0d856924864f634af7aa769901c4a1054da6ca1e)), closes [#127](https://github.com/brawer/kube-shim/issues/127)
+
+
+### 🐞 Bug Fixes
+
+* charge every job for the resources it created, and name them in the cost report ([5957b86](https://github.com/brawer/kube-shim/commit/5957b866e6a1e4e0651e521d3c14d32c9d9742e6)), closes [#148](https://github.com/brawer/kube-shim/issues/148)
+* give the boot disk and each volume size their own SkuPriceId ([783d8d7](https://github.com/brawer/kube-shim/commit/783d8d760427d8b62b36149107e0c75c65783743))
+
+
+### 📚 Documentation
+
+* correct the Phase 14a note on the CapacityReservationStatus validator failure ([#153](https://github.com/brawer/kube-shim/issues/153)) ([de3c23a](https://github.com/brawer/kube-shim/commit/de3c23a2ae83c92260b09b6721123473fb70cbd1))
+
 ## [0.5.0](https://github.com/brawer/kube-shim/compare/v0.4.3...v0.5.0) (2026-11-08)
 
 
