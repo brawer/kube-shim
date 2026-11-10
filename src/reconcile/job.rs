@@ -102,7 +102,7 @@ use crate::providers::{
     FirewallFamily, FirewallRule, ProviderError,
 };
 use crate::shutdown::Shutdown;
-use crate::{cloud_init, container_env, pricing, ssh, volumes, workload};
+use crate::{cloud_init, container_env, job_resources, pricing, ssh, volumes, workload};
 use anyhow::Result;
 use chrono::Utc;
 use serde_json::Value as JsonValue;
@@ -588,6 +588,10 @@ pub async fn advance_all_until(
             continue;
         };
 
+        if target_status == TERMINAL_STATE {
+            record_actual_cost(pool, ctx, &id, &namespace, &name, &spec_str, now).await?;
+        }
+
         sqlx::query(
             r#"
             UPDATE jobs
@@ -862,7 +866,7 @@ async fn handle_vm_pending(
                  creating a duplicate",
                 found.id
             );
-            set_worker_vm(pool, job_id, &found.id, &title, &plan.name).await?;
+            set_worker_vm(pool, job_id, &found.id, &title, &plan.name, None).await?;
             return Ok(true);
         }
     }
@@ -886,7 +890,15 @@ async fn handle_vm_pending(
                 server.id,
                 plan.name
             );
-            set_worker_vm(pool, job_id, &server.id, &title, &plan.name).await?;
+            set_worker_vm(
+                pool,
+                job_id,
+                &server.id,
+                &title,
+                &plan.name,
+                server.boot_disk_id.as_deref(),
+            )
+            .await?;
             Ok(true)
         }
         Err(err) => {
@@ -1110,6 +1122,10 @@ async fn handle_vm_creating(
         Ok(server) if server.is_started() => {
             if let Some(ip) = &server.public_ipv4 {
                 set_worker_ssh_ip(pool, job_id, ip).await?;
+                job_resources::set_public_ipv4(pool, job_id, ip).await?;
+            }
+            if let Some(boot_disk_id) = &server.boot_disk_id {
+                job_resources::set_boot_disk_id(pool, job_id, boot_disk_id).await?;
             }
             tracing::info!(
                 "job {namespace}/{name}: worker VM {vm_id} is running (ip {:?})",
@@ -1502,6 +1518,8 @@ async fn handle_container_running(
     // `handle_created` already stored. Best-effort, same as that
     // estimate: a pricing/exchange-rate cache gap just leaves
     // `jobs.actual_cost` unset rather than blocking completion.
+    // Provisional: `record_actual_cost` replaces it once the job is
+    // archived, from how long its VM and volume really existed.
     let duration_seconds = Utc::now().timestamp() - created_at;
     let spec: JsonValue = serde_json::from_str(spec_str).unwrap_or(JsonValue::Null);
     let main_currency = pricing::effective_main_currency(pool, &ctx.main_currency).await?;
@@ -1515,7 +1533,8 @@ async fn handle_container_running(
         &ctx.zone,
         &spec,
         worker_plan.as_deref(),
-        duration_seconds,
+        Some(duration_seconds),
+        Some(duration_seconds),
         &main_currency,
     )
     .await
@@ -1674,6 +1693,13 @@ async fn handle_volume_detaching(
         Ok(()) => {
             tracing::info!("job {namespace}/{name}: deleted volume {provider_volume_id}");
             delete_job_volume(pool, job_id).await?;
+            job_resources::record_deleted(
+                pool,
+                job_id,
+                job_resources::VOLUME,
+                Utc::now().timestamp(),
+            )
+            .await?;
             Ok(true)
         }
         Err(err) => {
@@ -1770,6 +1796,13 @@ async fn handle_vm_terminating(
     match ctx.provider.delete_server(&vm_id).await {
         Ok(()) => {
             tracing::info!("job {namespace}/{name}: deleted worker VM {vm_id}");
+            job_resources::record_deleted(
+                pool,
+                job_id,
+                job_resources::SERVER,
+                Utc::now().timestamp(),
+            )
+            .await?;
             Ok(true)
         }
         Err(err) => {
@@ -1812,6 +1845,16 @@ async fn insert_job_volume(
     .bind(now)
     .execute(pool)
     .await?;
+    // Its billing starts now, whatever way the job ends (issue #148).
+    job_resources::record_created(
+        pool,
+        job_id,
+        job_resources::VOLUME,
+        provider_volume_id,
+        provider_volume_name,
+        now,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1835,12 +1878,16 @@ async fn delete_job_volume(pool: &SqlitePool, job_id: &str) -> Result<()> {
 
 /// Also records the plan the VM was created with (issue #85), so actual
 /// cost and the status page use what was really provisioned.
+///
+/// Also records the VM in `job_resources` (issue #148): its billing
+/// starts now, whatever way the job ends.
 async fn set_worker_vm(
     pool: &SqlitePool,
     job_id: &str,
     vm_id: &str,
     vm_name: &str,
     plan: &str,
+    boot_disk_id: Option<&str>,
 ) -> Result<()> {
     sqlx::query(
         "UPDATE jobs SET worker_vm_id = ?, worker_vm_name = ?, worker_plan = ? WHERE id = ?",
@@ -1851,6 +1898,11 @@ async fn set_worker_vm(
     .bind(job_id)
     .execute(pool)
     .await?;
+    let now = Utc::now().timestamp();
+    job_resources::record_created(pool, job_id, job_resources::SERVER, vm_id, vm_name, now).await?;
+    if let Some(boot_disk_id) = boot_disk_id {
+        job_resources::set_boot_disk_id(pool, job_id, boot_disk_id).await?;
+    }
     Ok(())
 }
 
@@ -1906,6 +1958,68 @@ async fn record_completion(
     .bind(job_id)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Sets `jobs.actual_cost` for a job about to be archived (issue #148),
+/// from how long its worker VM and volume really existed
+/// (`job_resources`) -- from creation to deletion, which is what the
+/// provider bills, whatever way the job ended. A job that is force-failed
+/// (`StateTimeout`, `DeadlineExceeded`) or whose provisioning failed after
+/// creating a VM or volume never reaches `handle_container_running`'s own
+/// cost calculation, but its resources were billed all the same.
+///
+/// Cleanup has finished by the time a job is archived, so any resource
+/// not yet recorded as deleted is recorded as deleted now. A job with no
+/// recorded resources (it never got that far, it ran in dry-run mode, or
+/// it was provisioned before `job_resources` existed) keeps whatever
+/// `actual_cost` it has. Best-effort like every other cost calculation:
+/// a pricing or exchange-rate gap keeps the existing value.
+async fn record_actual_cost(
+    pool: &SqlitePool,
+    ctx: &JobContext,
+    job_id: &str,
+    namespace: &str,
+    name: &str,
+    spec_str: &str,
+    now: i64,
+) -> Result<()> {
+    job_resources::record_all_deleted(pool, job_id, now).await?;
+    let resources = job_resources::for_job(pool, job_id).await?;
+    if resources.is_empty() {
+        return Ok(());
+    }
+    let (server_seconds, volume_seconds) = job_resources::lifetimes(&resources);
+    let spec: JsonValue = serde_json::from_str(spec_str).unwrap_or(JsonValue::Null);
+    let main_currency = pricing::effective_main_currency(pool, &ctx.main_currency).await?;
+    let worker_plan: Option<String> =
+        sqlx::query_scalar("SELECT worker_plan FROM jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await?;
+    let cost = match pricing::calculate_actual_cost(
+        pool,
+        &ctx.zone,
+        &spec,
+        worker_plan.as_deref(),
+        server_seconds,
+        volume_seconds,
+        &main_currency,
+    )
+    .await
+    {
+        Ok(Some(cost)) => cost,
+        Ok(None) => return Ok(()),
+        Err(err) => {
+            tracing::warn!("job {namespace}/{name}: actual_cost calculation failed: {err:?}");
+            return Ok(());
+        }
+    };
+    sqlx::query("UPDATE jobs SET actual_cost = ? WHERE id = ?")
+        .bind(cost)
+        .bind(job_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -3666,6 +3780,111 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "Archived");
+    }
+
+    #[tokio::test]
+    async fn test_archiving_a_force_failed_job_records_its_actual_cost() {
+        // Issue #148: a job force-failed with a StateTimeout never reaches
+        // ContainerRunning's own cost calculation, but its VM and volume
+        // were billed from creation until deletion.
+        let app = axum::Router::new().route(
+            "/1.3/server/:uuid",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"server": {"uuid": "srv1", "title": "t", "state": "stopped"}}))
+            })
+            .delete(|| async { axum::http::StatusCode::NO_CONTENT }),
+        );
+        let provider = crate::providers::upcloud::tests::mock_server(app).await;
+        let mut ctx = mock_ctx(false);
+        ctx.provider = Arc::new(provider);
+
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        crate::workload::seed_test_plans(&pool).await;
+        for (key, price) in [
+            ("server_plan_DEV-1xCPU-1GB-10GB", 0.4464),
+            ("storage_standard", 0.0118),
+        ] {
+            sqlx::query(
+                "INSERT INTO provider_pricing (zone, price_key, amount, price, currency, fetched_at) \
+                 VALUES ('de-fra1', ?, 1, ?, 'EUR', 0)",
+            )
+            .bind(key)
+            .bind(price)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let now = Utc::now().timestamp();
+        let spec = serde_json::json!({"template": {"spec": {
+            "containers": [{"image": "busybox:latest"}],
+            "volumes": [{"ephemeral": {"volumeClaimTemplate": {"spec": {
+                "resources": {"requests": {"storage": "10Gi"}},
+                "storageClassName": "kube-shim-standard"
+            }}}}]
+        }}})
+        .to_string();
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, worker_vm_id, worker_plan, \
+             last_error, created_at, updated_at, last_transition_time, version) \
+             VALUES ('j1', 'job-one', 'default', ?, 'VMTerminating', 'srv1', \
+             'DEV-1xCPU-1GB-10GB', 'StateTimeout: stuck in ContainerRunning', ?, ?, ?, 1)",
+        )
+        .bind(&spec)
+        .bind(now - 7300)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The VM existed for two hours (until this tick deletes it), the
+        // volume for one.
+        job_resources::record_created(&pool, "j1", job_resources::SERVER, "srv1", "w", now - 7200)
+            .await
+            .unwrap();
+        job_resources::record_created(&pool, "j1", job_resources::VOLUME, "vol1", "v", now - 7200)
+            .await
+            .unwrap();
+        job_resources::record_deleted(&pool, "j1", job_resources::VOLUME, now - 3600)
+            .await
+            .unwrap();
+
+        advance_all(&pool, &ctx).await.unwrap();
+
+        let (status, actual_cost): (String, Option<f64>) =
+            sqlx::query_as("SELECT status, actual_cost FROM jobs WHERE id = 'j1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "Archived");
+        // 2h of the VM (0.004464/h) plus 1h of the 10GB volume (0.000118/GB/h).
+        let expected = 2.0 * 0.004464 + 10.0 * 0.000118;
+        assert!(
+            (actual_cost.unwrap() - expected).abs() < 1e-4,
+            "{actual_cost:?}"
+        );
+        let resources = job_resources::for_job(&pool, "j1").await.unwrap();
+        assert!(resources.iter().all(|r| r.deleted_at.is_some()));
+    }
+
+    #[tokio::test]
+    async fn test_archiving_a_job_that_created_nothing_leaves_actual_cost_unset() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, spec, status, created_at, updated_at, version) \
+             VALUES ('j1', 'job-one', 'default', '{}', 'VMTerminating', 0, 0, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        advance_all(&pool, &mock_ctx(false)).await.unwrap();
+
+        let actual_cost: Option<f64> =
+            sqlx::query_scalar("SELECT actual_cost FROM jobs WHERE id = 'j1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(actual_cost, None);
     }
 
     #[tokio::test]

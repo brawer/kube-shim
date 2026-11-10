@@ -95,6 +95,10 @@ pub struct Server {
     pub state: String,
     pub public_ipv4: Option<String>,
     pub public_ipv6: Option<String>,
+    /// The provider's ID for the disk the server boots from, if the
+    /// response listed it -- the cost report's `ResourceId` for the
+    /// boot disk's charge (issue #148).
+    pub boot_disk_id: Option<String>,
 }
 
 impl Server {
@@ -291,6 +295,7 @@ mod tests {
             state: state.to_string(),
             public_ipv4: None,
             public_ipv6: None,
+            boot_disk_id: None,
         }
     }
 
