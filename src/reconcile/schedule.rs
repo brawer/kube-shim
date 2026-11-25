@@ -4,6 +4,7 @@
 //! 14b): the rolling budget guard, consulted before a run is created
 //! at all.
 
+use crate::api::job::string_map_column;
 use crate::pricing;
 use crate::reconcile::job::{active_deadline_seconds, is_pre_completion_state, record_event};
 use crate::reconcile::JobContext;
@@ -12,6 +13,7 @@ use chrono::{DateTime, Duration, Utc};
 use cron::Schedule;
 use serde_json::Value as JsonValue;
 use sqlx::{Row, SqlitePool};
+use std::collections::BTreeMap;
 use std::str::FromStr;
 use uuid::Uuid;
 
@@ -377,7 +379,6 @@ async fn create_job_run(
     cronjob_spec_str: &str,
     now: DateTime<Utc>,
 ) -> Result<bool> {
-    let _ = cronjob_id; // not needed yet; kept for a future FK-style reference
     let cronjob_spec: JsonValue = serde_json::from_str(cronjob_spec_str).unwrap_or(JsonValue::Null);
     let job_template_spec = cronjob_spec
         .pointer("/jobTemplate/spec")
@@ -414,19 +415,37 @@ async fn create_job_run(
     let job_name = format!("{cronjob_name}-{}", now.timestamp());
     let job_spec_json = serde_json::to_string(&job_template_spec)?;
     let now_ts = now.timestamp();
+    // Like Kubernetes' CronJob controller, the run gets the labels and
+    // annotations of the CronJob's `jobTemplate.metadata`.
+    // `api::job` adds the scheduled-time annotation and the owner
+    // reference when it returns the Job.
+    let template_metadata = |field: &str| -> Option<BTreeMap<String, String>> {
+        serde_json::from_value(
+            cronjob_spec
+                .pointer(&format!("/jobTemplate/metadata/{field}"))?
+                .clone(),
+        )
+        .ok()
+    };
+    let labels = template_metadata("labels");
+    let annotations = template_metadata("annotations");
 
     sqlx::query(
         r#"
-        INSERT INTO jobs (id, name, namespace, cronjob_name, spec, status, estimated_cost, created_at, updated_at, version)
-        VALUES (?, ?, ?, ?, ?, 'Created', ?, ?, ?, 1)
+        INSERT INTO jobs (id, name, namespace, cronjob_name, cronjob_uid, spec, status, estimated_cost,
+                          labels, annotations, created_at, updated_at, version)
+        VALUES (?, ?, ?, ?, ?, ?, 'Created', ?, ?, ?, ?, ?, 1)
         "#,
     )
     .bind(&job_id)
     .bind(&job_name)
     .bind(namespace)
     .bind(cronjob_name)
+    .bind(cronjob_id)
     .bind(&job_spec_json)
     .bind(estimated_cost)
+    .bind(string_map_column(labels.as_ref()))
+    .bind(string_map_column(annotations.as_ref()))
     .bind(now_ts)
     .bind(now_ts)
     .execute(pool)
@@ -709,6 +728,39 @@ mod tests {
                 .unwrap();
         let spec: JsonValue = serde_json::from_str(&spec_str).unwrap();
         assert_eq!(spec["activeDeadlineSeconds"], 3600);
+    }
+
+    /// Issue #154: like Kubernetes' CronJob controller, a run takes its
+    /// labels and annotations from `jobTemplate.metadata`, and records
+    /// which CronJob created it.
+    #[tokio::test]
+    async fn test_job_run_keeps_the_job_template_metadata_and_its_cronjob() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let created_at = Utc::now().timestamp() - 120;
+        let template = json!({
+            "metadata": {"labels": {"app": "osmdiffs"}, "annotations": {"owner": "osm-team"}},
+            "spec": {"activeDeadlineSeconds": 3600},
+        });
+        insert_cronjob_with(
+            &pool,
+            "every-minute",
+            "* * * * *",
+            created_at,
+            json!({"jobTemplate": template}),
+        )
+        .await;
+
+        schedule_due_jobs(&pool, &mock_ctx()).await.unwrap();
+
+        let (labels, annotations, cronjob_uid): (String, String, String) = sqlx::query_as(
+            "SELECT labels, annotations, cronjob_uid FROM jobs WHERE cronjob_name = 'every-minute'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(labels, r#"{"app":"osmdiffs"}"#);
+        assert_eq!(annotations, r#"{"owner":"osm-team"}"#);
+        assert_eq!(cronjob_uid, "cj-every-minute");
     }
 
     #[test]

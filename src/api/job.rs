@@ -17,7 +17,7 @@
 
 use super::cost_report::CostReportConfig;
 use super::pods::phase_for;
-use super::secret::ObjectMeta;
+use super::secret::{rfc3339, ObjectMeta, OwnerReference};
 use crate::reconcile::history;
 use crate::reconcile::job as reconcile_job;
 use crate::reconcile::job::RUN_FAILED_SQL;
@@ -32,6 +32,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -59,11 +60,20 @@ pub struct Job {
 /// string -- `kubectl get jobs`/`kubectl describe job` read this shape
 /// specifically.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JobStatus {
     pub active: i32,
     pub succeeded: i32,
     pub failed: i32,
     pub conditions: Vec<JobCondition>,
+    /// When the Job started: its creation, since kube-shim starts every
+    /// Job right away (there's no `suspend` for Jobs here).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<String>,
+    /// When the Job completed. Like in Kubernetes, only set for a Job
+    /// that succeeded, never for one that failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_time: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +114,8 @@ fn status_for(status: &str, failed: bool) -> JobStatus {
                 condition_type: "Complete".to_string(),
                 status: "True".to_string(),
             }],
+            start_time: None,
+            completion_time: None,
         },
         "Failed" => JobStatus {
             active: 0,
@@ -113,6 +125,8 @@ fn status_for(status: &str, failed: bool) -> JobStatus {
                 condition_type: "Failed".to_string(),
                 status: "True".to_string(),
             }],
+            start_time: None,
+            completion_time: None,
         },
         // "Running" and "Pending" (still provisioning) -- real
         // Kubernetes' own Job.status.active already collapses "pod
@@ -124,19 +138,155 @@ fn status_for(status: &str, failed: bool) -> JobStatus {
             succeeded: 0,
             failed: 0,
             conditions: vec![],
+            start_time: None,
+            completion_time: None,
         },
     }
 }
 
-fn row_to_job(row: SqliteRow) -> Job {
-    let id: String = row.get(0);
-    let name: String = row.get(1);
-    let namespace: String = row.get(2);
-    let spec_str: String = row.get(3);
-    let status: String = row.get(4);
-    let failed: bool = row.get(5);
+/// Labels the API server adds to a Job's pod template, and selects in
+/// `spec.selector`, unless `spec.manualSelector` is set: upstream's
+/// `generateSelector` in `pkg/registry/batch/job/strategy.go`. Both the
+/// current `batch.kubernetes.io/` keys and the legacy unprefixed ones.
+const JOB_NAME_LABELS: [&str; 2] = ["job-name", "batch.kubernetes.io/job-name"];
+const CONTROLLER_UID_LABELS: [&str; 2] = ["controller-uid", "batch.kubernetes.io/controller-uid"];
 
-    let spec: JsonValue = serde_json::from_str(&spec_str).unwrap_or(JsonValue::Null);
+/// What a CronJob's controller sets on each Job it creates, to the time
+/// it was scheduled for (upstream's `getJobFromTemplate2`).
+pub(crate) const CRONJOB_SCHEDULED_TIMESTAMP_ANNOTATION: &str =
+    "batch.kubernetes.io/cronjob-scheduled-timestamp";
+
+/// The columns `job_from_row` reads, in its order. The owning CronJob
+/// is looked up by the `cronjob_uid` recorded when the run was created,
+/// or by name for runs from before that column; either way only while
+/// it still exists, since deleting a CronJob here orphans its runs, and
+/// Kubernetes removes the owner reference from an orphaned Job.
+const JOB_COLUMNS: &str = "jobs.id, jobs.name, jobs.namespace, jobs.spec, jobs.status, \
+     {RUN_FAILED_SQL}, jobs.created_at, jobs.completed_at, jobs.labels, jobs.annotations, \
+     jobs.cronjob_name, cronjobs.id";
+const JOB_FROM: &str = "jobs LEFT JOIN cronjobs ON cronjobs.namespace = jobs.namespace \
+     AND cronjobs.name = jobs.cronjob_name \
+     AND (jobs.cronjob_uid IS NULL OR cronjobs.id = jobs.cronjob_uid)";
+
+fn select_jobs_sql(condition: &str) -> String {
+    let columns = JOB_COLUMNS.replace("{RUN_FAILED_SQL}", RUN_FAILED_SQL);
+    format!("SELECT {columns} FROM {JOB_FROM} WHERE {condition}")
+}
+
+/// A stored `labels`/`annotations` column: a JSON object of strings, or
+/// NULL for none.
+pub(crate) fn parse_string_map(column: Option<String>) -> BTreeMap<String, String> {
+    column
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// A `labels`/`annotations` map as stored: NULL when empty.
+pub(crate) fn string_map_column(map: Option<&BTreeMap<String, String>>) -> Option<String> {
+    map.filter(|m| !m.is_empty())
+        .map(|m| serde_json::to_string(m).expect("a string map serializes"))
+}
+
+/// Everything about a Job that `job_from_parts` needs, as stored.
+struct StoredJob {
+    id: String,
+    name: String,
+    namespace: String,
+    spec: JsonValue,
+    status: String,
+    failed: bool,
+    created_at: i64,
+    completed_at: Option<i64>,
+    labels: BTreeMap<String, String>,
+    annotations: BTreeMap<String, String>,
+    cronjob_name: Option<String>,
+    cronjob_uid: Option<String>,
+}
+
+fn row_to_job(row: SqliteRow) -> Job {
+    let spec_str: String = row.get(3);
+    job_from_parts(StoredJob {
+        id: row.get(0),
+        name: row.get(1),
+        namespace: row.get(2),
+        spec: serde_json::from_str(&spec_str).unwrap_or(JsonValue::Null),
+        status: row.get(4),
+        failed: row.get(5),
+        created_at: row.get(6),
+        completed_at: row.get(7),
+        labels: parse_string_map(row.get(8)),
+        annotations: parse_string_map(row.get(9)),
+        cronjob_name: row.get(10),
+        cronjob_uid: row.get(11),
+    })
+}
+
+/// A Job as the Kubernetes API server would return it, to the extent
+/// kube-shim knows. The API server defaults a few things when it stores
+/// a Job, which kube-shim does when it returns one instead, so they
+/// apply to Jobs created before this, too:
+///
+/// - `spec.selector` and the pod template's labels get `job-name` and
+///   `controller-uid` labels (`generateSelector`), unless
+///   `spec.manualSelector` is set;
+/// - `metadata.labels` default to the pod template's labels when the
+///   Job has none of its own (`SetDefaults_Job`);
+/// - a CronJob's run is owned by it and annotated with the time it was
+///   scheduled for (`getJobFromTemplate2`).
+fn job_from_parts(stored: StoredJob) -> Job {
+    let StoredJob {
+        id,
+        name,
+        namespace,
+        mut spec,
+        status,
+        failed,
+        created_at,
+        completed_at,
+        mut labels,
+        mut annotations,
+        cronjob_name,
+        cronjob_uid,
+    } = stored;
+
+    let manual_selector = spec.get("manualSelector").and_then(JsonValue::as_bool) == Some(true);
+    if !manual_selector && spec.is_object() {
+        generate_selector(&mut spec, &name, &id);
+    }
+    if labels.is_empty() {
+        if let Some(template_labels) = spec
+            .pointer("/template/metadata/labels")
+            .and_then(JsonValue::as_object)
+        {
+            labels = template_labels
+                .iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .collect();
+        }
+    }
+
+    let mut owner_references = None;
+    if let Some(cronjob_name) = cronjob_name {
+        annotations
+            .entry(CRONJOB_SCHEDULED_TIMESTAMP_ANNOTATION.to_string())
+            .or_insert_with(|| rfc3339(created_at));
+        if let Some(uid) = cronjob_uid {
+            owner_references = Some(vec![OwnerReference {
+                api_version: "batch/v1".to_string(),
+                kind: "CronJob".to_string(),
+                name: cronjob_name,
+                uid,
+                controller: Some(true),
+                block_owner_deletion: Some(true),
+            }]);
+        }
+    }
+
+    let mut job_status = status_for(&status, failed);
+    job_status.start_time = Some(rfc3339(created_at));
+    if job_status.succeeded > 0 {
+        job_status.completion_time = completed_at.map(rfc3339);
+    }
 
     Job {
         api_version: "batch/v1".to_string(),
@@ -145,11 +295,57 @@ fn row_to_job(row: SqliteRow) -> Job {
             name,
             namespace: Some(namespace),
             uid: Some(id),
-            creation_timestamp: None,
+            // Jobs can't be changed here, so their spec never moves on
+            // from its first generation.
+            generation: Some(1),
+            creation_timestamp: Some(rfc3339(created_at)),
+            labels: (!labels.is_empty()).then_some(labels),
+            annotations: (!annotations.is_empty()).then_some(annotations),
+            owner_references,
         },
         spec,
-        status: status_for(&status, failed),
+        status: job_status,
     }
+}
+
+/// Upstream's `generateSelector`: labels the pod template with the
+/// Job's name and UID, keeping any value the user already gave for one
+/// of those keys, and selects pods by UID.
+fn generate_selector(spec: &mut JsonValue, name: &str, uid: &str) {
+    let template_labels = object_at(spec, &["template", "metadata", "labels"]);
+    for key in JOB_NAME_LABELS {
+        template_labels
+            .entry(key)
+            .or_insert_with(|| JsonValue::String(name.to_string()));
+    }
+    for key in CONTROLLER_UID_LABELS {
+        template_labels
+            .entry(key)
+            .or_insert_with(|| JsonValue::String(uid.to_string()));
+    }
+    object_at(spec, &["selector", "matchLabels"])
+        .entry("batch.kubernetes.io/controller-uid")
+        .or_insert_with(|| JsonValue::String(uid.to_string()));
+}
+
+/// The object at `path` under `value` (an object), creating it and any
+/// object on the way, and replacing anything there that isn't one.
+fn object_at<'a>(
+    value: &'a mut JsonValue,
+    path: &[&str],
+) -> &'a mut serde_json::Map<String, JsonValue> {
+    let mut current = value;
+    for key in path {
+        let map = current.as_object_mut().expect("checked or just made");
+        let next = map
+            .entry(*key)
+            .or_insert_with(|| JsonValue::Object(Default::default()));
+        if !next.is_object() {
+            *next = JsonValue::Object(Default::default());
+        }
+        current = next;
+    }
+    current.as_object_mut().expect("just made an object")
 }
 
 pub async fn create_job(
@@ -267,15 +463,20 @@ pub async fn create_job(
     // estimated_cost was already computed above, at admission time --
     // handle_created no longer exists to compute it again on the
     // first tick.
+    let labels = req.metadata.labels.unwrap_or_default();
+    let annotations = req.metadata.annotations.unwrap_or_default();
     let insert_result = sqlx::query(
-        "INSERT INTO jobs (id, name, namespace, spec, status, estimated_cost, created_at, updated_at, version) \
-         VALUES (?, ?, ?, ?, 'Created', ?, ?, ?, 1)",
+        "INSERT INTO jobs (id, name, namespace, spec, status, estimated_cost, labels, annotations, \
+         created_at, updated_at, version) \
+         VALUES (?, ?, ?, ?, 'Created', ?, ?, ?, ?, ?, 1)",
     )
     .bind(&id)
     .bind(&req.metadata.name)
     .bind(&namespace)
     .bind(&spec_json)
     .bind(estimated_cost)
+    .bind(string_map_column(Some(&labels)))
+    .bind(string_map_column(Some(&annotations)))
     .bind(now)
     .bind(now)
     .execute(&pool)
@@ -290,18 +491,20 @@ pub async fn create_job(
     // poll -- same reasoning create_cronjob's own notify_one() call has.
     notify.notify_one();
 
-    let job = Job {
-        api_version: "batch/v1".to_string(),
-        kind: "Job".to_string(),
-        metadata: ObjectMeta {
-            name: req.metadata.name,
-            namespace: Some(namespace),
-            uid: Some(id),
-            creation_timestamp: Some(super::secret::rfc3339(now)),
-        },
+    let job = job_from_parts(StoredJob {
+        id,
+        name: req.metadata.name,
+        namespace,
         spec: req.spec,
-        status: status_for("Created", false),
-    };
+        status: "Created".to_string(),
+        failed: false,
+        created_at: now,
+        completed_at: None,
+        labels,
+        annotations,
+        cronjob_name: None,
+        cronjob_uid: None,
+    });
 
     (StatusCode::CREATED, Json(job)).into_response()
 }
@@ -314,13 +517,11 @@ pub async fn list_jobs(
     State(pool): State<SqlitePool>,
     Path(namespace): Path<String>,
 ) -> Result<Json<JobList>, (StatusCode, String)> {
-    let rows = sqlx::query(&format!(
-        "SELECT id, name, namespace, spec, status, {RUN_FAILED_SQL} FROM jobs WHERE namespace = ?"
-    ))
-    .bind(&namespace)
-    .fetch_all(&pool)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let rows = sqlx::query(&select_jobs_sql("jobs.namespace = ? ORDER BY jobs.name"))
+        .bind(&namespace)
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let items = rows.into_iter().map(row_to_job).collect();
 
@@ -335,16 +536,13 @@ pub async fn get_job(
     State(pool): State<SqlitePool>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Job>, (StatusCode, String)> {
-    let row = sqlx::query(&format!(
-        "SELECT id, name, namespace, spec, status, {RUN_FAILED_SQL} FROM jobs \
-         WHERE namespace = ? AND name = ?"
-    ))
-    .bind(&namespace)
-    .bind(&name)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Job not found".to_string()))?;
+    let row = sqlx::query(&select_jobs_sql("jobs.namespace = ? AND jobs.name = ?"))
+        .bind(&namespace)
+        .bind(&name)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Job not found".to_string()))?;
 
     Ok(Json(row_to_job(row)))
 }
@@ -826,5 +1024,213 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    async fn get_json(pool: &SqlitePool, uri: &str) -> JsonValue {
+        let response = router(pool.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        body_json(response).await
+    }
+
+    /// Issue #154: `kubectl get jobs --sort-by=.metadata.creationTimestamp`
+    /// failed, and AGE was `<unknown>`, because a listed Job had no
+    /// `creationTimestamp`.
+    #[tokio::test]
+    async fn test_listed_job_has_the_metadata_kubernetes_would_return() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let mut spec = valid_spec();
+        spec["template"]["metadata"] = json!({"labels": {"app": "osmdiffs"}});
+        let created = body_json(
+            router(pool.clone())
+                .oneshot(create_request("manual-run", spec))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let uid = created["metadata"]["uid"].as_str().unwrap().to_string();
+        let created_at: i64 = sqlx::query_scalar("SELECT created_at FROM jobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let timestamp = rfc3339(created_at);
+
+        let list = get_json(&pool, "/apis/batch/v1/namespaces/default/jobs").await;
+        let job = &list["items"][0];
+        assert_eq!(job, &created, "create and list return the same Job");
+        let expected_labels = json!({
+            "app": "osmdiffs",
+            "batch.kubernetes.io/controller-uid": uid,
+            "batch.kubernetes.io/job-name": "manual-run",
+            "controller-uid": uid,
+            "job-name": "manual-run",
+        });
+        assert_eq!(
+            job["metadata"],
+            json!({
+                "name": "manual-run",
+                "namespace": "default",
+                "uid": uid,
+                "generation": 1,
+                "creationTimestamp": timestamp,
+                "labels": expected_labels,
+            })
+        );
+        assert_eq!(
+            job["spec"]["template"]["metadata"]["labels"],
+            expected_labels
+        );
+        assert_eq!(
+            job["spec"]["selector"],
+            json!({"matchLabels": {"batch.kubernetes.io/controller-uid": uid}})
+        );
+        assert_eq!(job["status"]["startTime"], timestamp);
+        assert!(job["status"].get("completionTime").is_none());
+
+        let got = get_json(&pool, "/apis/batch/v1/namespaces/default/jobs/manual-run").await;
+        assert_eq!(got, created);
+    }
+
+    /// Labels and annotations given for the Job itself are kept, and
+    /// then the pod template's labels aren't copied to it.
+    #[tokio::test]
+    async fn test_job_keeps_its_own_labels_and_annotations() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let body = json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {
+                "name": "labelled",
+                "labels": {"team": "osm"},
+                "annotations": {"note": "testing v0.4.3"},
+            },
+            "spec": valid_spec(),
+        });
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/apis/batch/v1/namespaces/default/jobs")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let response = router(pool.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let job = get_json(&pool, "/apis/batch/v1/namespaces/default/jobs/labelled").await;
+        assert_eq!(job["metadata"]["labels"], json!({"team": "osm"}));
+        assert_eq!(
+            job["metadata"]["annotations"],
+            json!({"note": "testing v0.4.3"})
+        );
+        assert_eq!(
+            job["spec"]["template"]["metadata"]["labels"]["job-name"],
+            "labelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manual_selector_job_gets_no_generated_labels() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        let mut spec = valid_spec();
+        spec["manualSelector"] = json!(true);
+        spec["selector"] = json!({"matchLabels": {"app": "x"}});
+        spec["template"]["metadata"] = json!({"labels": {"app": "x"}});
+        let response = router(pool.clone())
+            .oneshot(create_request("manual-selector", spec.clone()))
+            .await
+            .unwrap();
+        let job = body_json(response).await;
+        assert_eq!(job["spec"], spec);
+        assert_eq!(job["metadata"]["labels"], json!({"app": "x"}));
+    }
+
+    async fn insert_cronjob(pool: &SqlitePool, id: &str, name: &str) {
+        sqlx::query(
+            "INSERT INTO cronjobs (id, name, namespace, spec, schedule, created_at, updated_at) \
+             VALUES (?, ?, 'default', '{}', '* * * * *', 0, 0)",
+        )
+        .bind(id)
+        .bind(name)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_cronjob_run(pool: &SqlitePool, name: &str, cronjob_uid: Option<&str>) {
+        sqlx::query(
+            "INSERT INTO jobs (id, name, namespace, cronjob_name, cronjob_uid, spec, status, \
+             labels, created_at, completed_at, updated_at, version) \
+             VALUES (?, ?, 'default', 'weekly', ?, '{}', 'Archived', '{\"app\":\"osmdiffs\"}', \
+             1794711605, 1794715205, 1794715205, 1)",
+        )
+        .bind(format!("{name}-uid"))
+        .bind(name)
+        .bind(cronjob_uid)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cronjob_run_is_owned_by_its_cronjob() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_cronjob(&pool, "cronjob-uid", "weekly").await;
+        insert_cronjob_run(&pool, "weekly-1794711605", Some("cronjob-uid")).await;
+
+        let job = get_json(
+            &pool,
+            "/apis/batch/v1/namespaces/default/jobs/weekly-1794711605",
+        )
+        .await;
+        assert_eq!(
+            job["metadata"]["ownerReferences"],
+            json!([{
+                "apiVersion": "batch/v1",
+                "kind": "CronJob",
+                "name": "weekly",
+                "uid": "cronjob-uid",
+                "controller": true,
+                "blockOwnerDeletion": true,
+            }])
+        );
+        assert_eq!(
+            job["metadata"]["annotations"],
+            json!({"batch.kubernetes.io/cronjob-scheduled-timestamp": "2026-11-15T03:00:05Z"})
+        );
+        assert_eq!(job["metadata"]["labels"], json!({"app": "osmdiffs"}));
+        assert_eq!(job["metadata"]["creationTimestamp"], "2026-11-15T03:00:05Z");
+        assert_eq!(job["status"]["startTime"], "2026-11-15T03:00:05Z");
+        assert_eq!(job["status"]["completionTime"], "2026-11-15T04:00:05Z");
+    }
+
+    /// Deleting a CronJob here leaves its runs behind, which Kubernetes
+    /// calls orphaning: their owner reference goes away. A CronJob
+    /// created again under the same name doesn't own them either.
+    #[tokio::test]
+    async fn test_orphaned_cronjob_run_has_no_owner() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_cronjob(&pool, "new-cronjob-uid", "weekly").await;
+        insert_cronjob_run(&pool, "orphan", Some("deleted-cronjob-uid")).await;
+        let job = get_json(&pool, "/apis/batch/v1/namespaces/default/jobs/orphan").await;
+        assert!(job["metadata"].get("ownerReferences").is_none(), "{job}");
+        assert!(job["metadata"]["annotations"]
+            .get("batch.kubernetes.io/cronjob-scheduled-timestamp")
+            .is_some());
+    }
+
+    /// Runs from before `jobs.cronjob_uid` find their CronJob by name.
+    #[tokio::test]
+    async fn test_older_cronjob_run_finds_its_owner_by_name() {
+        let pool = crate::db::init_pool(":memory:").await.unwrap();
+        insert_cronjob(&pool, "cronjob-uid", "weekly").await;
+        insert_cronjob_run(&pool, "older", None).await;
+        let job = get_json(&pool, "/apis/batch/v1/namespaces/default/jobs/older").await;
+        assert_eq!(job["metadata"]["ownerReferences"][0]["uid"], "cronjob-uid");
     }
 }

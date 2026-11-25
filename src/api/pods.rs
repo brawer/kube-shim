@@ -64,7 +64,7 @@ pub async fn get_pod(
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Pod>, (StatusCode, String)> {
     let row = sqlx::query(&format!(
-        "SELECT status, {RUN_FAILED_SQL} FROM jobs WHERE namespace = ? AND name = ?"
+        "SELECT status, {RUN_FAILED_SQL}, created_at FROM jobs WHERE namespace = ? AND name = ?"
     ))
     .bind(&namespace)
     .bind(&name)
@@ -85,7 +85,8 @@ pub async fn get_pod(
             name,
             namespace: Some(namespace),
             uid: None,
-            creation_timestamp: None,
+            creation_timestamp: Some(super::secret::rfc3339(row.get(2))),
+            ..Default::default()
         },
         status: PodStatus {
             phase: phase_for(&status, failed).to_string(),

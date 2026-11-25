@@ -120,6 +120,7 @@ pub async fn create_cronjob(
             namespace: Some(namespace),
             uid: Some(id),
             creation_timestamp: Some(super::secret::rfc3339(now)),
+            ..Default::default()
         },
         spec: req.spec,
         status: None,
@@ -435,6 +436,7 @@ async fn load_cronjob(
             namespace: Some(namespace.to_string()),
             uid: Some(id),
             creation_timestamp: Some(super::secret::rfc3339(created_at)),
+            ..Default::default()
         },
         spec: {
             let mut spec = serde_json::from_str(&spec_str)?;
@@ -475,7 +477,7 @@ pub async fn list_cronjobs(
 ) -> Result<Json<ListCronJobsResponse>, (StatusCode, String)> {
     let rows = sqlx::query(
         r#"
-        SELECT id, name, namespace, spec, status FROM cronjobs
+        SELECT id, name, namespace, spec, status, created_at FROM cronjobs
         WHERE namespace = ?
         "#,
     )
@@ -504,7 +506,8 @@ pub async fn list_cronjobs(
                     name,
                     namespace: Some(ns),
                     uid: Some(id),
-                    creation_timestamp: None,
+                    creation_timestamp: Some(super::secret::rfc3339(row.get(5))),
+                    ..Default::default()
                 },
                 spec,
                 status,

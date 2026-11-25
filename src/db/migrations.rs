@@ -79,6 +79,14 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     // still show a CronJob's last result after its row is gone. NULL
     // for runs removed before this column existed.
     ("pruned_jobs", "failed", "INTEGER"),
+    // Issue #154: a Job's own `metadata.labels` and `.annotations` (for
+    // a CronJob's run: its `jobTemplate.metadata`'s), as JSON objects,
+    // and the UID of the CronJob that created the run, for the Job's
+    // `ownerReferences`. NULL for none, and for jobs from before these
+    // columns.
+    ("jobs", "labels", "TEXT"),
+    ("jobs", "annotations", "TEXT"),
+    ("jobs", "cronjob_uid", "TEXT"),
 ];
 
 pub async fn run(pool: &SqlitePool) -> Result<()> {
