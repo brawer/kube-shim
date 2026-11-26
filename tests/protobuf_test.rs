@@ -85,10 +85,20 @@ async fn send(router: &axum::Router, request: Request<Body>) -> (StatusCode, Val
 
 /// Removes what the server generates itself, so a protobuf-created
 /// object can be compared with a JSON-created one.
+/// A Job's UID also shows up in the labels the server adds to it, and
+/// its creation time as `status.startTime`.
 fn strip_generated(mut object: Value) -> Value {
+    let uid = object.pointer("/metadata/uid").cloned();
     if let Some(meta) = object.get_mut("metadata").and_then(Value::as_object_mut) {
         meta.remove("uid");
         meta.remove("creationTimestamp");
+    }
+    if let Some(status) = object.get_mut("status").and_then(Value::as_object_mut) {
+        status.remove("startTime");
+    }
+    if let Some(uid) = uid {
+        let text = object.to_string().replace(&uid.to_string(), "\"<uid>\"");
+        object = serde_json::from_str(&text).unwrap();
     }
     object
 }

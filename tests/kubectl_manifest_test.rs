@@ -92,12 +92,14 @@ async fn test_kubectl_create_secret_manifest_accepted() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["apiVersion"], "v1");
     assert_eq!(body["data"]["AWS_ACCESS_KEY_ID"], "QUtJQTEyMw==");
+    assert_eq!(body["metadata"]["creationTimestamp"], created);
 
     let (status, body) = send(&router, request("GET", SECRETS, None)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["apiVersion"], "v1");
     assert_eq!(body["kind"], "SecretList");
     assert_eq!(body["items"][0]["apiVersion"], "v1");
+    assert_eq!(body["items"][0]["metadata"]["creationTimestamp"], created);
 }
 
 /// `kubectl apply -f` / OpenTofu with `stringData`: plain values are
@@ -225,10 +227,13 @@ async fn test_kubectl_cronjob_manifest_accepted() {
     let created = body["metadata"]["creationTimestamp"].as_str().unwrap();
     assert!(chrono::DateTime::parse_from_rfc3339(created).is_ok());
 
+    let created = created.to_string();
+
     let (status, body) = send(&router, request("GET", uri, None)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["apiVersion"], "batch/v1");
     assert_eq!(body["items"][0]["apiVersion"], "batch/v1");
+    assert_eq!(body["items"][0]["metadata"]["creationTimestamp"], created);
 }
 
 #[tokio::test]
@@ -251,4 +256,12 @@ async fn test_kubectl_job_manifest_accepted() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
     assert_eq!(body["apiVersion"], "batch/v1");
     assert!(body.get("api_version").is_none());
+    let created = body["metadata"]["creationTimestamp"].as_str().unwrap();
+    assert!(chrono::DateTime::parse_from_rfc3339(created).is_ok());
+
+    // Issue #154: `kubectl get jobs` showed AGE <unknown>, and
+    // `--sort-by=.metadata.creationTimestamp` failed, on the list.
+    let (status, list) = send(&router, request("GET", uri, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list["items"][0]["metadata"]["creationTimestamp"], created);
 }

@@ -129,6 +129,7 @@ pub async fn list_events(
                     namespace: Some(job_namespace.clone()),
                     uid: None,
                     creation_timestamp: Some(timestamp.clone()),
+                    ..Default::default()
                 },
                 involved_object: InvolvedObjectRef {
                     api_version: "v1".to_string(),

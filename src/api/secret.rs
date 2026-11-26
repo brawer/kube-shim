@@ -12,17 +12,45 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx::{Row, SqlitePool};
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The subset of Kubernetes' `ObjectMeta` that kube-shim knows about.
+/// Fields left `None` are omitted from responses, as the API server
+/// omits empty ones. `resourceVersion` and `managedFields` aren't here:
+/// kube-shim has no cluster-wide revision counter to hand out, and no
+/// server-side apply.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectMeta {
     pub name: String,
     pub namespace: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creation_timestamp: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_references: Option<Vec<OwnerReference>>,
+}
+
+/// Kubernetes' `metav1.OwnerReference`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnerReference {
+    pub api_version: String,
+    pub kind: String,
+    pub name: String,
+    pub uid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_owner_deletion: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +173,7 @@ pub async fn create_secret(
             namespace: Some(namespace),
             uid: Some(id),
             creation_timestamp: Some(rfc3339(now)),
+            ..Default::default()
         },
         data,
         secret_type: Some(SECRET_TYPE.to_string()),
@@ -159,7 +188,7 @@ pub async fn get_secret(
 ) -> Result<Json<Secret>, (StatusCode, String)> {
     let row = sqlx::query(
         r#"
-        SELECT id, name, namespace, data FROM secrets
+        SELECT id, name, namespace, data, created_at FROM secrets
         WHERE name = ? AND namespace = ?
         "#,
     )
@@ -182,7 +211,8 @@ pub async fn get_secret(
             name,
             namespace: Some(namespace),
             uid: Some(id),
-            creation_timestamp: None,
+            creation_timestamp: Some(rfc3339(row.get(4))),
+            ..Default::default()
         },
         data,
         secret_type: Some(SECRET_TYPE.to_string()),
@@ -218,11 +248,13 @@ pub async fn patch_secret(
         Err(e) => return k8s_status::bad_request(format!("invalid JSON patch: {e}")),
     };
 
-    let row = match sqlx::query("SELECT id, data FROM secrets WHERE name = ? AND namespace = ?")
-        .bind(&name)
-        .bind(&namespace)
-        .fetch_optional(&pool)
-        .await
+    let row = match sqlx::query(
+        "SELECT id, data, created_at FROM secrets WHERE name = ? AND namespace = ?",
+    )
+    .bind(&name)
+    .bind(&namespace)
+    .fetch_optional(&pool)
+    .await
     {
         Ok(Some(row)) => row,
         Ok(None) => return k8s_status::not_found("Secret", &name),
@@ -233,7 +265,13 @@ pub async fn patch_secret(
         Ok(data) => data,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    let metadata = serde_json::json!({"name": name, "namespace": namespace, "uid": id});
+    let creation_timestamp = rfc3339(row.get(2));
+    let metadata = serde_json::json!({
+        "name": name,
+        "namespace": namespace,
+        "uid": id,
+        "creationTimestamp": creation_timestamp,
+    });
     let mut object = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Secret",
@@ -280,7 +318,8 @@ pub async fn patch_secret(
             name,
             namespace: Some(namespace),
             uid: Some(id),
-            creation_timestamp: None,
+            creation_timestamp: Some(creation_timestamp),
+            ..Default::default()
         },
         data,
         secret_type: Some(SECRET_TYPE.to_string()),
@@ -356,7 +395,7 @@ pub async fn list_secrets(
 ) -> Result<Json<ListSecretsResponse>, (StatusCode, String)> {
     let rows = sqlx::query(
         r#"
-        SELECT id, name, namespace, data FROM secrets
+        SELECT id, name, namespace, data, created_at FROM secrets
         WHERE namespace = ?
         "#,
     )
@@ -381,7 +420,8 @@ pub async fn list_secrets(
                     name,
                     namespace: Some(ns),
                     uid: Some(id),
-                    creation_timestamp: None,
+                    creation_timestamp: Some(rfc3339(row.get(4))),
+                    ..Default::default()
                 },
                 data,
                 secret_type: Some(SECRET_TYPE.to_string()),
