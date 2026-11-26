@@ -22,6 +22,7 @@ pub mod run_options;
 pub mod shutdown;
 pub mod ssh;
 pub mod status_page;
+pub mod table;
 pub mod tls;
 pub mod volumes;
 pub mod workload;

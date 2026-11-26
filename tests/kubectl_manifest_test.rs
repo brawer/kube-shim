@@ -265,3 +265,153 @@ async fn test_kubectl_job_manifest_accepted() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(list["items"][0]["metadata"]["creationTimestamp"], created);
 }
+
+/// What `kubectl get` sends: it prints the server's columns from a
+/// `Table`, and only NAME and AGE without one.
+const KUBECTL_GET_ACCEPT: &str = "application/json;as=Table;v=v1;g=meta.k8s.io,\
+     application/json;as=Table;v=v1beta1;g=meta.k8s.io,application/json";
+
+fn table_request(uri: &str) -> Request<Body> {
+    let mut req = request("GET", uri, None);
+    req.headers_mut()
+        .insert("accept", KUBECTL_GET_ACCEPT.parse().unwrap());
+    req
+}
+
+fn column_names(table: &Value) -> Vec<&str> {
+    table["columnDefinitions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn test_kubectl_get_receives_tables() {
+    let router = test_router().await;
+    let jobs = "/apis/batch/v1/namespaces/default/jobs";
+    let manifest = json!({
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {"name": "manual-run", "labels": {"app": "osm"}},
+        "spec": {
+            "activeDeadlineSeconds": 600,
+            "template": {"spec": {
+                "restartPolicy": "Never",
+                "containers": [{"name": "main", "image": "busybox:latest"}]
+            }}
+        }
+    });
+    let (status, job) = send(&router, request("POST", jobs, Some(manifest))).await;
+    assert_eq!(status, StatusCode::CREATED, "{job}");
+    let uid = job["metadata"]["uid"].as_str().unwrap();
+
+    let (status, table) = send(&router, table_request(jobs)).await;
+    assert_eq!(status, StatusCode::OK, "{table}");
+    assert_eq!(table["kind"], "Table");
+    assert_eq!(table["apiVersion"], "meta.k8s.io/v1");
+    assert_eq!(
+        column_names(&table),
+        [
+            "Name",
+            "Status",
+            "Completions",
+            "Duration",
+            "Age",
+            "Containers",
+            "Images",
+            "Selector"
+        ]
+    );
+    let cells = &table["rows"][0]["cells"];
+    assert_eq!(cells[0], "manual-run");
+    assert_eq!(cells[1], "Running");
+    assert_eq!(cells[2], "0/1");
+    assert_eq!(cells[5], "main");
+    assert_eq!(cells[6], "busybox:latest");
+    assert_eq!(
+        cells[7],
+        format!("batch.kubernetes.io/controller-uid={uid}")
+    );
+    let object = &table["rows"][0]["object"];
+    assert_eq!(object["kind"], "PartialObjectMetadata");
+    assert_eq!(object["metadata"]["labels"]["app"], "osm");
+
+    // A single object is a one-row Table too.
+    let (status, table) = send(&router, table_request(&format!("{jobs}/manual-run"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(table["kind"], "Table");
+    assert_eq!(table["rows"].as_array().unwrap().len(), 1);
+
+    // Without `as=Table`, the plain object as before.
+    let (_, list) = send(&router, request("GET", jobs, None)).await;
+    assert_eq!(list["kind"], "JobList");
+
+    // Errors stay a Status.
+    let (status, body) = send(&router, table_request(&format!("{jobs}/nope"))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_ne!(body["kind"], "Table");
+
+    let (status, body) = send(
+        &router,
+        table_request(&format!("{jobs}?includeObject=Everything")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["kind"], "Status");
+
+    let manifest = json!({
+        "kind": "Secret",
+        "apiVersion": "v1",
+        "metadata": {"name": "creds"},
+        "data": {"a": "eA==", "b": "eQ=="},
+        "type": "Opaque"
+    });
+    let (status, _) = send(&router, request("POST", SECRETS, Some(manifest))).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, table) = send(&router, table_request(SECRETS)).await;
+    assert_eq!(column_names(&table), ["Name", "Type", "Data", "Age"]);
+    assert_eq!(table["rows"][0]["cells"][1], "Opaque");
+    assert_eq!(table["rows"][0]["cells"][2], 2);
+
+    let cronjobs = "/apis/batch/v1/namespaces/default/cronjobs";
+    let manifest = json!({
+        "apiVersion": "batch/v1",
+        "kind": "CronJob",
+        "metadata": {"name": "nightly"},
+        "spec": {
+            "schedule": "0 3 * * *",
+            "jobTemplate": {"spec": {
+                "activeDeadlineSeconds": 600,
+                "template": {"spec": {
+                    "restartPolicy": "Never",
+                    "containers": [{"name": "main", "image": "busybox:latest"}]
+                }}
+            }}
+        }
+    });
+    let (status, body) = send(&router, request("POST", cronjobs, Some(manifest))).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (_, table) = send(&router, table_request(cronjobs)).await;
+    assert_eq!(
+        column_names(&table),
+        [
+            "Name",
+            "Schedule",
+            "Timezone",
+            "Suspend",
+            "Active",
+            "Last Schedule",
+            "Age",
+            "Containers",
+            "Images",
+            "Selector"
+        ]
+    );
+    let cells = &table["rows"][0]["cells"];
+    assert_eq!(cells[0], "nightly");
+    assert_eq!(cells[1], "0 3 * * *");
+    assert_eq!(cells[5], "<none>");
+    assert_eq!(cells[7], "main");
+}
