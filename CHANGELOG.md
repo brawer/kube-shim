@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.5.2](https://github.com/brawer/kube-shim/compare/v0.5.1...v0.5.2) (2026-11-26)
+
+
+### 🆕 Enhancements
+
+* answer kubectl get with server-side Tables ([#158](https://github.com/brawer/kube-shim/issues/158)) ([6e4c733](https://github.com/brawer/kube-shim/commit/6e4c733347ce7ac0094b26a1df8647764eb9aa71))
+
+
+### 🐞 Bug Fixes
+
+* return the metadata Kubernetes would for Jobs ([#156](https://github.com/brawer/kube-shim/issues/156)) ([b234325](https://github.com/brawer/kube-shim/commit/b234325b5d4557d3bed93c672e7a5cd3e9aa5827)), closes [#154](https://github.com/brawer/kube-shim/issues/154)
+
 ## [0.5.1](https://github.com/brawer/kube-shim/compare/v0.5.0...v0.5.1) (2026-11-10)
 
 
