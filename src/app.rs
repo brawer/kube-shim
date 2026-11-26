@@ -10,7 +10,7 @@
 //! hand-rolled duplicate.
 
 use crate::reconcile::TickHealth;
-use crate::{api, auth, config, k8s_protobuf, metrics_export, ssh, status_page};
+use crate::{api, auth, config, k8s_protobuf, metrics_export, ssh, status_page, table};
 use axum::{
     http::{HeaderName, HeaderValue},
     middleware,
@@ -167,6 +167,9 @@ fn authenticated_router(
         // them (issue #106); inside the auth layer below, so nothing is
         // decoded for an unauthenticated request.
         .layer(middleware::from_fn(k8s_protobuf::protobuf_bodies))
+        // `kubectl get` asks for a server-side printed Table, and shows
+        // only NAME and AGE without one.
+        .layer(middleware::from_fn(table::tables))
         .layer(Extension(notify))
         .layer(Extension(worker_ssh))
         .layer(Extension(cost_report_config))
